@@ -17,7 +17,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 
 from baton.adapters.base import (
@@ -31,11 +31,10 @@ from baton.adapters.base import (
     RoundContext,
     RoundResult,
 )
+from baton.adapters.guard import RETRY_S, Eval, Guard, LimitsError
 from baton.config import AgentConfig
 from baton.proc import clean_env, run_streaming
 
-# How long an agent rests after a failed or unreadable limits read.
-RETRY_S = 300
 READ_TIMEOUT_S = 15
 # Longest chunk taken from the server in one piece; a server cannot grow a line without bound.
 MAX_LINE_BYTES = 64 * 1024
@@ -51,10 +50,6 @@ _LIMIT_RE = re.compile(
     r"usage limit|rate.?limit|limit reached|quota|too many requests|\b429\b|credits",
     re.IGNORECASE,
 )
-
-
-class LimitsError(Exception):
-    """Limits could not be read or understood."""
 
 
 # --- reading ---------------------------------------------------------------------------------
@@ -204,17 +199,7 @@ def parse_balance(result: dict) -> Decimal:
     return balance
 
 
-@dataclass(frozen=True)
-class _Eval:
-    """One limits read, judged. Everything readable is used even when something else is not."""
-
-    avail: Availability
-    refused: bool  # a clear "no": flag false, reached type set, or a window at the threshold
-    blind: bool  # some field the decision needs was missing or unreadable
-    balance: Decimal | None  # the credit balance whenever it could be parsed
-
-
-def _evaluate(result: object, threshold_pct: int, now: float) -> _Eval:
+def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
     """Judge a read without letting one unreadable field hide the rest.
 
     A parseable balance is always reported, so a drop is seen even if other fields are broken,
@@ -270,7 +255,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> _Eval:
             saturated.append(window)
 
     if not reasons and not blind:
-        return _Eval(Availability(True, usage=usage), False, False, balance)
+        return Eval(Availability(True, usage=usage), False, False, balance)
 
     def resets(group: list[dict]) -> list[float]:
         return [float(w["resetsAt"]) for w in group if _is_number(w.get("resetsAt"))]
@@ -285,7 +270,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> _Eval:
     else:
         until = now + RETRY_S
     text = "; ".join(reasons + [f"unreadable: {b}" for b in blind] if reasons else blind)
-    return _Eval(
+    return Eval(
         Availability(False, until=until, reason=text, usage=usage),
         refused=bool(reasons),
         blind=bool(blind),
@@ -296,112 +281,6 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> _Eval:
 def check_limits(result: dict, threshold_pct: int, now: float) -> Availability:
     """Whether a round may start (or go on) given one limits read."""
     return _evaluate(result, threshold_pct, now).avail
-
-
-# --- the credit guard ------------------------------------------------------------------------
-
-
-class _Guard:
-    """Watches one round: usage threshold, credit balance, and being blind."""
-
-    def __init__(
-        self,
-        cfg: AgentConfig,
-        read: Callable[[], dict],
-        poll_clock: Callable[[], float],
-        wall_clock: Callable[[], float],
-    ) -> None:
-        self.cfg = cfg
-        self.read = read
-        self.poll_clock = poll_clock
-        self.wall_clock = wall_clock
-        self.baseline: Decimal | None = None
-        self.failures = 0
-        self.last_poll = 0.0
-
-    def start(self) -> RoundResult | None:
-        """Read the baseline immediately before spawning. A result means: do not spawn."""
-        try:
-            result = self.read()
-        except Exception as exc:
-            return RoundResult(
-                LIMIT, until=self.wall_clock() + RETRY_S, reason=f"cannot read limits: {exc}"
-            )
-        ev = _evaluate(result, self.cfg.threshold_pct, self.wall_clock())
-        if not ev.avail.ok or ev.balance is None:
-            return RoundResult(LIMIT, until=ev.avail.until, reason=ev.avail.reason)
-        self.baseline = ev.balance
-        self.last_poll = self.poll_clock()
-        return None
-
-    def tick(self) -> RoundResult | None:
-        now = self.poll_clock()
-        if now - self.last_poll < self.cfg.poll_s:
-            return None
-        self.last_poll = now
-        verdict, unreadable, _ = self._observe()
-        if verdict is not None:
-            return verdict
-        if unreadable is None:
-            self.failures = 0
-            return None
-        self.failures += 1
-        if self.failures >= 2:
-            return RoundResult(
-                CREDIT_GUARD,
-                reason=f"limits unreadable {self.failures} times in a row: {unreadable}",
-            )
-        return None
-
-    def _observe(self) -> tuple[RoundResult | None, str | None, bool]:
-        """One read: (a verdict that stops the round, why it was not fully readable, whether
-        the balance parsed).
-
-        Order matters: any parseable balance is compared first, then clear refusals are honoured,
-        and only then is being blind counted by the caller.
-        """
-        assert self.baseline is not None
-        try:
-            result = self.read()
-        except Exception as exc:
-            return None, f"limits read failed: {exc}", False
-        ev = _evaluate(result, self.cfg.threshold_pct, self.wall_clock())
-        unreadable = ev.avail.reason if ev.blind else None
-        if ev.balance is not None and ev.balance < self.baseline:
-            return (
-                RoundResult(
-                    CREDIT_GUARD,
-                    until=None if ev.avail.ok else ev.avail.until,
-                    reason=f"credit balance dropped from {self.baseline} to {ev.balance}",
-                ),
-                unreadable,
-                True,
-            )
-        seen = ev.balance is not None
-        if ev.refused:
-            result = RoundResult(LIMIT, until=ev.avail.until, reason=ev.avail.reason)
-            return result, unreadable, seen
-        return None, unreadable, seen
-
-    def close(self) -> RoundResult | None:
-        """The read after the process is gone: it must see the balance, or the round is suspect.
-
-        A debit made since the last poll is only visible here, and the next round's baseline
-        would absorb it. One failed read is retried once; a second failure is credit_guard.
-        """
-        why = ""
-        for _ in range(2):
-            verdict, unreadable, balance_seen = self._observe()
-            if verdict is not None and verdict.outcome == CREDIT_GUARD:
-                return verdict
-            # What close() guards is the balance: once it parsed and did not drop, another
-            # field staying blind says nothing about a debit.
-            if unreadable is None or balance_seen:
-                return None
-            why = unreadable
-        return RoundResult(
-            CREDIT_GUARD, reason=f"cannot confirm the balance after the round: {why}"
-        )
 
 
 # --- the adapter -----------------------------------------------------------------------------
@@ -474,7 +353,7 @@ class CodexAdapter:
         return [cfg.bin, "exec", "resume", *common, *access, session_id, "-"]
 
     def run_round(self, prompt: str, ctx: RoundContext) -> RoundResult:
-        guard = _Guard(self.cfg, self._read, self._poll_clock, self._wall_clock)
+        guard = Guard(self.cfg, self._read, _evaluate, self._poll_clock, self._wall_clock)
         refused = guard.start()
         if refused is not None:
             return refused

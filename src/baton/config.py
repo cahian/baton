@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-AGENT_NAMES = ("codex", "antigravity", "claude")
-DEFAULT_ORDER = ("codex", "antigravity", "claude")
+AGENT_NAMES = ("codex", "antigravity")
+DEFAULT_ORDER = ("codex", "antigravity")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -31,15 +31,6 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "threshold_pct": 90,
         "poll_s": 30,
         "bin": "agy",
-        "full_access": True,
-    },
-    "claude": {
-        "enabled": True,
-        "model": "sonnet",
-        "effort": "high",
-        "threshold_pct": 95,
-        "poll_s": 15,
-        "bin": "claude",
         "full_access": True,
     },
 }
@@ -70,7 +61,7 @@ class Goal:
     round_max_s: int
     idle_s: int
     snapshot: bool
-    verify_command: str
+    verify_command: str | None
     verify_timeout_s: int
     agents: dict[str, AgentConfig]
     path: Path
@@ -189,7 +180,7 @@ def load_goal(path: Path) -> Goal:
 
     verify = _table(data, "verify", "")
     _check_keys(verify, {"command", "timeout_s"}, "[verify]")
-    verify_command = _required_str(verify, "command", "verify.")
+    verify_command = _required_str(verify, "command", "verify.") if "command" in verify else None
 
     agents_table = _table(data, "agents", "")
     unknown = sorted(set(agents_table) - set(AGENT_NAMES))

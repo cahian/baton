@@ -1,8 +1,12 @@
 import contextlib
+import errno
+import io
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -73,6 +77,12 @@ def test_clean_env_removes_every_key():
 def test_codex_credential_variables_are_scrubbed(key):
     assert key in SCRUBBED_ENV
     assert key not in clean_env({key: "secret", "PATH": "/bin"})
+
+
+def test_anthropic_variables_are_no_longer_scrubbed():
+    # Claude left the rotation; nothing here launches it, so its variables are the user's own.
+    assert "ANTHROPIC_API_KEY" not in SCRUBBED_ENV
+    assert "ANTHROPIC_AUTH_TOKEN" not in SCRUBBED_ENV
 
 
 def test_clean_env_defaults_to_process_environment(monkeypatch):
@@ -574,3 +584,161 @@ def test_tick_stop_during_drain_is_kept_when_no_guard_follows(tmp_path):
         _burst_then_guard(4000), tmp_path, None, make_ctx(tmp_path), on_line, tick, tick_s=0.1
     )
     assert ex.stopped is tick_stop
+
+
+class BrokenLog:
+    """A log on a full disk: every operation fails once `failing()` says so."""
+
+    def __init__(self, failing):
+        self.failing = failing
+
+    def _check(self):
+        if self.failing():
+            raise OSError(errno.EFBIG, "File too large")
+
+    def write(self, data):
+        self._check()
+        return len(data)
+
+    def flush(self):
+        self._check()
+
+    def close(self):
+        self._check()
+
+
+def broken_log_path(path: Path, failing) -> Path:
+    class BrokenLogPath(type(path)):
+        def open(self, *args, **kwargs):
+            return BrokenLog(failing)
+
+    return BrokenLogPath(path)
+
+
+def test_log_failure_while_stopping_still_kills_a_sigterm_ignoring_group(tmp_path, monkeypatch):
+    monkeypatch.setattr(proc, "KILL_GRACE_S", 0.2)
+    code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ready', flush=True)\n"
+        "while True:\n"
+        "    print('still here', flush=True); time.sleep(0.01)\n"
+    )
+    stop = RoundResult(LIMIT, reason="guard")
+    broken = threading.Event()
+    spawned = []
+
+    def on_line(line):
+        if line == "ready":
+            broken.set()  # the disk fills up as the stop is decided
+            return stop
+        return None
+
+    ctx = make_ctx(
+        tmp_path,
+        log_path=broken_log_path(tmp_path / "x.log", broken.is_set),
+        on_spawn=spawned.append,
+    )
+    try:
+        ex = run_streaming(py(code), tmp_path, None, ctx, on_line, lambda: None)
+    finally:
+        if spawned:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(spawned[0], signal.SIGKILL)
+    assert ex.stopped is stop
+    assert ex.returncode == -9
+
+
+def test_log_failure_does_not_stop_on_line_delivery(tmp_path):
+    guard = RoundResult(LIMIT, reason="guard")
+    got = []
+
+    def on_line(line):
+        got.append(line)
+        return guard if line == "GUARD" else None
+
+    ctx = make_ctx(tmp_path, log_path=broken_log_path(tmp_path / "x.log", lambda: True))
+    ex = run_streaming(_burst_then_guard(50), tmp_path, None, ctx, on_line, lambda: None)
+    assert ex.stopped is guard
+    assert len(got) == 51 and got[-1] == "GUARD"
+    assert ex.tail.rstrip().endswith("GUARD")
+
+
+def test_hard_cap_never_discards_queued_lines(tmp_path, monkeypatch):
+    monkeypatch.setattr(proc, "HARD_DRAIN_S", 0.05)
+    n = 1000
+    guard = RoundResult(LIMIT, reason="guard")
+    got = []
+
+    def on_line(line):
+        got.append(line)
+        time.sleep(0.001)  # about 1.3 s of work, far past the cap
+        return guard if line == "GUARD" else None
+
+    ex = run_streaming(
+        _burst_then_guard(n), tmp_path, None, make_ctx(tmp_path), on_line, lambda: None, tick_s=0.1
+    )
+    assert ex.stopped is guard
+    assert got == [f"L {i}" for i in range(n)] + ["GUARD"]
+
+
+def test_timeout_never_discards_queued_lines(tmp_path):
+    n = 200
+    guard = RoundResult(LIMIT, reason="guard")
+    ctx = make_ctx(tmp_path)
+    got = []
+
+    def on_line(line):
+        if not got:
+            ctx.round_max_s = 0  # the limit passes with the whole burst already queued
+            time.sleep(0.3)
+        got.append(line)
+        return guard if line == "GUARD" else None
+
+    code = (
+        f"for i in range({n}): print('L', i)\n"
+        "print('GUARD', flush=True)\n"
+        "import time; time.sleep(60)\n"
+    )
+    ex = run_streaming(py(code), tmp_path, None, ctx, on_line, lambda: None, tick_s=0.01)
+    assert ex.timed_out
+    assert ex.stopped is guard
+    assert got == [f"L {i}" for i in range(n)] + ["GUARD"]
+
+
+def test_reader_told_to_stop_queues_the_chunk_it_already_read(tmp_path):
+    lines = queue.Queue(maxsize=1)
+    lines.put(b"first\n")
+    stop, abandon = threading.Event(), threading.Event()
+    stream = io.BytesIO(b"second\nthird\n")
+    reader = threading.Thread(target=proc._reader, args=(stream, lines, stop, abandon), daemon=True)
+    reader.start()
+    end = time.monotonic() + 5
+    while stream.tell() == 0 and time.monotonic() < end:  # now it holds "second", waits for room
+        time.sleep(0.001)
+    stop.set()
+    got = [lines.get(timeout=2), lines.get(timeout=2), lines.get(timeout=2)]
+    reader.join(timeout=2)
+    assert got == [b"first\n", b"second\n", proc._EOF]  # "third" was never read
+    assert not reader.is_alive()
+
+
+def test_raising_on_line_still_stops_the_group(tmp_path):
+    spawned = []
+
+    def on_line(line):
+        raise RuntimeError("boom")
+
+    code = "print('ready', flush=True)\nimport time; time.sleep(60)\n"
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="boom"):
+        run_streaming(
+            py(code),
+            tmp_path,
+            None,
+            make_ctx(tmp_path, on_spawn=spawned.append),
+            on_line,
+            lambda: None,
+        )
+    assert time.monotonic() - t0 < 5
+    assert wait_dead(spawned[0])

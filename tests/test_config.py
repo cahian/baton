@@ -20,18 +20,18 @@ def write(tmp_path: Path, text: str) -> Path:
 
 def minimal(skip: str | None = None) -> str:
     parts = [v for k, v in BASE.items() if k != skip]
-    if skip != "verify.command":
-        parts.append(VERIFY)
+    parts.append(VERIFY)
     return "\n".join(parts) + "\n"
 
 
 def test_defaults_match_spec(tmp_path):
     goal = load_goal(write(tmp_path, minimal()))
-    assert goal.order == ("codex", "antigravity", "claude")
+    assert goal.order == ("codex", "antigravity")
+    assert set(goal.agents) == {"codex", "antigravity"}
     assert goal.workdir == Path("/work/demo")
     assert (goal.round_max_s, goal.idle_s, goal.snapshot) == (3600, 1200, True)
     assert (goal.verify_command, goal.verify_timeout_s) == ("./check.sh", 3600)
-    codex, agy, claude = (goal.agents[n] for n in ("codex", "antigravity", "claude"))
+    codex, agy = (goal.agents[n] for n in ("codex", "antigravity"))
     assert codex.enabled and codex.threshold_pct == 90 and codex.poll_s == 15
     assert (codex.model, codex.effort, codex.bin, codex.full_access) == (
         "gpt-6.1-sol",
@@ -42,12 +42,10 @@ def test_defaults_match_spec(tmp_path):
     assert agy.enabled is True
     assert (agy.model, agy.bin) == ("gemini-4-argon-medium", "agy")
     assert (agy.threshold_pct, agy.poll_s) == (90, 30)
-    assert claude.enabled and claude.threshold_pct == 95
-    assert (claude.model, claude.effort, claude.bin) == ("sonnet", "high", "claude")
     assert goal.path == tmp_path / "goal.toml"
 
 
-@pytest.mark.parametrize("key", ["name", "workdir", "objective", "verify.command"])
+@pytest.mark.parametrize("key", ["name", "workdir", "objective"])
 def test_missing_required_key_raises_goalerror(tmp_path, key):
     with pytest.raises(GoalError, match=key.replace(".", r"\.")):
         load_goal(write(tmp_path, minimal(skip=key)))
@@ -75,7 +73,8 @@ def test_overrides_are_applied(tmp_path):
     "extra",
     [
         "[agents.codex]\nthreshold_pct = 0\n",
-        "[agents.claude]\nthreshold_pct = 100\n",
+        "[agents.antigravity]\nthreshold_pct = 100\n",
+        "[agents.claude]\nenabled = true\n",
         "[agents.codex]\nthreshold_pct = 'high'\n",
         "[agents.codex]\nenabled = 1\n",
         "[agents.nope]\nenabled = true\n",
@@ -117,11 +116,7 @@ def test_relative_goal_path_gives_absolute_workdir(tmp_path, monkeypatch):
 
 
 def test_all_ordered_agents_disabled_raises(tmp_path):
-    text = (
-        minimal()
-        + "[agents.codex]\nenabled = false\n[agents.claude]\nenabled = false\n"
-        + "[agents.antigravity]\nenabled = false\n"
-    )
+    text = minimal() + "[agents.codex]\nenabled = false\n[agents.antigravity]\nenabled = false\n"
     with pytest.raises(GoalError, match="disabled"):
         load_goal(write(tmp_path, text))
 
@@ -136,3 +131,25 @@ def test_enabled_agent_outside_order_does_not_count(tmp_path):
 def test_threshold_99_is_accepted(tmp_path):
     goal = load_goal(write(tmp_path, minimal() + "[agents.codex]\nthreshold_pct = 99\n"))
     assert goal.agents["codex"].threshold_pct == 99
+
+
+def test_verify_command_is_optional(tmp_path):
+    text = minimal().replace(VERIFY, "")
+    assert load_goal(write(tmp_path, text)).verify_command is None
+    text = minimal().replace(VERIFY, "[verify]\ntimeout_s = 60\n")
+    goal = load_goal(write(tmp_path, text))
+    assert (goal.verify_command, goal.verify_timeout_s) == (None, 60)
+
+
+def test_empty_verify_command_still_raises(tmp_path):
+    text = minimal().replace('"./check.sh"', '""')
+    with pytest.raises(GoalError, match=r"verify\.command"):
+        load_goal(write(tmp_path, text))
+
+
+def test_claude_is_no_longer_an_agent(tmp_path):
+    text = minimal().replace(
+        'objective = "Ship it."', 'objective = "x"\norder = ["codex", "claude"]'
+    )
+    with pytest.raises(GoalError, match="claude"):
+        load_goal(write(tmp_path, text))
