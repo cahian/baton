@@ -717,6 +717,7 @@ def test_reader_told_to_stop_queues_the_chunk_it_already_read(tmp_path):
     while stream.tell() == 0 and time.monotonic() < end:  # now it holds "second", waits for room
         time.sleep(0.001)
     stop.set()
+    time.sleep(proc.PUT_TIMEOUT_S * 4)  # room appears only after the stop was seen
     got = [lines.get(timeout=2), lines.get(timeout=2), lines.get(timeout=2)]
     reader.join(timeout=2)
     assert got == [b"first\n", b"second\n", proc._EOF]  # "third" was never read
