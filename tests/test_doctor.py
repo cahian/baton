@@ -8,7 +8,7 @@ from baton import doctor
 from baton.config import load_goal
 from baton.doctor import Check, Proc, interactive_codex, run_checks
 
-SECRET = "sk-very-secret-value-12345"
+SECRET = "fake-very-secret-value-12345"
 
 
 @pytest.fixture(autouse=True)
@@ -213,7 +213,7 @@ def test_antigravity_unreadable_balance_blocks(fakes, credits):
 
 # --- Claude API -------------------------------------------------------------------------------
 
-CLAUDE_KEY = "sk-ant-api03-DOCTORKEY0123456789abcdef"
+CLAUDE_KEY = "fake-ant-api03-DOCTORKEY0123456789abcdef"
 
 
 def claude_ledger(fakes, spent="0", reserved=None):
@@ -334,7 +334,7 @@ def test_claude_uses_the_cost_report_when_an_admin_key_is_set(fakes, monkeypatch
     from baton.adapters import claude_api
 
     admin = fakes.root / "admin.key"
-    admin.write_text("sk-ant-admin01-ADMINKEY\n")
+    admin.write_text("fake-ant-admin01-ADMINKEY\n")
     admin.chmod(0o600)
     monkeypatch.setattr(claude_api, "fetch_cost_report", lambda path, since, **kw: Decimal("170"))
     claude_ledger(fakes, spent="20")
@@ -348,7 +348,7 @@ def test_claude_cost_report_failure_is_flagged(fakes, monkeypatch):
     from baton.adapters import claude_api
 
     admin = fakes.root / "admin.key"
-    admin.write_text("sk-ant-admin01-ADMINKEY\n")
+    admin.write_text("fake-ant-admin01-ADMINKEY\n")
     admin.chmod(0o600)
 
     def broken(path, since, **kw):

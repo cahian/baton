@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps `baton serve` running. Replace the placeholders, then:
+    cp examples/baton-serve.plist ~/Library/LaunchAgents/<label>.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+  Stop it with:  launchctl bootout gui/$(id -u)/<label>
+  launchd does not load your shell profile: PATH must reach baton, codex, agy and claude.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.baton-serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/bin/baton</string>
+    <string>serve</string>
+    <string>--port</string>
+    <string>18777</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/path/to/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/path/to/home</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/path/to/baton-serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/baton-serve.log</string>
+</dict>
+</plist>

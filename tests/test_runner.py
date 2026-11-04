@@ -701,7 +701,7 @@ def test_gate_output_is_a_tail(tmp_path, work):
 
 @pytest.fixture
 def repo(tmp_path, work, monkeypatch):
-    for key, value in (("NAME", "Baton Tests"), ("EMAIL", "baton-tests@baton.dev")):
+    for key, value in (("NAME", "Baton Tests"), ("EMAIL", "baton-tests@baton.invalid")):
         monkeypatch.setenv(f"GIT_AUTHOR_{key}", value)
         monkeypatch.setenv(f"GIT_COMMITTER_{key}", value)
     subprocess.run(["git", "init", "-q", str(work)], check=True)

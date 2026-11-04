@@ -846,7 +846,7 @@ def test_extra_env_reaches_only_that_child(tmp_path, monkeypatch):
 
 
 def test_extra_env_values_are_redacted_from_log_and_lines(tmp_path):
-    secret = "sk-ant-api03-SECRETSECRET"
+    secret = "fake-ant-api03-SECRETSECRET"
     ctx = make_ctx(tmp_path)
     shown, parsed = [], []
     ctx.on_output = shown.append
@@ -865,7 +865,7 @@ def test_extra_env_values_are_redacted_from_log_and_lines(tmp_path):
 
 
 def test_a_secret_split_across_two_chunks_is_still_redacted(tmp_path):
-    secret = "sk-ant-api03-SPLITSPLITSPLIT"
+    secret = "fake-ant-api03-SPLITSPLITSPLIT"
     # one line, longer than the 64 KB chunk, with the secret straddling the cut
     code = (
         "import os, sys\n"
@@ -903,7 +903,7 @@ def test_a_cut_line_without_a_secret_arrives_whole_and_in_order(tmp_path):
         ctx,
         lambda line: parsed.append(line) and None,
         lambda: None,
-        extra_env={"K": "sk-ant-api03-NOTPRINTED"},
+        extra_env={"K": "fake-ant-api03-NOTPRINTED"},
     )
     assert "".join(parsed[:-1]) == "x" * 200000 and parsed[-1] == "end"
     assert ctx.log_path.read_text() == "x" * 200000 + "\nend\n"
@@ -918,6 +918,6 @@ def test_the_held_back_end_of_an_unfinished_last_line_still_reaches_the_log(tmp_
         ctx,
         never,
         lambda: None,
-        extra_env={"K": "sk-ant-api03-NOTPRINTED"},
+        extra_env={"K": "fake-ant-api03-NOTPRINTED"},
     )
     assert ctx.log_path.read_text() == "y" * 65536

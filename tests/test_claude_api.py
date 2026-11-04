@@ -33,8 +33,8 @@ from baton.ledger import Ledger
 from baton.proc import SCRUBBED_ENV
 
 FAKE = Path(__file__).parent / "fakes" / "fake_claude.py"
-KEY = "sk-ant-api03-TESTKEY0123456789abcdefghij"
-ADMIN_KEY = "sk-ant-admin01-ADMINKEY0123456789abcdef"
+KEY = "fake-ant-api03-TESTKEY0123456789abcdefghij"
+ADMIN_KEY = "fake-ant-admin01-ADMINKEY0123456789abcdef"
 NOW = datetime(2026, 11, 4, 12, tzinfo=UTC).timestamp()
 NEXT_PERIOD = datetime(2026, 12, 1, tzinfo=UTC).timestamp()
 CEILING = Decimal("180")
