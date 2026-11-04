@@ -801,3 +801,33 @@ def test_only_the_last_error_lines_are_kept(fake, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_EXEC_EXIT", "1")
     res = adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path))
     assert res.outcome == TRANSIENT  # the limit line was pushed out of the bounded window
+
+
+# --- fix round 2 -----------------------------------------------------------------------------
+
+
+def test_refusal_on_partial_data_with_no_reset_retries_in_five_minutes():
+    r = limits(allowed=False, primary=None, secondary=None)
+    a = check_limits(r, 90, NOW)
+    assert not a.ok and a.until == NOW + 300
+
+
+def test_refusal_on_clean_data_with_no_reset_keeps_until_unknown():
+    r = limits(primary=95, secondary=None)
+    del r["rateLimits"]["primary"]["resetsAt"]
+    a = check_limits(r, 90, NOW)
+    assert not a.ok and a.until is None
+
+
+def test_closing_read_with_readable_balance_ignores_a_stubborn_blind_field(fake, tmp_path):
+    blind = without(limits(balance="10"), "rateLimits", "rateLimitReachedType")
+    a, reads = closing_adapter(fake, limits(balance="10"), blind)
+    res = a.run_round("go", make_ctx(tmp_path))
+    assert res.outcome == COMPLETED
+    assert reads.calls == 2  # the balance parsed and held: no retry, no false credit_guard
+
+
+def test_closing_read_with_blind_field_still_sees_a_drop(fake, tmp_path):
+    blind_drop = without(limits(balance="9"), "rateLimits", "rateLimitReachedType")
+    a, _ = closing_adapter(fake, limits(balance="10"), blind_drop)
+    assert a.run_round("go", make_ctx(tmp_path)).outcome == CREDIT_GUARD

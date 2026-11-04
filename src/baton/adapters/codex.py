@@ -280,6 +280,8 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> _Eval:
         until = max(known) if known else None
         if until is not None and until <= now:
             until = now + RETRY_S  # a stale reset is no reset
+        elif until is None and blind:
+            until = now + RETRY_S  # refused on partial data: retry after the usual pause
     else:
         until = now + RETRY_S
     text = "; ".join(reasons + [f"unreadable: {b}" for b in blind] if reasons else blind)
@@ -337,7 +339,7 @@ class _Guard:
         if now - self.last_poll < self.cfg.poll_s:
             return None
         self.last_poll = now
-        verdict, unreadable = self._observe()
+        verdict, unreadable, _ = self._observe()
         if verdict is not None:
             return verdict
         if unreadable is None:
@@ -351,8 +353,9 @@ class _Guard:
             )
         return None
 
-    def _observe(self) -> tuple[RoundResult | None, str | None]:
-        """One read: (a verdict that stops the round, why the read was not fully readable).
+    def _observe(self) -> tuple[RoundResult | None, str | None, bool]:
+        """One read: (a verdict that stops the round, why it was not fully readable, whether
+        the balance parsed).
 
         Order matters: any parseable balance is compared first, then clear refusals are honoured,
         and only then is being blind counted by the caller.
@@ -361,7 +364,7 @@ class _Guard:
         try:
             result = self.read()
         except Exception as exc:
-            return None, f"limits read failed: {exc}"
+            return None, f"limits read failed: {exc}", False
         ev = _evaluate(result, self.cfg.threshold_pct, self.wall_clock())
         unreadable = ev.avail.reason if ev.blind else None
         if ev.balance is not None and ev.balance < self.baseline:
@@ -372,10 +375,13 @@ class _Guard:
                     reason=f"credit balance dropped from {self.baseline} to {ev.balance}",
                 ),
                 unreadable,
+                True,
             )
+        seen = ev.balance is not None
         if ev.refused:
-            return RoundResult(LIMIT, until=ev.avail.until, reason=ev.avail.reason), unreadable
-        return None, unreadable
+            result = RoundResult(LIMIT, until=ev.avail.until, reason=ev.avail.reason)
+            return result, unreadable, seen
+        return None, unreadable, seen
 
     def close(self) -> RoundResult | None:
         """The read after the process is gone: it must see the balance, or the round is suspect.
@@ -385,10 +391,12 @@ class _Guard:
         """
         why = ""
         for _ in range(2):
-            verdict, unreadable = self._observe()
+            verdict, unreadable, balance_seen = self._observe()
             if verdict is not None and verdict.outcome == CREDIT_GUARD:
                 return verdict
-            if unreadable is None:
+            # What close() guards is the balance: once it parsed and did not drop, another
+            # field staying blind says nothing about a debit.
+            if unreadable is None or balance_seen:
                 return None
             why = unreadable
         return RoundResult(
