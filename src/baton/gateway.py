@@ -1,12 +1,14 @@
 """The OpenCode gateway: the whole rotation behind one OpenAI-compatible model, `baton/auto`.
 
 One job per OpenCode session runs `run_goal` in a daemon thread of this process. The HTTP
-connection only watches the job: dropping it never stops the work, and the next request for the
-same session either interrupts the running job with a note or starts a new one.
+connection only watches the job: dropping it never stops the work. The next request for the same
+session attaches to the stream when it carries no new user message; otherwise it interrupts the
+running job with a note, or starts a new one. `job.json` lets the next server take a job up again.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,7 +20,7 @@ import threading
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,9 +28,9 @@ from urllib.parse import quote
 
 from baton.adapters.base import Adapter
 from baton.config import Goal, GoalError, check_repo_table, goal_from_table
-from baton.proc import OURS, check_group, kill_group
+from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group
 from baton.runner import run_goal
-from baton.store import AlreadyRunning, StateError, Store, state_dir
+from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 18777
@@ -50,6 +52,8 @@ MAX_RESTARTS = 5
 SETTLE_POLL_S = 0.05
 GATE_SHOWN_CHARS = 1500
 NAME_MAX_CHARS = 100
+# job.json `status`: anything but RUNNING is left alone when `baton serve` starts.
+RUNNING, FINISHED, STOPPED, REFUSED = "running", "finished", "stopped", "refused"
 
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
@@ -105,6 +109,14 @@ def last_user_index(messages: list) -> int | None:
         if _role(messages[i]) == "user":
             return i
     return None
+
+
+def message_mark(messages: list, index: int) -> tuple[int, str]:
+    """What identifies the user message at `index`: its position among the user messages, and a
+    hash of its text. A retry repeats both; the same words said again come at a later position."""
+    position = sum(1 for message in messages[:index] if _role(message) == "user")
+    text = _text_of(messages[index]).strip()
+    return position, hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def history_text(messages: list) -> str:
@@ -252,6 +264,21 @@ def render_event(kind: str, f: Mapping) -> str:
     return ""
 
 
+def slim_conversation(context: list) -> list[dict]:
+    """The part of a conversation that a briefing can use, as plain text: `job.json` is rewritten
+    with each message, and requests can carry megabytes of tool traffic."""
+    kept: list[dict] = []
+    size = 0
+    for message in reversed(context):
+        role, text = _role(message), _text_of(message)
+        if role in ("user", "assistant") and text.strip():
+            kept.append({"role": role, "content": text})
+            size += len(text)
+            if size > HISTORY_MAX_CHARS:
+                break
+    return kept[::-1]
+
+
 def compose_objective(before: list, text: str) -> str:
     """The objective for `text` as the newest message: the conversation first, when there is
     one. It is the whole briefing of an agent with no session of its own."""
@@ -270,6 +297,19 @@ class _JobStore(Store):
     def __init__(self, root: Path, listener: Callable[[str, dict], None]) -> None:
         super().__init__(root)
         self._listener = listener
+        self.halted = False
+
+    def halt(self) -> None:
+        """Stop the run now because the server is going away. Held in memory and not in the stop
+        file: that file is a person's decision, and this job is to resume on the next start."""
+        self.halted = True
+
+    def stop_request(self) -> str:
+        return "now" if self.halted else super().stop_request()
+
+    def clear_stop(self) -> None:
+        if not self.halted:  # a person's own stop waits for the next start
+            super().clear_stop()
 
     def emit(self, kind: str, **fields: object) -> None:
         try:
@@ -290,6 +330,8 @@ class Job:
         goal: Goal,
         adapters_for: Callable[[Goal], Mapping[str, Adapter]],
         context: list[dict],
+        accepted: Iterable[tuple[int, str]] = (),
+        restarted: bool = False,
     ) -> None:
         self.session = session
         self.name = name
@@ -298,6 +340,10 @@ class Job:
         self.goal = goal
         # The conversation up to the newest message handed to this job.
         self.context = context
+        self.restarted = restarted  # taken up again by a new server, not started by a message
+        self._accepted = set(accepted)  # the marks of every user message this session has given
+        self._last_accepted: tuple[int, str] | None = None
+        self._refused = False
         self._adapters_for = adapters_for
         self._cond = threading.Condition()
         self._items: list[str] = []
@@ -312,6 +358,8 @@ class Job:
     # life
 
     def start(self) -> None:
+        if self.restarted:
+            self._push("\n[baton] baton restarted: continuing this job\n\n")
         self._thread.start()
 
     def is_running(self) -> bool:
@@ -332,7 +380,7 @@ class Job:
                     adapters,
                     self.store,
                     objective=self.objective,
-                    owes_round=attempt == 0,
+                    owes_round=attempt == 0 and not self.restarted,
                 )
                 # The run only finishes with no note left unread, but a message can land in the
                 # inbox between that check and the end of the run: start again for it.
@@ -345,13 +393,33 @@ class Job:
                 with self._cond:
                     self._closing = False
         except AlreadyRunning as exc:
+            self._refused = True
+            self._forget_last_message()
             self._push(f"\n[baton] cannot start: {exc}\n")
         except Exception as exc:  # one job crashing must never take the server with it
+            self._forget_last_message()
             self._push(f"\n[baton] the job crashed: {type(exc).__name__}: {exc}\n")
         finally:
             with self._cond:
+                self.save(self._final_status())
                 self._done = True
                 self._cond.notify_all()
+
+    def _forget_last_message(self) -> None:
+        """Nothing was done with it, so sending it again is not a retry of something accepted."""
+        with self._cond:
+            self._accepted.discard(self._last_accepted)
+
+    def _final_status(self) -> str:
+        """What the next `baton serve` should do. A run the server cut short, or one that
+        crashed, has not finished, and a person's stop is the only stop that lasts."""
+        if self._refused and not self.restarted:
+            return REFUSED
+        if self._end == "finished":
+            return FINISHED
+        if self._end == "stopped" and not self.store.halted:
+            return STOPPED
+        return RUNNING
 
     def _note_waiting(self) -> bool:
         """True when a run that finished left a note in the inbox. A run that was stopped
@@ -369,11 +437,40 @@ class Job:
         with self._cond:
             return compose_objective(self.context[:-1], self.context[-1]["content"])
 
-    def request_stop(self, now: bool = True) -> None:
-        try:
-            self.store.request_stop(now=now)
-        except OSError:
-            pass
+    def halt(self) -> None:
+        self.store.halt()
+
+    # what survives a restart
+
+    def save(self, status: str = RUNNING) -> None:
+        """Write job.json. Failing to is no reason to stop working, only to say so."""
+        with self._cond:
+            record = {
+                "session": self.session,
+                "workdir": str(self.workdir),
+                "objective": self.objective(),
+                "conversation": slim_conversation(self.context),
+                "accepted": sorted(self._accepted),
+                "status": status,
+            }
+            try:
+                self.store.save_job(record)
+            except (OSError, ValueError) as exc:
+                self._push(f"\n[baton] alert: could not save this job: {exc}\n\n")
+
+    def knows(self, mark: tuple[int, str]) -> bool:
+        with self._cond:
+            return mark in self._accepted
+
+    def accepted(self) -> set[tuple[int, str]]:
+        with self._cond:
+            return set(self._accepted)
+
+    def accept(self, mark: tuple[int, str]) -> None:
+        with self._cond:
+            self._accepted.add(mark)
+            self._last_accepted = mark
+            self.save()
 
     # feed
 
@@ -395,7 +492,7 @@ class Job:
                 self._end = kind
         self._push(render_event(kind, fields))
 
-    def add_note(self, text: str) -> bool:
+    def add_note(self, text: str, mark: tuple[int, str]) -> bool:
         """Queue a new message for the running job and end the current round, so the next one
         reads it. False when the job is over or about to be."""
         with self._cond:
@@ -404,17 +501,18 @@ class Job:
             self.store.say(text)
             self.store.request_interrupt()
             self.context.append({"role": "user", "content": text})
+            self.accept(mark)
         self._push(
             "\n[baton] message received: ending the current round so the next one reads it\n\n"
         )
         return True
 
-    def settle(self, text: str, timeout: float) -> str:
+    def settle(self, text: str, mark: tuple[int, str], timeout: float) -> str:
         """For a job that is wrapping up: wait until it takes the note ("accepted", it went
         on with a follow-up) or is over ("gone"). "timeout" when it is still neither."""
         deadline = time.monotonic() + timeout
         while True:
-            if self.add_note(text):
+            if self.add_note(text, mark):
                 return "accepted"
             if not self.is_running():
                 return "gone"
@@ -460,6 +558,15 @@ class Job:
                 sent = max(sent, last)
 
 
+def _marks(raw: object) -> set[tuple[int, str]]:
+    """The accepted-message marks of a job.json, which holds them as lists."""
+    return {
+        (mark[0], mark[1])
+        for mark in (raw if isinstance(raw, list) else ())
+        if isinstance(mark, list) and len(mark) == 2
+    }
+
+
 class JobManager:
     def __init__(self, adapters_for: Callable[[Goal], Mapping[str, Adapter]]) -> None:
         self._adapters_for = adapters_for
@@ -471,30 +578,65 @@ class JobManager:
         with self._lock:
             return self._jobs.get(session)
 
+    def attach(self, session: str, messages: list) -> Job | None:
+        """The session's job when this request brings no new user message, so a client that
+        retries reads the stream again and changes nothing. None when the message is new. Raises
+        GatewayError for a message that a server before this one already finished with."""
+        index = last_user_index(messages)
+        if index is None:
+            return None
+        mark = message_mark(messages, index)
+        job = self.get(session)
+        if job is not None:
+            return job if job.knows(mark) else None
+        if mark in self._recorded_marks(session):
+            raise GatewayError(
+                "this message was already handled, in a job that has ended. Send a new message "
+                "to go on."
+            )
+        return None
+
+    @staticmethod
+    def _recorded_marks(session: str) -> set[tuple[int, str]]:
+        """The marks in the session's job.json. Unreadable counts as none: a message is then
+        taken for new, which at worst repeats work, where the opposite would drop it."""
+        try:
+            record = Store(state_dir(job_name(session))).load_job()
+        except StateError:
+            return set()
+        raw = record.get("accepted") if record else None
+        return _marks(raw)
+
     def submit(self, session: str, workdir: Path, messages: list[dict]) -> Job:
         """Deliver the last user message to the session's job: as a note with an interrupt when
-        one is running, otherwise as the objective of a new one. At most one job runs in a
-        directory. Raises GatewayError or GoalError when nothing can be started."""
+        one is running, otherwise as the objective of a new one, and not at all when it was
+        delivered before. At most one job runs in a directory. Raises GatewayError or GoalError
+        when nothing can be started."""
         index = last_user_index(messages)
         text = _text_of(messages[index]).strip() if index is not None else ""
         if index is None or not text:
             raise GatewayError("the last message is empty, so there is nothing to work on.")
+        mark = message_mark(messages, index)
         while True:
             with self._lock:
                 if self._closed:
                     raise GatewayError("baton is shutting down, so it started nothing.")
                 old = self._jobs.get(session)
+                if old is not None and old.knows(mark):
+                    return old
                 if old is None or not old.is_running():
                     self._refuse_if_busy(session, workdir)
-                    job = self._create(session, workdir, messages[:index], text)
+                    accepted = old.accepted() if old else self._recorded_marks(session)
+                    job = self._create(session, workdir, messages[:index], text, accepted)
+                    job.accept(mark)
                     self._jobs[session] = job
                     job.start()
                     return job
-                if old.add_note(text):
+                if old.add_note(text, mark):
                     return old
             # It is wrapping up and still holds the goal's lock: wait outside our own lock, so
             # other sessions are not held up.
-            outcome = old.settle(text, HANDOVER_S)
+            outcome = old.settle(text, mark, HANDOVER_S)
             if outcome == "accepted":
                 return old
             if outcome == "timeout":
@@ -529,11 +671,18 @@ class JobManager:
         objective = compose_objective(before, text)
         return build_goal(name, workdir, objective), resumed
 
-    def _create(self, session: str, workdir: Path, before: list, text: str) -> Job:
+    def _create(
+        self,
+        session: str,
+        workdir: Path,
+        before: list,
+        text: str,
+        accepted: Iterable[tuple[int, str]],
+    ) -> Job:
         name = job_name(session)
         goal, resumed = self._briefing(name, workdir, before, text)
         context = [*before, {"role": "user", "content": text}]
-        job = Job(session, name, workdir, goal, self._adapters_for, context)
+        job = Job(session, name, workdir, goal, self._adapters_for, context, accepted)
 
         # A stop or interrupt left by something earlier is not about this message.
         job.store.clear_stop()
@@ -542,14 +691,111 @@ class JobManager:
             job.store.say(text)  # the resumed prompt carries no objective, only notes
         return job
 
+    # after a restart
+
+    def recover(self) -> int:
+        """Kill every recorded agent group that is verifiably ours and alive, then resume every
+        job that had not finished; how many were resumed. For `baton serve` as it starts.
+
+        Each goal is handled under its own lock, so a live runner's agent is never touched: a
+        second server, or a `baton run`, simply keeps what it holds. Nothing is signalled unless
+        `check_group` proves it ours, and one job that cannot be handled never stops the others.
+        """
+        base = state_base()
+        roots = sorted(
+            root
+            for root in (base.iterdir() if base.is_dir() else ())
+            if root.is_dir() and ((root / "state.json").exists() or (root / "job.json").exists())
+        )
+        resumed = 0
+        for root in roots:
+            try:
+                resumed += self._recover(root)
+            except Exception as exc:
+                print(f"baton: {root.name} was not recovered: {exc}", flush=True)
+        return resumed
+
+    def _recover(self, root: Path) -> bool:
+        store = Store(root)
+        try:
+            with store.lock():
+                self._kill_leftover(store)
+        except AlreadyRunning:
+            return False
+        record = store.load_job()
+        if record is None or record.get("status") != RUNNING:
+            return False
+        try:
+            self._resume(root.name, record)
+        except (GatewayError, GoalError, OSError) as exc:
+            store.emit("alert", message=f"this job could not be resumed: {exc}")
+            raise
+        return True
+
+    @staticmethod
+    def _kill_leftover(store: Store) -> None:
+        """End the group a dead run left behind. Called with the goal's lock held."""
+        state = store.load_state()
+        group, start = state.get("group"), state.get("group_start")
+        if group is None:
+            return
+        found = check_group(group, start)
+        if found == OURS:
+            kill_group(group)
+            store.emit("alert", message=f"stopped process group {group}, left by a previous run")
+        elif found == UNKNOWN:
+            store.emit(
+                "alert",
+                message=f"process group {group} from the last run is alive but could not be "
+                "verified, so it was not killed",
+            )
+        if check_group(group, start) == DEAD:
+            state.update(group=None, group_start=None)
+            store.save_state(state)
+
+    def _resume(self, name: str, record: dict) -> None:
+        session, directory = record.get("session"), record.get("workdir")
+        conversation = record.get("conversation")
+        if (
+            not isinstance(session, str)
+            or job_name(session) != name
+            or not isinstance(directory, str)
+            or not isinstance(conversation, list)
+            or not conversation
+            or not isinstance(conversation[-1], dict)
+            or not isinstance(conversation[-1].get("content"), str)
+        ):
+            raise GatewayError(f"its job.json does not describe job {name}")
+        workdir = Path(directory)
+        if not workdir.is_dir():
+            raise GatewayError(f"its directory does not exist: {workdir}")
+        objective = compose_objective(conversation[:-1], conversation[-1]["content"])
+        goal = build_goal(name, workdir, objective)
+        job = Job(
+            session,
+            name,
+            workdir,
+            goal,
+            self._adapters_for,
+            conversation,
+            _marks(record.get("accepted")),
+            restarted=True,
+        )
+        with self._lock:
+            if self._closed:
+                return
+            self._jobs[session] = job
+            job.start()
+
     def shutdown(self, timeout: float = SHUTDOWN_S) -> None:
-        """Stop every running job, killing its agent's process group, and wait for them."""
+        """Stop every running job, killing its agent's process group, and wait for them. The
+        jobs have not finished, so the next `baton serve` resumes them."""
         with self._lock:
             self._closed = True  # from here on submit starts nothing
             jobs = list(self._jobs.values())
         running = [j for j in jobs if j.is_running()]
         for job in running:
-            job.request_stop(now=True)
+            job.halt()
         deadline = time.monotonic() + timeout
         for job in running:
             job.join(max(0.0, deadline - time.monotonic()))
@@ -675,6 +921,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _job_for(self, session: str, messages: list) -> Job:
         manager = self.manager
+        attached = manager.attach(session, messages)
+        if attached is not None:
+            return attached
         existing = manager.get(session)
         if existing is not None and existing.is_running():
             workdir = existing.workdir
@@ -829,6 +1078,9 @@ def serve(port: int, adapters_for: Callable[[Goal], Mapping[str, Adapter]]) -> N
     print(f"baton: gateway listening on http://{host}:{bound}/v1", flush=True)
     with _Shutdown():
         try:
+            resumed = manager.recover()
+            if resumed:
+                print(f"baton: resumed {resumed} unfinished job(s)", flush=True)
             server.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:
             pass

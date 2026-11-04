@@ -1,5 +1,6 @@
 """The OpenCode gateway, over a real HTTP server on an ephemeral port with scripted adapters."""
 
+import contextlib
 import http.client
 import json
 import os
@@ -16,6 +17,7 @@ from baton import gateway, runner
 from baton.adapters.base import COMPLETED, LIMIT, Availability, RoundResult
 from baton.cli import main
 from baton.gateway import content_text, make_server
+from baton.proc import process_start
 from baton.store import Store, state_dir
 
 SESSION = "ses_abc123"
@@ -551,7 +553,7 @@ def test_a_message_never_read_by_a_stopped_job_is_not_run_again(gw):
     job = gw.job()
     # the stop and the message arrive together: the round ends, the stop wins, the note is unread
     Store(state_dir(gateway.job_name(SESSION))).request_stop(now=True)
-    assert job.add_note("a message that no agent will read")
+    assert job.add_note("a message that no agent will read", (9, "unread"))
     assert wait_for(lambda: not job.is_running())
     assert len(gw.agents["claude_api"].prompts) == 1
     text = s.read_all()
@@ -800,6 +802,463 @@ def test_shutdown_stops_a_running_job(gw):
     gw.manager.shutdown(timeout=10)
     assert not gw.job().is_running()
     assert "stopped" in s.read_all()
+
+
+# a client that retries
+
+
+def test_a_retry_attaches_without_interrupting_or_adding_a_note(gw):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "first")]
+    s = gw.stream("go")
+    s.read_until("first")
+    job = gw.job()
+    again = gw.stream("go")  # the same POST again: no new user message
+    assert gw.job() is job
+    assert not (job.store.root / "interrupt").exists()
+    assert not (job.store.root / "inbox.md").exists()
+    assert sum(1 for m in job.context if m["role"] == "user") == 1
+    release.set()
+    assert "done" in again.read_all()
+    assert len(gw.agents["claude_api"].prompts) == 1
+    assert not any(e.get("interrupted") for e in gw.events() if e["kind"] == "round_end")
+
+
+def test_two_copies_of_a_post_that_race_deliver_one_message(gw):
+    """Both can get past the look before `submit`, so `submit` must look again under its lock."""
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    gw.stream("go").read_until("busy")
+    job = gw.job()
+    messages = [{"role": "user", "content": "go"}]
+    assert gw.manager.submit(SESSION, gw.work, messages) is job
+    assert [m["content"] for m in job.context if m["role"] == "user"] == ["go"]
+    assert not (job.store.root / "interrupt").exists()
+    job.halt()
+
+
+def test_a_retry_does_not_kill_the_round(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    gw.stream("go")
+    time.sleep(1.2)  # should_kill is polled constantly: an interrupt would have been seen by now
+    assert gw.job().is_running()
+    assert [e["kind"] for e in gw.events()].count("round_end") == 0
+    gw.job().halt()
+
+
+def test_the_same_words_at_a_later_position_are_a_new_message(gw):
+    gw.agents["claude_api"].script = [until_killed("busy"), say("again")]
+    s = gw.stream("continue")
+    s.read_until("busy")
+    second = gw.stream(
+        "continue",
+        history=[{"role": "user", "content": "continue"}, {"role": "assistant", "content": "ok"}],
+    )
+    assert "interrupted by your message" in second.read_until("interrupted by your message")
+    second.read_all()
+    assert len(gw.agents["claude_api"].prompts) == 2
+
+
+def test_another_message_at_the_same_position_is_new(gw):
+    gw.agents["claude_api"].script = [until_killed("busy"), say("again")]
+    s = gw.stream("first")
+    s.read_until("busy")
+    gw.stream("second").read_all()
+    assert "second" in gw.agents["claude_api"].prompts[1]
+
+
+def test_a_retry_after_the_job_finished_starts_nothing(gw):
+    gw.agents["claude_api"].script = [say("first")]
+    assert "first" in gw.stream("go").read_all()
+    job = gw.job()
+    gw.stream("go").read_all()
+    assert gw.job() is job
+    assert len(gw.agents["claude_api"].prompts) == 1
+
+
+def test_a_retry_of_a_job_that_ended_under_an_earlier_server_starts_nothing(gw):
+    gw.agents["claude_api"].script = [say("first")]
+    gw.stream("go").read_all()
+    gw.manager._jobs.clear()  # what a new server knows: only the state directory
+    text = gw.stream("go").read_all()
+    assert "already handled" in text
+    assert gw.job() is None
+    assert len(gw.agents["claude_api"].prompts) == 1
+
+
+def test_a_retry_needs_no_session_directory(gw, monkeypatch):
+    gw.stream("go").read_all()
+    monkeypatch.setattr(
+        gateway, "session_directory", lambda _: pytest.fail("a retry must not look it up")
+    )
+    gw.stream("go").read_all()
+
+
+def test_a_message_that_could_not_start_is_not_a_retry(gw):
+    (gw.work / "baton.toml").write_text("not toml =\n")
+    assert "invalid" in gw.stream("go").read_all()
+    (gw.work / "baton.toml").unlink()
+    gw.agents["claude_api"].script = [say("second try")]
+    assert "second try" in gw.stream("go").read_all()
+
+
+def test_a_message_refused_by_a_lock_can_be_sent_again(gw):
+    gw.agents["claude_api"].script = [say("second try")]
+    with Store(state_dir(gateway.job_name(SESSION))).lock():
+        assert "cannot start" in gw.stream("go").read_all()
+    assert "second try" in gw.stream("go").read_all()
+    assert json.loads((gw.job().store.root / "job.json").read_text())["status"] == "finished"
+
+
+def test_a_crashed_job_can_be_told_again(gw, monkeypatch):
+    real = gw.manager._adapters_for
+
+    def broken(goal):
+        gw.manager._adapters_for = real
+        raise RuntimeError("no adapters")
+
+    gw.manager._adapters_for = broken
+    assert "crashed" in gw.stream("go").read_all()
+    gw.agents["claude_api"].script = [say("second try")]
+    assert "second try" in gw.stream("go").read_all()
+
+
+def test_message_mark_ignores_what_is_around_the_message():
+    one = [{"role": "system", "content": "a"}, {"role": "user", "content": "hi"}]
+    two = [
+        {"role": "system", "content": "b"},
+        {"role": "assistant", "content": "x"},
+        {"role": "user", "content": " hi "},
+    ]
+    assert gateway.message_mark(one, 1) == gateway.message_mark(two, 2)
+    assert gateway.message_mark(one, 1)[0] == 0
+
+
+# restarting
+
+
+def job_json(root):
+    return json.loads((root / "job.json").read_text())
+
+
+def restart(gw):
+    """The server as a new process finds it: nothing in memory, the state directory on disk."""
+    gw.manager._jobs.clear()
+    return gw.manager
+
+
+def leftover(name, workdir, status="running", session=SESSION, **state):
+    """The state directory of a job whose server died."""
+    store = Store(state_dir(name))
+    store.save_state({"workdir": str(workdir), **state})
+    store.save_job(
+        {
+            "session": session,
+            "workdir": str(workdir),
+            "objective": "fix the bug",
+            "conversation": [{"role": "user", "content": "fix the bug"}],
+            "accepted": [
+                list(gateway.message_mark([{"role": "user", "content": "fix the bug"}], 0))
+            ],
+            "status": status,
+        }
+    )
+    return store
+
+
+@pytest.fixture
+def stray():
+    """A live process group that is not a child waiting to be reaped by anyone but a thread."""
+    made = []
+
+    def spawn():
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        threading.Thread(target=proc.wait, daemon=True).start()
+        made.append(proc)
+        return proc
+
+    yield spawn
+    for proc in made:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def group_of(proc):
+    return {"group": proc.pid, "group_start": process_start(proc.pid)}
+
+
+def test_job_json_holds_what_a_restart_needs(gw):
+    gw.agents["claude_api"].script = [until_killed("busy"), say("done now")]
+    s = gw.stream("first")
+    s.read_until("busy")
+    record = job_json(gw.job().store.root)
+    assert record["session"] == SESSION
+    assert record["workdir"] == str(gw.work)
+    assert record["status"] == "running"
+    assert record["objective"] == "first"
+    assert record["conversation"] == [{"role": "user", "content": "first"}]
+    gw.stream("second").read_all()
+    record = job_json(gw.job().store.root)
+    assert [m["content"] for m in record["conversation"]] == ["first", "second"]
+    assert len(record["accepted"]) == 2
+    assert record["status"] == "finished"
+
+
+def test_job_json_is_not_a_copy_of_the_whole_request(gw):
+    huge = [
+        {"role": "tool", "content": "x" * 300_000},
+        {"role": "assistant", "content": "y" * 300_000},
+        {"role": "user", "content": "z" * 300_000},
+    ]
+    gw.stream("go", history=huge).read_all()
+    assert (gw.job().store.root / "job.json").stat().st_size < 400_000
+
+
+def test_a_person_stopping_a_job_is_final(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    gw.job().store.request_stop(now=True)
+    s.read_all()
+    assert job_json(gw.job().store.root)["status"] == "stopped"
+    manager = restart(gw)
+    assert manager.recover() == 0
+
+
+def test_a_server_shutdown_is_not_a_stop(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    root = gw.job().store.root
+    gw.manager.shutdown(timeout=10)
+    assert "stopped" in s.read_all()
+    assert job_json(root)["status"] == "running"
+    assert not (root / "stop").exists()
+
+
+def test_a_person_s_stop_survives_a_shutdown_of_the_server(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    job = gw.job()
+    job.halt()
+    outside = Store(job.store.root)  # `baton stop`, from another process
+    outside.request_stop()
+    s.read_all()
+    assert outside.stop_request() == "soon"
+
+
+def test_recover_kills_a_verified_group_and_resumes_the_job(gw, stray):
+    agent = stray()
+    store = leftover(gateway.job_name(SESSION), gw.work, **group_of(agent))
+    gw.agents["claude_api"].script = [say("back at it")]
+    manager = restart(gw)
+    assert manager.recover() == 1
+    job = manager.get(SESSION)
+    assert wait_for(lambda: not job.is_running())
+    assert agent.poll() is not None
+    assert "fix the bug" in gw.agents["claude_api"].prompts[0]
+    assert store.load_state()["group"] is None
+    assert job_json(store.root)["status"] == "finished"
+    assert any("left by a previous run" in str(e.get("message")) for e in store.events())
+
+
+def test_recover_kills_a_group_of_a_job_that_will_not_be_resumed(gw, stray):
+    agent = stray()
+    store = leftover("session-old", gw.work, status="finished", session="old", **group_of(agent))
+    manager = restart(gw)
+    assert manager.recover() == 0
+    assert wait_for(lambda: agent.poll() is not None)
+    assert store.load_state()["group"] is None
+    assert gw.agents["claude_api"].prompts == []
+
+
+def test_recover_kills_a_group_left_by_a_goal_run(gw, stray):
+    agent = stray()
+    Store(state_dir("a-goal")).save_state({"workdir": str(gw.work), **group_of(agent)})
+    assert restart(gw).recover() == 0
+    assert wait_for(lambda: agent.poll() is not None)
+
+
+def test_recover_leaves_a_live_runner_alone(gw, stray):
+    agent = stray()
+    store = leftover(gateway.job_name(SESSION), gw.work, **group_of(agent))
+    manager = restart(gw)
+    with store.lock():
+        assert manager.recover() == 0
+    assert agent.poll() is None
+    assert manager.get(SESSION) is None
+
+
+def test_recover_does_not_touch_a_group_it_cannot_verify(gw, stray):
+    agent = stray()
+    store = leftover("session-old", gw.work, status="finished", session="old", group=agent.pid)
+    assert restart(gw).recover() == 0
+    assert agent.poll() is None
+    assert store.load_state()["group"] == agent.pid
+    assert any("could not be verified" in str(e.get("message")) for e in store.events())
+
+
+def test_recover_does_not_touch_a_group_whose_number_was_recycled(gw, stray):
+    agent = stray()
+    store = leftover(
+        "session-old",
+        gw.work,
+        status="finished",
+        session="old",
+        group=agent.pid,
+        group_start="Mon Jan  1 00:00:00 2001",
+    )
+    assert restart(gw).recover() == 0
+    assert agent.poll() is None
+    assert store.load_state()["group"] == agent.pid
+
+
+def test_recover_leaves_finished_and_stopped_jobs(gw):
+    for name, status in (("finished", "finished"), ("stopped", "stopped"), ("refused", "refused")):
+        leftover(f"session-{name}", gw.work, status=status, session=name)
+    manager = restart(gw)
+    assert manager.recover() == 0
+    assert gw.agents["claude_api"].prompts == []
+
+
+def test_recover_goes_on_past_a_job_it_cannot_read(gw, capsys):
+    bad = Store(state_dir("session-bad"))
+    (bad.root / "job.json").write_text("{ not json")
+    leftover("session-gone", gw.work / "gone", session="gone")
+    leftover(gateway.job_name(SESSION), gw.work)
+    gw.agents["claude_api"].script = [say("still works")]
+    manager = restart(gw)
+    assert manager.recover() == 1
+    out = capsys.readouterr().out
+    assert "session-bad" in out and "session-gone" in out
+    assert wait_for(lambda: not manager.get(SESSION).is_running())
+
+
+def test_a_job_json_that_names_another_session_is_not_resumed(gw, capsys):
+    leftover("session-other", gw.work, session="not-this-one")
+    assert restart(gw).recover() == 0
+    assert gw.agents["claude_api"].prompts == []
+
+
+def test_a_resumed_job_honours_a_stop_asked_for_while_the_server_was_down(gw):
+    store = leftover(gateway.job_name(SESSION), gw.work)
+    store.request_stop()
+    manager = restart(gw)
+    assert manager.recover() == 1
+    assert wait_for(lambda: not manager.get(SESSION).is_running())
+    assert gw.agents["claude_api"].prompts == []
+    assert job_json(store.root)["status"] == "stopped"
+
+
+def test_a_resumed_job_does_not_owe_another_round(gw):
+    (gw.work / "baton.toml").write_text('[verify]\ncommand = "true"\n')
+    store = leftover(gateway.job_name(SESSION), gw.work)
+    manager = restart(gw)
+    assert manager.recover() == 1
+    assert wait_for(lambda: not manager.get(SESSION).is_running())
+    assert gw.agents["claude_api"].prompts == []
+    assert job_json(store.root)["status"] == "finished"
+
+
+def test_a_resumed_job_keeps_the_round_it_owed(gw):
+    (gw.work / "baton.toml").write_text('[verify]\ncommand = "true"\n')
+    leftover(gateway.job_name(SESSION), gw.work, owes_round=True)
+    manager = restart(gw)
+    assert manager.recover() == 1
+    assert wait_for(lambda: not manager.get(SESSION).is_running())
+    assert len(gw.agents["claude_api"].prompts) == 1
+
+
+@pytest.fixture
+def resumed(gw):
+    """A server taken over by a new manager while a job's round is running."""
+    leftover(gateway.job_name(SESSION), gw.work)
+    gw.agents["claude_api"].script = [until_killed("resumed work"), say("finished it")]
+    assert restart(gw).recover() == 1
+    return gw
+
+
+def test_reattaching_to_a_resumed_job_streams_it_without_interrupting(resumed):
+    gw = resumed
+    s = gw.stream("fix the bug")  # the client retries what it was waiting on
+    assert "baton restarted" in s.read_until("resumed work")
+    assert [m["content"] for m in gw.job().context] == ["fix the bug"]  # no note was added
+    assert not (gw.job().store.root / "inbox.md").exists()
+    gw.job().halt()
+    s.read_all()
+    assert not any(e.get("interrupted") for e in gw.events() if e["kind"] == "round_end")
+
+
+def test_a_new_message_reaches_a_resumed_job(resumed):
+    gw = resumed
+    gw.stream("fix the bug").read_until("resumed work")
+    s = gw.stream(
+        "and the docs",
+        history=[
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": "working"},
+        ],
+    )
+    text = s.read_all()
+    assert "interrupted by your message" in text and "finished it" in text
+    assert "and the docs" in gw.agents["claude_api"].prompts[1]
+
+
+def test_serve_kill_9_kills_the_orphan_and_resumes_the_job(fakes, monkeypatch, tmp_path):
+    """The whole repro, with real processes: the agent outlives the server, and the next server
+    ends it and carries the job on."""
+    db = tmp_path / "opencode.db"
+    make_db(db, [(SESSION, str(fakes.work))])
+    monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
+    (fakes.work / "baton.toml").write_text(
+        'order = ["codex"]\nsnapshot = false\n'
+        "[agents.antigravity]\nenabled = false\n[agents.claude_api]\nenabled = false\n"
+    )
+
+    def start(sleep):
+        env = {**os.environ, "FAKE_CODEX_EXEC_SLEEP": sleep}
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "baton.cli", "serve", "--port", "0"],
+            stdout=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        line = proc.stdout.readline()
+        assert "127.0.0.1" in line, line
+        return proc, int(line.rsplit(":", 1)[1].split("/")[0])
+
+    first, port = start("60")
+    second = None
+    try:
+        Stream(port, request("work for a long time"))
+        assert wait_for(fakes.codex_pidfile.exists)
+        pid = int(fakes.codex_pidfile.read_text())
+        state = Store(state_dir(gateway.job_name(SESSION)))
+        assert wait_for(lambda: state.load_state().get("group") == pid)
+        first.kill()
+        first.wait()
+        assert _alive(pid), "the agent should outlive a server killed with SIGKILL"
+
+        second, port = start("0")
+        assert wait_for(lambda: not _alive(pid))
+        assert wait_for(lambda: job_json(state.root)["status"] == "finished")
+        assert len(fakes.codex_calls()) == 2
+        assert "resume" in fakes.codex_calls()[1]["argv"]  # its own conversation goes on
+        Stream(port, request("work for a long time")).read_all()
+        assert len(fakes.codex_calls()) == 2  # the retry attached: no third agent call
+    finally:
+        for proc in (first, second):
+            if proc is None:
+                continue
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            proc.stdout.close()
+        if fakes.codex_pidfile.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(fakes.codex_pidfile.read_text()), signal.SIGKILL)
 
 
 def test_serve_stops_the_agent_group_on_sigterm(fakes, monkeypatch, tmp_path):

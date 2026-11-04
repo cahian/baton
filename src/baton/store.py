@@ -74,6 +74,7 @@ class Store:
         self._inbox = self.root / "inbox.md"
         self._stop = self.root / "stop"
         self._interrupt = self.root / "interrupt"
+        self._job = self.root / "job.json"
         self._seq = max(self._last_seq(self._events), self._last_seq(self._rotated))
 
     # events
@@ -170,6 +171,24 @@ class Store:
 
     def save_state(self, state: dict) -> None:
         _atomic_write(self._state, json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    # job
+
+    def save_job(self, record: dict) -> None:
+        """Write what `baton serve` needs to take a job up again after a restart."""
+        _atomic_write(self._job, json.dumps(record, ensure_ascii=False) + "\n")
+
+    def load_job(self) -> dict | None:
+        """The job record, or None when this is not a job. Raises StateError when unreadable."""
+        try:
+            data = json.loads(self._job.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise StateError(f"cannot read {self._job}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateError(f"corrupt job file {self._job}: not a JSON object")
+        return data
 
     # round logs
 
