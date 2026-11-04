@@ -132,7 +132,7 @@ Gemini 4 Argon<TAB>Gemini 4 Argon Weekly Limit<TAB>99%<TAB>2026-11-11T17:56:01Z
 
 `/credits` prints `Remaining credits<TAB>0`.
 
-Relevant rows are those whose first column is `Gemini Models` or starts with `Gemini`. Rows for `Claude and GPT models` are ignored. Used percent is `100 - remaining`. At least one `Gemini Models` row and a parseable credit balance are required, otherwise the agent is unavailable and retried after 5 min.
+Relevant rows are those whose first column is `Gemini Models` or starts with `Gemini`. Rows for `Claude and GPT models` are ignored. Used percent is `100 - remaining`. Both `Gemini Models` rows, Five Hour and Weekly, and a parseable credit balance are required, otherwise the agent is unavailable and retried after 5 min.
 
 Start a round only if every relevant row has used percent below `threshold_pct` (default 90). While a round runs, read both every `poll_s` (default 30) and apply the same rules as Codex: threshold reached is `limit`, credits below the balance read just before the round is `credit_guard`, two consecutive failed reads is `credit_guard`. A saturated row's reset sets the cooldown, the latest when several saturate.
 
@@ -277,6 +277,8 @@ Every value except `name`, `workdir` and `objective` has the default shown. With
 - `baton say <goal.toml> [--now] "note"`: adds to the inbox. `--now` also interrupts the current round.
 - `baton stop <goal.toml> [--now]`: requests a stop.
 - `baton opencode-config [--port 18777]`: prints the provider JSON for `opencode.json`.
+- `baton jobs`: lists jobs; `status`, `say` and `stop` also accept a job name.
+- `baton install-service [--port 18777]`: writes the launchd plist and loads it.
 
 ### OpenCode gateway
 
@@ -295,6 +297,8 @@ Request handling:
 - **Job already running for the session:** the new message becomes a note with interrupt, and the stream attaches to the job.
 - **Job finished for the session:** a new one starts, reusing the stored vendor session ids.
 
+On startup `baton serve` kills every recorded agent group that is verifiably ours and still alive, then resumes every job that had not finished. `job.json` in the job's state directory stores the session, workdir, objective and conversation. A message from a person always gets at least one round, even if the gate already passes. A repeated POST carrying no new user message attaches to the stream without interrupting. `baton.toml` may not set `bin`, `key_file`, `admin_key_file` or `full_access`. `threshold_pct` above 90 is rejected everywhere, and an `antigravity.model` must start with `gemini-`. `baton install-service` writes a launchd plist with absolute paths, KeepAlive, a PATH built from the resolved agent binaries and an ExitTimeOut above the shutdown wait.
+
 A job runs in its own thread inside `baton serve` through `run_goal`, independent of the HTTP connection. A dropped connection never stops it. Stream output: rendered agent text, one line on each rotation, wait or gate result, and a final summary. Send an empty-content delta every 15 s so long waits do not trip client timeouts. The `tools` field is ignored, since each CLI uses its own tools. `finish_reason: "stop"` is sent only when the job finishes, or `baton stop` is honoured.
 
 History: when a job starts with no vendor session id, the prompt includes the OpenCode conversation so far, up to the last 24000 chars. With a vendor session, only the new message goes in.
@@ -306,6 +310,8 @@ History: when a job starts with no vendor session id, the prompt includes the Op
 - Tests never call a real vendor. Fake CLIs and fake limit readers stand in.
 
 ## Risks to state plainly
+
+- An interrupted Claude round has no final cost, so its full reservation stays counted until the period rolls. Each interrupt can cost up to `round_budget_usd` of the ceiling.
 
 - Claude spend is an estimate. The hard stops are the credit running out, auto-reload being off, and the workspace spend limit, all configured in the Console.
 
