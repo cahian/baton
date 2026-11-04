@@ -15,7 +15,8 @@ DEFAULT_ORDER = ("claude_api", "antigravity", "codex")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# Per-agent defaults. `bin` is a bare command name, resolved from PATH later.
+# Per-agent defaults. `bin` is a bare command name, resolved from PATH later, or a path, where a
+# leading `~` is expanded.
 _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
     "codex": {
         "enabled": True,
@@ -70,6 +71,11 @@ GOAL_KEYS = frozenset(
     }
 )
 GLOBAL_ONLY = ("monthly_budget_usd", "reserve_pct", "budget_reset_day")
+# What a `baton.toml` may not set: it comes with the repository, so it must not choose which
+# executables run, which credentials are read or whether the sandbox is on.
+REPO_FORBIDDEN = ("bin", "key_file", "admin_key_file", "full_access")
+MAX_THRESHOLD_PCT = 90
+ANTIGRAVITY_MODEL_PREFIX = "gemini-"
 
 
 class GoalError(Exception):
@@ -184,7 +190,7 @@ def _load_claude_api(table: dict[str, Any]) -> AgentConfig:
         enabled=_bool(table, "enabled", d["enabled"], where),
         model=_str(table, "model", d["model"], where),
         effort=_str(table, "effort", d["effort"], where),
-        bin=_str(table, "bin", d["bin"], where),
+        bin=os.path.expanduser(_str(table, "bin", d["bin"], where)),
         monthly_budget_usd=_usd(table, "monthly_budget_usd", d["monthly_budget_usd"], where),
         reserve_pct=_int(table, "reserve_pct", d["reserve_pct"], where, 1, 99),
         round_budget_usd=_usd(table, "round_budget_usd", d["round_budget_usd"], where),
@@ -201,14 +207,17 @@ def _load_agent(name: str, table: dict[str, Any]) -> AgentConfig:
     where = f"agents.{name}."
     _check_keys(table, set(_AGENT_DEFAULTS[name]), f"[agents.{name}]")
     d = _AGENT_DEFAULTS[name]
+    model = _str(table, "model", d["model"], where)
+    if name == "antigravity" and not model.startswith(ANTIGRAVITY_MODEL_PREFIX):
+        raise GoalError(f"{where}model must start with {ANTIGRAVITY_MODEL_PREFIX!r}")
     return AgentConfig(
         name=name,
         enabled=_bool(table, "enabled", d["enabled"], where),
-        model=_str(table, "model", d["model"], where),
+        model=model,
         effort=_str(table, "effort", d["effort"], where),
-        threshold_pct=_int(table, "threshold_pct", d["threshold_pct"], where, 1, 99),
+        threshold_pct=_int(table, "threshold_pct", d["threshold_pct"], where, 1, MAX_THRESHOLD_PCT),
         poll_s=_int(table, "poll_s", d["poll_s"], where, 1, 3600),
-        bin=_str(table, "bin", d["bin"], where),
+        bin=os.path.expanduser(_str(table, "bin", d["bin"], where)),
         full_access=_bool(table, "full_access", d["full_access"], where),
     )
 
@@ -284,6 +293,18 @@ def load_goal(path: Path) -> Goal:
 
     rest = {k: v for k, v in data.items() if k not in ("name", "workdir", "objective")}
     return goal_from_table(rest, name=name, workdir=workdir, objective=objective, path=path)
+
+
+def check_repo_table(data: dict[str, Any]) -> None:
+    """Refuse what a `baton.toml` may not set. A malformed `agents` is left for the builder."""
+    agents = data.get("agents")
+    for agent, table in agents.items() if isinstance(agents, dict) else ():
+        for key in REPO_FORBIDDEN:
+            if isinstance(table, dict) and key in table:
+                raise GoalError(
+                    f"agents.{agent}.{key} may not be set here: a file that comes with a "
+                    f"repository must not choose executables or credentials (use {defaults_path()})"
+                )
 
 
 def goal_from_table(

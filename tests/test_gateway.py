@@ -342,6 +342,43 @@ def test_baton_toml_cannot_set_a_global_setting(gw):
     assert gw.agents["claude_api"].prompts == [] and gw.agents["codex"].prompts == []
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        '[agents.codex]\nbin = "./evil"\n',
+        '[agents.antigravity]\nbin = "./evil"\n',
+        '[agents.claude_api]\nbin = "./evil"\n',
+        '[agents.claude_api]\nkey_file = "./stolen.key"\n',
+        '[agents.claude_api]\nadmin_key_file = "./stolen.key"\n',
+        "[agents.codex]\nfull_access = true\n",
+        "[agents.antigravity]\nfull_access = false\n",
+    ],
+)
+def test_baton_toml_cannot_choose_executables_or_credentials(gw, line):
+    (gw.work / "baton.toml").write_text(line)
+    text = gw.stream("go").read_all()
+    assert "may not be set here" in text
+    assert gw.agents["codex"].prompts == [] and gw.agents["claude_api"].prompts == []
+
+
+def test_the_defaults_file_may_still_set_bin(fakes, monkeypatch):
+    fakes.defaults('[agents.codex]\nbin = "/opt/codex"\n')
+    goal = gateway.build_goal("session-x", fakes.work, "go")
+    assert goal.agents["codex"].bin == "/opt/codex"
+
+
+@pytest.mark.parametrize(
+    ("line", "why"),
+    [
+        ("[agents.codex]\nthreshold_pct = 91\n", "between 1 and 90"),
+        ('[agents.antigravity]\nmodel = "gpt-6"\n', "must start with 'gemini-'"),
+    ],
+)
+def test_baton_toml_obeys_the_same_rules_as_a_goal_file(gw, line, why):
+    (gw.work / "baton.toml").write_text(line)
+    assert why in gw.stream("go").read_all()
+
+
 def test_the_defaults_file_applies_to_a_session_job(gw, tmp_path, monkeypatch):
     defaults = tmp_path / "defaults.toml"
     defaults.write_text("[agents.claude_api]\nenabled = false\n")

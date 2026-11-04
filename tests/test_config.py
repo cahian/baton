@@ -131,9 +131,50 @@ def test_enabled_agent_outside_order_does_not_count(tmp_path):
         load_goal(write(tmp_path, text))
 
 
-def test_threshold_99_is_accepted(tmp_path):
-    goal = load_goal(write(tmp_path, minimal() + "[agents.codex]\nthreshold_pct = 99\n"))
-    assert goal.agents["codex"].threshold_pct == 99
+def test_threshold_90_is_accepted(tmp_path):
+    goal = load_goal(write(tmp_path, minimal() + "[agents.codex]\nthreshold_pct = 90\n"))
+    assert goal.agents["codex"].threshold_pct == 90
+
+
+@pytest.mark.parametrize("agent", ["codex", "antigravity"])
+def test_a_threshold_above_90_is_refused_in_a_goal(tmp_path, agent):
+    with pytest.raises(GoalError, match="threshold_pct must be between 1 and 90"):
+        load_goal(write(tmp_path, minimal() + f"[agents.{agent}]\nthreshold_pct = 91\n"))
+
+
+def test_a_threshold_above_90_is_refused_in_the_defaults_file(tmp_path, monkeypatch):
+    path = tmp_path / "defaults.toml"
+    path.write_text("[agents.codex]\nthreshold_pct = 91\n")
+    monkeypatch.setenv("BATON_CONFIG", str(path))
+    with pytest.raises(GoalError, match="threshold_pct must be between 1 and 90"):
+        load_defaults()
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "claude-opus-5-5", "gemini", "Gemini-4"])
+def test_an_antigravity_model_that_is_not_gemini_is_refused(tmp_path, model):
+    text = minimal() + f'[agents.antigravity]\nmodel = "{model}"\n'
+    with pytest.raises(GoalError, match="must start with 'gemini-'"):
+        load_goal(write(tmp_path, text))
+
+
+def test_the_gemini_prefix_only_binds_antigravity(tmp_path):
+    goal = load_goal(write(tmp_path, minimal() + '[agents.codex]\nmodel = "gpt-7"\n'))
+    assert goal.agents["codex"].model == "gpt-7"
+
+
+def test_a_tilde_in_bin_is_expanded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "me"))
+    text = (
+        minimal()
+        + '[agents.codex]\nbin = "~/bin/codex"\n[agents.claude_api]\nbin = "~/bin/claude"\n'
+    )
+    goal = load_goal(write(tmp_path, text))
+    assert goal.agents["codex"].bin == str(tmp_path / "me/bin/codex")
+    assert goal.agents["claude_api"].bin == str(tmp_path / "me/bin/claude")
+
+
+def test_a_bare_bin_stays_a_command_name(tmp_path):
+    assert load_goal(write(tmp_path, minimal())).agents["codex"].bin == "codex"
 
 
 def test_verify_command_is_optional(tmp_path):

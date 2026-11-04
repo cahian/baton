@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from baton.adapters.base import Adapter
-from baton.config import Goal, GoalError, goal_from_table
+from baton.config import Goal, GoalError, check_repo_table, goal_from_table
 from baton.proc import OURS, check_group, kill_group
 from baton.runner import run_goal
 from baton.store import AlreadyRunning, StateError, Store, state_dir
@@ -185,9 +185,9 @@ def job_name(session: str) -> str:
 def build_goal(name: str, workdir: Path, objective: str) -> Goal:
     """The goal for a session job, in memory, through the same builder as a goal file. The
     workdir's `baton.toml` supplies the verify command, the agent settings and the timings;
-    `name`, `workdir` and `objective` in it are ignored, since the session decides those. Without
-    one there is no gate. A `baton.toml` that cannot be read or is invalid is an error, never a
-    silent fall back to no gate."""
+    `name`, `workdir` and `objective` in it are ignored, since the session decides those, and it
+    may not choose executables or credentials. Without one there is no gate. A `baton.toml` that
+    cannot be read or is invalid is an error, never a silent fall back to no gate."""
     path = workdir / "baton.toml"
     data: dict = {}
     if path.exists():
@@ -197,6 +197,7 @@ def build_goal(name: str, workdir: Path, objective: str) -> Goal:
             raise GoalError(f"invalid {path}: {exc}") from None
     rest = {k: v for k, v in data.items() if k not in ("name", "workdir", "objective")}
     try:
+        check_repo_table(rest)
         return goal_from_table(rest, name=name, workdir=workdir, objective=objective, path=path)
     except GoalError as exc:
         raise GoalError(f"{path}: {exc}" if data else str(exc)) from None
