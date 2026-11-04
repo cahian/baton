@@ -2,21 +2,22 @@
 
 ## Intent
 
-A single long coding goal should keep moving for days across several subscription-based coding agents, without a person restarting anything and without ever spending pay-as-you-go credits.
+A single long coding goal should keep moving for days across two subscription-based coding agents, Codex and Antigravity (Gemini 4 Argon),, without a person restarting anything and without ever spending pay-as-you-go credits.
 
 The real failure this exists to prevent: at 100% of its included usage, the Codex CLI keeps working and silently debits account credits. No error is raised and no 429 reaches the client. Any design that waits for a limit error loses money first. Limits must be read and acted on before they are reached.
 
 ## Goals
 
-1. Run one goal to completion, rotating in a fixed priority order.
+1. Run one goal to completion: stay on the current agent until its limit, pass to the other, and when both are exhausted resume with whichever returns first.
 2. Finish only when a verification command exits 0. An agent saying "done" means nothing.
 3. Never spend credits: stop an agent before its included usage ends, and kill it if a credit balance moves.
 4. Never give up: when every agent is exhausted, wait for the earliest reset and continue.
-5. One screen to watch it and talk to it.
+5. Use it from OpenCode as one model, `baton/auto`, keeping history and context there.
 
 ## Non-goals
 
-- Routing a subscription through third-party clients. Claude subscriptions are not permitted in third-party tools, so every agent runs through its vendor's own CLI.
+- Claude. It is deliberately out of the rotation.
+- Reimplementing a coding agent. Every agent runs through its vendor's own CLI.
 - Merging conversation history between vendors. Continuity comes from the repository and a handoff file.
 - Pushing code, opening PRs, or touching anything beyond the working directory on the agent's behalf. Goals may instruct agents to do so.
 
@@ -33,7 +34,7 @@ Any of these is a failure even if the goal finishes:
 ## Vocabulary
 
 - **goal**: a TOML file describing the objective, working directory and verification command.
-- **agent**: a vendor CLI behind an adapter: `codex`, `antigravity`, `claude`.
+- **agent**: a vendor CLI behind an adapter: `codex`, `antigravity`.
 - **round**: one agent process, fresh or resuming that vendor's conversation, working until it exits or is stopped.
 - **gate**: the verification command, run before the first round and after every round.
 
@@ -44,14 +45,14 @@ Any of these is a failure even if the goal finishes:
 ```
 gate passes?                 -> finish, exit 0
 stop file present?           -> exit 0, goal unfinished
-pick first available agent in goal order
+keep current agent if available, else next available in rotation
 none available               -> sleep until earliest known reset, wake early for stop
 run one round
 snapshot uncommitted work
 run gate
 ```
 
-After each round the first agent in the order is reconsidered, so the highest priority agent returns as soon as its limit resets. A round in progress is not preempted.
+The current agent keeps working until it becomes unavailable, then the rotation moves to the other agent. With a limited reset time known for both, the wait ends at the earliest one, and that agent continues. Rotation is sticky: an agent coming back does not preempt the one working. The initial agent is the first in `order`.
 
 Exceptions in the loop are logged, followed by a 60 s sleep, then the loop continues. Only a passing gate, a stop request or a termination signal ends the process.
 
@@ -110,22 +111,6 @@ The prompt goes on stdin. A goal can set `full_access = false` to drop the bypas
 
 Interactive Codex sessions outside baton share the same limits and credits. baton cannot stop them, but a balance drop they cause still stops baton's round.
 
-### Claude adapter
-
-```
-claude -p --output-format stream-json --verbose --model <model> --effort <effort> \
-  --dangerously-skip-permissions
-```
-
-Prompt on stdin. Parsed stream events:
-
-- `{"type":"system","subtype":"init","apiKeySource":...}`: anything other than `"none"` stops the round with `credit_guard`, because it would bill an API key.
-- `{"type":"rate_limit_event","rate_limit_info":{...}}` with `status`, `resetsAt`, `rateLimitType`, `isUsingOverage`, `overageStatus`, and `unifiedWindows.<name>.{utilization,resetsAt,status}`.
-
-Stop with `credit_guard` when `isUsingOverage` is true. Stop with `limit` when `status` is `rejected`, or when any window `utilization` reaches `threshold_pct / 100` (default 95). `status` of `allowed` or `allowed_warning` under the threshold keeps going. Cooldown comes from the relevant `resetsAt`.
-
-There is no read-only limit query, so availability before a round is only the local cooldown. If the stream never produced a `rate_limit_event`, the round is not blocked: the vendor refuses overage on accounts that have it disabled, and the `init` check covers API billing. Exit text matching `limit|usage` with a non-zero exit is classified `limit`.
-
 ### Antigravity adapter
 
 ```
@@ -155,7 +140,7 @@ The final stream line is `{"event":"result","result":{"status":"SUCCESS","respon
 
 ### Environment
 
-Every agent process has `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` and `ANTHROPIC_AUTH_TOKEN` removed from its environment, so a vendor CLI cannot fall back to paid API access.
+Every agent process has `OPENAI_API_KEY`, `GEMINI_API_KEY` and `GOOGLE_API_KEY` removed from its environment, so a vendor CLI cannot fall back to paid API access.
 
 ### Process control
 
@@ -171,9 +156,9 @@ Context has three layers:
 2. **Private to each vendor:** when an agent's turn comes again, baton resumes that vendor's own conversation, so it keeps its full history. The prompt then only adds what changed since its last round: other agents' commits, the handoff, the gate output and the tail.
 3. **Everything else stays local:** raw logs in `rounds/` are for people, not prompts.
 
-Session ids come from the stream: `thread_id` in Codex `thread.started`, `session_id` in the Claude `init` event, `conversation_id` in the Antigravity `init` event. They are stored per agent in `state.json`.
+Session ids come from the stream: `thread_id` in Codex `thread.started`, `conversation_id` in the Antigravity `init` event. They are stored per agent in `state.json`.
 
-Resume commands: `codex exec resume <id>` with the same flags, `claude -p --resume <id>`, `agy --conversation <id>`. If a resume fails for any reason, or the working directory changed, clear the id and run the same round fresh with the full prompt. A failed resume never counts against the agent.
+Resume commands: `codex exec resume <id>` with the same flags, `agy --conversation <id>`. If a resume fails for any reason, or the working directory changed, clear the id and run the same round fresh with the full prompt. A failed resume never counts against the agent.
 
 ### Prompt and handoff
 
@@ -209,7 +194,7 @@ The verify command runs through the shell in the working directory with `verify.
 name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
-order = ["codex", "antigravity", "claude"]
+order = ["codex", "antigravity"]
 round_max_s = 3600
 idle_s = 1200
 snapshot = true
@@ -231,42 +216,49 @@ model = "gemini-4-argon-medium"
 threshold_pct = 90
 poll_s = 30
 
-[agents.claude]
-enabled = true
-model = "sonnet"
-effort = "high"
-threshold_pct = 95
 ```
 
-Every value except `name`, `workdir`, `objective` and `verify.command` has the default shown. Binary paths are resolved from `PATH`, overridable with `bin`, since tmux and launchd may not load shell aliases.
+Every value except `name`, `workdir` and `objective` has the default shown. Without `verify.command` the goal is finished when a round ends as `completed`. Binary paths are resolved from `PATH`, overridable with `bin`, since tmux and launchd may not load shell aliases.
 
 ### Commands
 
-- `baton doctor [goal]`: binaries, logins, stray API keys, live Codex limits, and any reason an agent would be skipped. Spends nothing. Non-zero exit on a blocking problem.
-- `baton run <goal.toml>`: the runner, in the foreground.
-- `baton panel <goal.toml>`: the interface.
-- `baton up <goal.toml>`: runner and panel together in a tmux session named `baton-<name>`, reattached if it exists.
+- `baton doctor [goal]`: binaries, logins, stray API keys, live limits for both agents. Spends nothing. Non-zero exit on a blocking problem.
+- `baton run <goal.toml>`: one goal in the foreground, without OpenCode.
+- `baton serve [--port 18777]`: the OpenCode gateway.
 - `baton status <goal.toml>`: one-shot text.
 - `baton say <goal.toml> [--now] "note"`: adds to the inbox. `--now` also interrupts the current round.
 - `baton stop <goal.toml> [--now]`: requests a stop.
+- `baton opencode-config [--port 18777]`: prints the provider JSON for `opencode.json`.
 
-### Panel
+### OpenCode gateway
 
-A Textual app that only reads state and events and writes to the inbox and stop file. Quitting it leaves the runner untouched. It shows:
+OpenCode sees one OpenAI-compatible provider. A spike with a stub server proved that `@ai-sdk/openai-compatible` streams from it, that OpenCode sends the full history each request, and that each request carries `x-opencode-session`. The spike only covered gaps of seconds.
 
-- one card per agent: state, usage percentages, countdown to reset
-- current round, elapsed time, last gate result
-- a live feed of normalized agent output
-- an input line that sends notes to the inbox; a note starting with `!` interrupts the current round
+The server binds `127.0.0.1` only and uses the standard library's threading HTTP server.
+
+- `GET /v1/models` returns one model, `auto`.
+- `POST /v1/chat/completions` with `stream: true` streams `chat.completion.chunk` SSE.
+
+Request handling:
+
+- **Title requests** have no `tools` key. Answer at once with up to 6 words of the first user message, without calling an agent, so they spend nothing.
+- **No job for the session:** create one. The job's name is `session-<id>`, its state lives in the usual state directory, and the workdir comes from the `x-opencode-directory` header, or failing that the `Working directory:` line of the system message. If neither exists, respond with a clear error message. Do not guess a directory.
+- **Goal:** if the workdir holds `baton.toml`, its `[verify]` and agent settings apply and the objective is the user's message. Otherwise there is no gate, and the job finishes when a round completes.
+- **Job already running for the session:** the new message becomes a note with interrupt, and the stream attaches to the job.
+- **Job finished for the session:** a new one starts, reusing the stored vendor session ids.
+
+A job runs in its own thread inside `baton serve` through `run_goal`, independent of the HTTP connection. A dropped connection never stops it. Stream output: rendered agent text, one line on each rotation, wait or gate result, and a final summary. Send an empty-content delta every 15 s so long waits do not trip client timeouts. The `tools` field is ignored, since each CLI uses its own tools. `finish_reason: "stop"` is sent only when the job finishes, or `baton stop` is honoured.
+
+History: when a job starts with no vendor session id, the prompt includes the OpenCode conversation so far, up to the last 24000 chars. With a vendor session, only the new message goes in.
 
 ## Constraints
 
-- Python 3.12, managed with uv. Textual is the only runtime dependency; the runner must work if Textual is not importable.
+- Python 3.12, managed with uv. No runtime dependencies.
 - No secrets are read, printed or logged by baton itself. Credential files are never opened.
 - Tests never call a real vendor. Fake CLIs and fake limit readers stand in.
 
 ## Risks to state plainly
 
 - A round can cross from threshold to 100% between polls. The 10% margin exists for this, and it cannot be mathematically zero. If the account's own setting for credits is available, it remains the only hard stop.
-- A long continuous loop may fall outside Anthropic's "ordinary, individual usage". The page does not define the limit.
+- A response held open for days through OpenCode is untested beyond seconds. The job does not depend on it: `baton status` and reattaching still work.
 - Antigravity's output when quota actually runs out has not been observed; the limit reads above are expected to stop it first.
