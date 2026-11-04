@@ -44,8 +44,9 @@ FEED_MAX_ITEMS = 5000
 # A job that is wrapping up has this long to release its lock before a new one is refused.
 HANDOVER_S = 10.0
 SHUTDOWN_S = 25.0
-# Messages that arrive while a goal is finishing each get a follow-up run, up to this many.
-MAX_FOLLOWUPS = 5
+# A message that lands in the inbox in the instant a goal finishes starts the goal again, up to
+# this many times in a row.
+MAX_RESTARTS = 5
 SETTLE_POLL_S = 0.05
 GATE_SHOWN_CHARS = 1500
 NAME_MAX_CHARS = 100
@@ -250,6 +251,15 @@ def render_event(kind: str, f: Mapping) -> str:
     return ""
 
 
+def compose_objective(before: list, text: str) -> str:
+    """The objective for `text` as the newest message: the conversation first, when there is
+    one. It is the whole briefing of an agent with no session of its own."""
+    history = history_text(before)
+    if not history:
+        return text
+    return f"Conversation so far (oldest first):\n{history}\n\nLatest message:\n{text}"
+
+
 # jobs
 
 
@@ -287,8 +297,6 @@ class Job:
         self.goal = goal
         # The conversation up to the newest message handed to this job.
         self.context = context
-        # Builds the goal for messages left unread when a run ends; set by the manager.
-        self.followup: Callable[[str], Goal] | None = None
         self._adapters_for = adapters_for
         self._cond = threading.Condition()
         self._items: list[str] = []
@@ -297,7 +305,6 @@ class Job:
         self._done = False
         self._delivered = 0
         self._end = ""  # how the last run ended: "finished", "stopped" or ""
-        self._stopping = False
         self.store = _JobStore(state_dir(name), self._on_event)
         self._thread = threading.Thread(target=self._run, name=f"baton-{name}", daemon=True)
 
@@ -317,22 +324,17 @@ class Job:
     def _run(self) -> None:
         try:
             adapters = self._adapters_for(self.goal)
-            goal, first_gate = self.goal, True
-            for attempt in range(MAX_FOLLOWUPS + 1):
+            for attempt in range(MAX_RESTARTS + 1):
                 self._end = ""
-                run_goal(goal, adapters, self.store, first_gate=first_gate)
-                notes = self._unread_notes()
-                if not notes:
+                run_goal(self.goal, adapters, self.store, objective=self.objective)
+                # The run only finishes with no note left unread, but a message can land in the
+                # inbox between that check and the end of the run: start again for it.
+                if not self._note_waiting():
                     break
-                if attempt == MAX_FOLLOWUPS:
-                    self._push("\n[baton] messages left unread, send them again:\n" + notes + "\n")
+                if attempt == MAX_RESTARTS:
+                    self._push("\n[baton] a message was left unread: send it again\n")
                     break
-                assert self.followup is not None
-                goal, first_gate = self.followup(notes), False
-                self._push(
-                    "\n[baton] a message arrived while the goal was finishing and no agent had "
-                    "read it: starting a follow-up run for it\n\n"
-                )
+                self._push("\n[baton] a message arrived as the goal finished: continuing\n\n")
                 with self._cond:
                     self._closing = False
         except AlreadyRunning as exc:
@@ -344,18 +346,23 @@ class Job:
                 self._done = True
                 self._cond.notify_all()
 
-    def _unread_notes(self) -> str:
-        """Notes still in the inbox after a run that finished: the person wrote them and no
-        agent ever got them. A run that was stopped leaves them alone."""
-        if self._end != "finished" or self._stopping or self.followup is None:
-            return ""
+    def _note_waiting(self) -> bool:
+        """True when a run that finished left a note in the inbox. A run that was stopped
+        leaves notes alone."""
+        if self._end != "finished":
+            return False
         try:
-            return self.store.take_inbox().strip()
+            return bool((self.store.root / "inbox.md").read_text(encoding="utf-8").strip())
         except OSError:
-            return ""
+            return False
+
+    def objective(self) -> str:
+        """The briefing for a fresh round: the conversation so far, including every message
+        accepted while the job runs."""
+        with self._cond:
+            return compose_objective(self.context[:-1], self.context[-1]["content"])
 
     def request_stop(self, now: bool = True) -> None:
-        self._stopping = True
         try:
             self.store.request_stop(now=now)
         except OSError:
@@ -389,6 +396,7 @@ class Job:
                 return False
             self.store.say(text)
             self.store.request_interrupt()
+            self.context.append({"role": "user", "content": text})
         self._push(
             "\n[baton] message received: ending the current round so the next one reads it\n\n"
         )
@@ -511,14 +519,7 @@ class JobManager:
         resumed = (
             state.get("workdir") == str(workdir) and isinstance(sessions, dict) and bool(sessions)
         )
-        # The objective is the briefing of an agent with no session of its own, however the
-        # rotation got to it, so it always carries the conversation.
-        history = history_text(before)
-        objective = (
-            f"Conversation so far (oldest first):\n{history}\n\nLatest message:\n{text}"
-            if history
-            else text
-        )
+        objective = compose_objective(before, text)
         return build_goal(name, workdir, objective), resumed
 
     def _create(self, session: str, workdir: Path, before: list, text: str) -> Job:
@@ -527,15 +528,6 @@ class JobManager:
         context = [*before, {"role": "user", "content": text}]
         job = Job(session, name, workdir, goal, self._adapters_for, context)
 
-        def followup(notes: str) -> Goal:
-            next_goal, next_resumed = self._briefing(name, workdir, job.context, notes)
-            job.context.append({"role": "user", "content": notes})
-            job.store.take_interrupt()
-            if next_resumed:
-                job.store.say(notes)
-            return next_goal
-
-        job.followup = followup
         # A stop or interrupt left by something earlier is not about this message.
         job.store.clear_stop()
         job.store.take_interrupt()

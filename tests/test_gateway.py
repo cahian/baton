@@ -40,10 +40,11 @@ class Fake:
         self.prompts.append(prompt)
         self.sessions.append(ctx.session_id)
         self.workdirs.append(ctx.workdir)
-        ctx.on_spawn(1)
+        step = self.script.pop(0) if self.script else None
+        if not getattr(step, "refuses", False):
+            ctx.on_spawn(1)  # the process started; a refused start never gets here
         if self.announce:
             ctx.on_session(self.announce)
-        step = self.script.pop(0) if self.script else None
         return step(self, prompt, ctx) if step else RoundResult(COMPLETED)
 
     def render(self, line):
@@ -454,59 +455,112 @@ def test_submit_after_shutdown_starts_nothing(gw):
     assert gw.agents["claude_api"].prompts == []
 
 
-def test_a_message_during_a_passing_verify_gets_a_follow_up_run(gw):
+def test_a_message_during_a_passing_verify_is_read_before_done(gw):
     (gw.work / "baton.toml").write_text(
-        'order = ["claude_api"]\nsnapshot = false\n[verify]\ncommand = "test -f GATE"\n'
+        'order = ["claude_api", "codex"]\nsnapshot = false\n[verify]\ncommand = "test -f GATE"\n'
     )
 
     def open_the_gate_then_work(agent, prompt, ctx):
         (gw.work / "GATE").write_text("x")
         return until_killed("working")(agent, prompt, ctx)
 
-    gw.agents["claude_api"].script = [open_the_gate_then_work]
+    def refused_start(agent, prompt, ctx):
+        return RoundResult(LIMIT, until=time.time() + 3600)
+
+    refused_start.refuses = True
+    # claude refuses to start when asked again: the note must reach codex, not be dropped
+    gw.agents["claude_api"].script = [open_the_gate_then_work, refused_start]
     first = gw.stream("first request")
     first.read_until("working")
     second = gw.stream("a late correction nobody has read")
     text = second.read_all()
-    prompts = gw.agents["claude_api"].prompts
-    assert len(prompts) == 2 and "a late correction nobody has read" in prompts[1]
-    assert "follow-up" in text and text.count("[baton] done") == 2
-    assert "to deliver it" not in text
+    assert "a late correction nobody has read" in gw.agents["codex"].prompts[0]
+    assert text.count("[baton] done") == 1
     assert Store(state_dir(gateway.job_name(SESSION))).take_inbox() == ""
     first.close()
 
 
-def test_a_message_never_read_is_not_reported_as_delivered(gw):
-    # a job that is stopped does not start a follow-up for what it never read
+def test_a_message_that_lands_as_the_goal_finishes_restarts_it(gw, monkeypatch):
+    real = gateway.Job._on_event
+    fired = []
+
+    def late(self, kind, fields):
+        real(self, kind, fields)
+        if kind == "finished" and not fired:
+            fired.append(1)
+            self.store.say("a note that arrived too late for the check")
+
+    monkeypatch.setattr(gateway.Job, "_on_event", late)
+    text = gw.stream("go").read_all()
+    prompts = gw.agents["claude_api"].prompts
+    assert len(prompts) == 2
+    assert "a note that arrived too late for the check" in prompts[1]
+    assert "continuing" in text and text.count("[baton] done") == 2
+
+
+def test_a_message_never_read_by_a_stopped_job_is_not_run_again(gw):
     gw.agents["claude_api"].script = [until_killed("busy")]
     s = gw.stream("go")
     s.read_until("busy")
     job = gw.job()
-    job.request_stop(now=True)
+    # the stop and the message arrive together: the round ends, the stop wins, the note is unread
+    Store(state_dir(gateway.job_name(SESSION))).request_stop(now=True)
+    assert job.add_note("a message that no agent will read")
     assert wait_for(lambda: not job.is_running())
     assert len(gw.agents["claude_api"].prompts) == 1
-    assert "follow-up" not in s.read_all()
+    text = s.read_all()
+    assert "continuing" not in text and "stopped" in text
+    assert "delivered" not in text
+
+
+def test_a_message_accepted_while_running_is_in_the_briefing_of_a_fresh_agent(gw):
+    gw.agents["claude_api"].script = [
+        until_killed("busy"),
+        lambda a, p, c: RoundResult(LIMIT, until=time.time() + 3600),
+    ]
+    first = gw.stream("first request")
+    first.read_until("busy")
+    second = gw.stream("then also handle the edge case")
+    second.read_all()
+    fresh = gw.agents["codex"].prompts[0]  # no session of its own: only the objective
+    assert "then also handle the edge case" in fresh and "first request" in fresh
+    first.close()
 
 
 def test_other_sessions_are_not_held_up_while_one_hands_over(gw, tmp_path, monkeypatch):
-    real = gateway.Job._unread_notes
+    real = gateway.Job._note_waiting
+    wrapping_up = threading.Event()
+    release = threading.Event()
 
-    def slow(self):
-        time.sleep(1.5)
+    def held(self):
+        if self.session == SESSION:
+            wrapping_up.set()
+            assert release.wait(30)
         return real(self)
 
-    monkeypatch.setattr(gateway.Job, "_unread_notes", slow)
+    monkeypatch.setattr(gateway.Job, "_note_waiting", held)
+    monkeypatch.setattr(gateway, "HANDOVER_S", 30.0)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     free = _second_session_in(gw, tmp_path, elsewhere, "ses_free")
-    gw.stream("one").read_until("[baton] done")  # the job is now wrapping up for 1.5 s
+    first = gw.stream("one")
+    assert wrapping_up.wait(10)  # the job has finished its run and is held in its wrap-up
     waiting = threading.Thread(target=lambda: gw.stream("two").read_all(), daemon=True)
     waiting.start()
-    time.sleep(0.2)  # the second message of SESSION is now waiting for the handover
-    started = time.monotonic()
-    gw.stream("quick", session=free).read_until("[baton] round 1")
-    assert time.monotonic() - started < 1.0
+    quick_done = threading.Event()
+
+    def quick():
+        gw.stream("quick", session=free).read_until("[baton] round 1")
+        quick_done.set()
+
+    threading.Thread(target=quick, daemon=True).start()
+    try:
+        # SESSION's second message sits in its handover; another session still gets through
+        assert quick_done.wait(10), "a handover in progress blocked another session"
+    finally:
+        release.set()
     waiting.join(20)
+    first.read_all()
 
 
 def test_a_finished_job_is_replaced_by_a_new_one(gw):

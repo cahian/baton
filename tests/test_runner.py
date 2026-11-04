@@ -1100,3 +1100,61 @@ def test_pause_wait_event_carries_seconds_and_agents(go, agents, work, store, wo
     waits = [e for e in store.events() if e["kind"] == "wait"]
     assert len(waits) == 1
     assert waits[0]["seconds"] == 30 and set(waits[0]["agents"]) == {"codex", "antigravity"}
+
+
+# notes outrank a passing gate
+
+
+def test_a_passing_gate_waits_for_an_unread_note(go, agents, work, store):
+    (work / "DONE").write_text("x")
+    store.say("read me before you finish")
+    assert go() == 0
+    assert len(agents["codex"].prompts) == 1
+    assert "read me before you finish" in agents["codex"].prompts[0]
+    assert kinds(store).count("finished") == 1 and kinds(store)[-1] == "finished"
+
+
+def test_a_note_carried_by_a_refused_start_still_holds_the_finish(go, agents, work, store, world):
+    (work / "DONE").write_text("x")
+    store.say("this must reach an agent")
+    agents["codex"].script = [refused(LIMIT, until=world.now + 3600)]
+    assert go() == 0
+    assert len(agents["codex"].prompts) == 1  # the refused start
+    assert len(agents["antigravity"].prompts) == 1
+    assert "this must reach an agent" in agents["antigravity"].prompts[0]
+    ends = [(e["kind"], e.get("agent")) for e in store.events() if e["kind"] != "gate"]
+    assert ends.index(("round_end", "antigravity")) < ends.index(("finished", None))
+
+
+def test_without_a_gate_a_note_arriving_in_the_last_round_gets_another(
+    tmp_path, work, store, agents, world
+):
+    goal = make_goal(tmp_path, work, verify=None)
+    agents["codex"].script = [
+        say([], then=lambda a, p, c: (store.say("late note"), done(work)(a, p, c))[1])
+    ]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert len(agents["codex"].prompts) == 2
+    assert "late note" in agents["codex"].prompts[1]
+    assert kinds(store).count("finished") == 1
+
+
+def test_a_stop_wins_over_an_unread_note(go, agents, work, store):
+    (work / "DONE").write_text("x")
+    store.say("never read")
+    store.request_stop()
+    assert go() == 0
+    assert agents["codex"].prompts == [] and agents["antigravity"].prompts == []
+    assert kinds(store)[-1] == "stopped"
+
+
+def test_the_objective_callable_briefs_each_fresh_round(tmp_path, work, store, agents, world):
+    goal = make_goal(tmp_path, work)
+    texts = iter(["first briefing", "second briefing"])
+    agents["codex"].script = [say(["x"]), done(work)]
+    run_goal(
+        goal, agents, store, clock=world.clock, sleep=world.sleep, objective=lambda: next(texts)
+    )
+    assert "first briefing" in agents["codex"].prompts[0]
+    assert "second briefing" in agents["codex"].prompts[1]
+    assert OBJECTIVE not in agents["codex"].prompts[0]

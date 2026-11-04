@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from baton.adapters.base import (
@@ -283,18 +284,21 @@ def run_goal(
     store: Store,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
-    first_gate: bool = True,
+    objective: Callable[[], str] | None = None,
 ) -> int:
     """Run `goal` until the gate passes or a stop is honoured. Returns 0 either way.
 
-    `first_gate=False` runs a round before the first verify, for a goal that has just been given
-    new work and so cannot be judged done by a gate that already passes.
+    A passing gate (or, with no gate, a completed round) only finishes the goal when no note from
+    the person is left unread, in the inbox or carried over from a start that was refused: the
+    rotation goes on until a round that actually started has taken them. A stop request wins over
+    notes. `objective`, when given, supplies the objective of each fresh round, for a caller whose
+    briefing grows while the goal runs.
 
     Holds the goal's lock for the duration; raises AlreadyRunning when another runner has it.
     Everything else that goes wrong is logged as an `error` event, followed by a 60 s sleep.
     """
     with store.lock():
-        return _Run(goal, adapters, store, clock, sleep, first_gate).run()
+        return _Run(goal, adapters, store, clock, sleep, objective).run()
 
 
 class _Run:
@@ -305,7 +309,7 @@ class _Run:
         store: Store,
         clock: Callable[[], float],
         sleep: Callable[[float], None],
-        first_gate: bool = True,
+        objective: Callable[[], str] | None = None,
     ) -> None:
         self.goal = goal
         self.adapters = adapters
@@ -320,7 +324,8 @@ class _Run:
         self.gate_tail = ""
         self.group: int | None = None
         self.group_start = ""
-        self.need_gate = first_gate
+        self.need_gate = True
+        self.objective = objective
         self.prev_agent: str | None = None
         self.carried_notes = ""
         self.heads: dict[str, str] = {}
@@ -483,7 +488,7 @@ class _Run:
             passed, self.gate_tail = run_gate(goal, should_kill=self.stop_now)
             self.need_gate = False
             self.emit("gate", passed=passed, tail=self.gate_tail)
-            if passed:
+            if passed and not self.unread_notes():
                 return self.finish("verify passed")
         self.need_gate = False
         if self.pause_until:
@@ -511,9 +516,18 @@ class _Run:
             )
             self.nap_until(until)
             return None
-        if self.run_round(adapter):
+        if self.run_round(adapter) and not self.unread_notes():
             return self.finish("round completed")
         return None
+
+    def unread_notes(self) -> bool:
+        """True while a note from the person has not reached an agent. The inbox is moved into
+        the carried notes (where the next round would take it anyway) so it is not lost."""
+        try:
+            self.carried_notes += self.store.take_inbox()
+        except OSError:
+            pass
+        return bool(self.carried_notes.strip())
 
     def stop_now(self) -> bool:
         return self.stop_requested() == "now"
@@ -587,7 +601,7 @@ class _Run:
 
         def attempt(session: str | None) -> RoundResult:
             prompt = build_prompt(
-                goal,
+                goal if self.objective is None else replace(goal, objective=self.objective()),
                 self.gate_tail,
                 notes,
                 handoff,
