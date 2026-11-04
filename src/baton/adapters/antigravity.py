@@ -60,6 +60,7 @@ _PERCENT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)%")
 _NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
 GEMINI_MODELS = "Gemini Models"
+GEMINI_WINDOWS = ("Five Hour", "Weekly")
 
 
 # --- reading ---------------------------------------------------------------------------------
@@ -170,11 +171,23 @@ def _is_gemini(group: str) -> bool:
     return group.strip().casefold().startswith("gemini")
 
 
+def _missing_windows(rows: list[dict]) -> list[str]:
+    """One message per window of `Gemini Models` that `rows` lacks. Each is a limit of its own, so
+    a read with only one of them says nothing about the other."""
+    labels = [r["label"].casefold() for r in rows if r["group"] == GEMINI_MODELS]
+    return [
+        f"usage has no readable {GEMINI_MODELS!r} {window} row"
+        for window in GEMINI_WINDOWS
+        if not any(window.casefold() in label for label in labels)
+    ]
+
+
 def _parse_usage_lenient(text: str) -> tuple[list[dict], list[str]]:
     """Every readable row, plus one message per problem found.
 
     A Gemini row that cannot be read is a problem; rows of other groups that cannot be read are
-    skipped silently, as they take part in no decision. A missing `Gemini Models` row is a problem.
+    skipped silently, as they take part in no decision. Each missing `Gemini Models` row is a
+    problem.
     """
     rows: list[dict] = []
     problems: list[str] = []
@@ -187,8 +200,7 @@ def _parse_usage_lenient(text: str) -> tuple[list[dict], list[str]]:
         except LimitsError as exc:
             if _is_gemini(cols[0]):
                 problems.append(str(exc))
-    if not any(r["group"] == GEMINI_MODELS for r in rows):
-        problems.append(f"usage has no readable {GEMINI_MODELS!r} rows")
+    problems.extend(_missing_windows(rows))
     return rows, problems
 
 
@@ -196,8 +208,8 @@ def parse_usage(text: str) -> list[dict]:
     """Rows of `/usage` as `{"group", "label", "used_pct", "resets_at"}` (reset as epoch seconds).
 
     Used percent is 100 minus the percent remaining, kept exact as a Decimal. Strict: a Gemini row
-    that cannot be read raises, and so does a text without a `Gemini Models` row. (The guard uses
-    the lenient reader instead, so a broken row never hides a readable saturated one.)
+    that cannot be read raises, and so does a text without both `Gemini Models` rows. (The guard
+    uses the lenient reader instead, so a broken row never hides a readable saturated one.)
     """
     rows, problems = _parse_usage_lenient(text)
     if problems:
@@ -257,8 +269,8 @@ def _until(saturated: list[dict], now: float) -> float:
 def check_usage(rows: list[dict], threshold_pct: int, now: float) -> Availability:
     """Whether the Gemini rows allow a round. Rows of other groups are ignored.
 
-    Unavailable until the latest reset among the saturated rows. Without a `Gemini Models` row and
-    nothing saturated the answer is unknown, so unavailable for the usual pause.
+    Unavailable until the latest reset among the saturated rows. Without both `Gemini Models`
+    rows and nothing saturated the answer is unknown, so unavailable for the usual pause.
     """
     saturated = _saturated(rows, threshold_pct)
     usage = _usage_summary(rows, None)
@@ -266,10 +278,9 @@ def check_usage(rows: list[dict], threshold_pct: int, now: float) -> Availabilit
         return Availability(
             False, until=_until(saturated, now), reason="; ".join(_reasons(saturated)), usage=usage
         )
-    if not any(r.get("group") == GEMINI_MODELS for r in rows):
-        return Availability(
-            False, until=now + RETRY_S, reason=f"usage has no {GEMINI_MODELS!r} rows", usage=usage
-        )
+    missing = _missing_windows(rows)
+    if missing:
+        return Availability(False, until=now + RETRY_S, reason="; ".join(missing), usage=usage)
     return Availability(True, usage=usage)
 
 

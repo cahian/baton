@@ -12,8 +12,11 @@ from baton.adapters.antigravity import (
     GEMINI_MODELS,
     AntigravityAdapter,
     LimitsError,
+    Reading,
+    _parse_usage_lenient,
     check_usage,
     classify,
+    evaluate,
     parse_credits,
     parse_usage,
     read_text,
@@ -317,6 +320,40 @@ def test_check_usage_stale_reset_does_not_become_a_busy_loop():
 def test_check_usage_honours_the_threshold():
     assert check_usage(rows_of(five=30), 90, NOW).ok
     assert not check_usage(rows_of(five=30), 70, NOW).ok
+
+
+ONLY_WEEKLY = "Gemini Models\tWeekly Limit Remaining\t100%\t2026-11-11T17:56:19Z\n"
+ONLY_FIVE_HOUR = "Gemini Models\tFive Hour Limit Remaining\t100%\t2026-11-04T22:56:19Z\n"
+
+
+@pytest.mark.parametrize(
+    ("text", "missing"), [(ONLY_WEEKLY, "Five Hour"), (ONLY_FIVE_HOUR, "Weekly")]
+)
+def test_one_gemini_models_row_alone_is_not_enough(text, missing):
+    with pytest.raises(LimitsError, match=missing):
+        parse_usage(text)
+    rows, problems = _parse_usage_lenient(text)
+    assert len(rows) == 1 and missing in problems[0]
+    verdict = evaluate(Reading(usage=text, credits="Remaining credits\t0\n"), 90, NOW)
+    assert not verdict.avail.ok and verdict.blind and missing in verdict.avail.reason
+    assert verdict.avail.until == NOW + 300
+
+
+@pytest.mark.parametrize(
+    ("text", "missing"), [(ONLY_WEEKLY, "Five Hour"), (ONLY_FIVE_HOUR, "Weekly")]
+)
+def test_check_usage_needs_both_gemini_models_rows(text, missing):
+    rows, _ = _parse_usage_lenient(text)
+    avail = check_usage(rows, 90, NOW)
+    assert not avail.ok and missing in avail.reason
+
+
+def test_a_model_row_cannot_stand_in_for_a_gemini_models_row():
+    text = (
+        ONLY_WEEKLY + "Gemini 4 Argon\tGemini 4 Argon Five Hour Limit\t99%\t2026-11-11T17:56:01Z\n"
+    )
+    with pytest.raises(LimitsError, match="Five Hour"):
+        parse_usage(text)
 
 
 def test_check_usage_without_gemini_models_rows_is_unavailable():

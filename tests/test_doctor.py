@@ -195,6 +195,13 @@ def test_codex_missing_window_blocks(fakes):
     assert not c.ok and c.blocking
 
 
+def test_antigravity_with_only_the_weekly_row_blocks_and_says_which_is_missing(fakes):
+    fakes.agy_files(usage="Gemini Models\tWeekly Limit Remaining\t100%\t2096-01-01T00:00:00Z\n")
+    c = check(run(fakes), "antigravity limits")
+    assert not c.ok and c.blocking
+    assert "Five Hour" in c.detail
+
+
 @pytest.mark.parametrize(
     "usage", ["garbage\n", "Claude and GPT models\tWeekly\t100%\t2030-01-01T00:00:00Z\n"]
 )
