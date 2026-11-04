@@ -17,13 +17,11 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 
 from baton.adapters.base import (
     AUTH,
     COMPLETED,
-    CREDIT_GUARD,
     LIMIT,
     TIMEOUT,
     TRANSIENT,
@@ -31,7 +29,7 @@ from baton.adapters.base import (
     RoundContext,
     RoundResult,
 )
-from baton.adapters.guard import RETRY_S, Eval, Guard, LimitsError
+from baton.adapters.guard import RETRY_S, Eval, Guard, LimitsError, run_guarded
 from baton.config import AgentConfig
 from baton.proc import clean_env, run_streaming
 
@@ -354,10 +352,6 @@ class CodexAdapter:
 
     def run_round(self, prompt: str, ctx: RoundContext) -> RoundResult:
         guard = Guard(self.cfg, self._read, _evaluate, self._poll_clock, self._wall_clock)
-        refused = guard.start()
-        if refused is not None:
-            return refused
-
         problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
         reported = False
 
@@ -381,39 +375,16 @@ class CodexAdapter:
             return None
 
         argv = self.argv(ctx.session_id, str(ctx.workdir))
-        spawned = False
 
-        def on_spawn(pid: int) -> None:
-            nonlocal spawned
-            spawned = True
-            ctx.on_spawn(pid)
-
-        result: RoundResult | None = None
-        try:
+        def start(run_ctx: RoundContext) -> RoundResult:
             exit_ = run_streaming(
-                argv,
-                ctx.workdir,
-                prompt,
-                replace(ctx, on_spawn=on_spawn),
-                on_line,
-                guard.tick,
-                tick_s=self.tick_s,
+                argv, ctx.workdir, prompt, run_ctx, on_line, guard.tick, tick_s=self.tick_s
             )
-        except OSError as exc:
-            if not spawned:
-                return RoundResult(TRANSIENT, reason=f"cannot start {self.cfg.bin}: {exc}")
-            # The agent ran (and may have spent something) before the runner failed.
-            result = RoundResult(TRANSIENT, reason=f"runner failed after the agent started: {exc}")
-        else:
-            result = exit_.stopped
-            if result is None:
-                result = self._classify(exit_.returncode, exit_.timed_out, problems, ctx)
-        # The process is gone; the closing read catches a debit made since the previous poll.
-        if result.outcome != CREDIT_GUARD:
-            late = guard.close()
-            if late is not None:
-                return late
-        return result
+            if exit_.stopped is not None:
+                return exit_.stopped
+            return self._classify(exit_.returncode, exit_.timed_out, problems, ctx)
+
+        return run_guarded(guard, ctx, self.cfg.bin, start)
 
     def _classify(
         self, returncode: int | None, timed_out: bool, problems: deque[str], ctx: RoundContext

@@ -11,6 +11,7 @@ A prompt (`-p <text> --output-format stream-json ...`) prints JSON lines. Every 
 `FAKE_AGY_CALLS` (argv and cwd, one JSON object per line). Knobs:
   FAKE_AGY_CONVERSATION_ID  id announced in the init event (default conv-1; the id passed with
                             --conversation wins when present)
+  FAKE_AGY_TEXT             text of the agent's text_delta (default "working on it")
   FAKE_AGY_EXEC_SLEEP       seconds to stay alive before the result event
   FAKE_AGY_EXEC_EXIT        exit code (default 0)
   FAKE_AGY_RESULT_STATUS    SUCCESS (default) or ERROR
@@ -79,7 +80,7 @@ def prompt_cmd(argv: list[str]) -> None:
                 "step_index": 1,
                 "state": "ACTIVE",
                 "step_type": "agent_response",
-                "text_delta": "working on it",
+                "text_delta": os.environ.get("FAKE_AGY_TEXT", "working on it"),
             },
         }
     )

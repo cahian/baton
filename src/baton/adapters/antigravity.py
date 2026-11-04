@@ -20,14 +20,13 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
 from baton.adapters.base import (
     AUTH,
     COMPLETED,
-    CREDIT_GUARD,
     LIMIT,
     TIMEOUT,
     TRANSIENT,
@@ -35,7 +34,7 @@ from baton.adapters.base import (
     RoundContext,
     RoundResult,
 )
-from baton.adapters.guard import RETRY_S, Eval, Guard, LimitsError
+from baton.adapters.guard import RETRY_S, Eval, Guard, LimitsError, run_guarded
 from baton.config import AgentConfig
 from baton.proc import clean_env, run_streaming
 
@@ -49,13 +48,13 @@ __all__ = [
     "read_text",
 ]
 
-READ_TIMEOUT_S = 15
+READ_TIMEOUT_S = 30
 # A limits answer is a handful of rows; anything bigger than this is not one.
 MAX_READ_BYTES = 256 * 1024
 # How many error lines of a round are kept to classify its failure.
 MAX_PROBLEMS = 20
 
-_AUTH_RE = re.compile(r"authenticat|sign[ -]?in|log[ -]?in", re.IGNORECASE)
+_AUTH_RE = re.compile(r"\bauthenticat|\bsign[ -]?in\b|\blog[ -]?in\b", re.IGNORECASE)
 _LIMIT_RE = re.compile(r"RESOURCE_EXHAUSTED|quota|rate[ _-]?limit|\b429\b", re.IGNORECASE)
 _PERCENT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)%")
 _NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
@@ -171,27 +170,38 @@ def _is_gemini(group: str) -> bool:
     return group.strip().casefold().startswith("gemini")
 
 
-def parse_usage(text: str) -> list[dict]:
-    """Rows of `/usage` as `{"group", "label", "used_pct", "resets_at"}` (reset as epoch seconds).
+def _parse_usage_lenient(text: str) -> tuple[list[dict], list[str]]:
+    """Every readable row, plus one message per problem found.
 
-    Used percent is 100 minus the percent remaining, kept exact as a Decimal. A Gemini row that
-    cannot be read raises; rows of other groups that cannot be read are skipped, as they do not
-    take part in any decision. At least one `Gemini Models` row is required.
+    A Gemini row that cannot be read is a problem; rows of other groups that cannot be read are
+    skipped silently, as they take part in no decision. A missing `Gemini Models` row is a problem.
     """
     rows: list[dict] = []
+    problems: list[str] = []
     for line in text.splitlines():
         if not line.strip():
             continue
         cols = line.split("\t")
-        if not _is_gemini(cols[0]):
-            try:
-                rows.append(_parse_row(cols))
-            except LimitsError:
-                pass
-            continue
-        rows.append(_parse_row(cols))
+        try:
+            rows.append(_parse_row(cols))
+        except LimitsError as exc:
+            if _is_gemini(cols[0]):
+                problems.append(str(exc))
     if not any(r["group"] == GEMINI_MODELS for r in rows):
-        raise LimitsError(f"usage has no {GEMINI_MODELS!r} rows")
+        problems.append(f"usage has no readable {GEMINI_MODELS!r} rows")
+    return rows, problems
+
+
+def parse_usage(text: str) -> list[dict]:
+    """Rows of `/usage` as `{"group", "label", "used_pct", "resets_at"}` (reset as epoch seconds).
+
+    Used percent is 100 minus the percent remaining, kept exact as a Decimal. Strict: a Gemini row
+    that cannot be read raises, and so does a text without a `Gemini Models` row. (The guard uses
+    the lenient reader instead, so a broken row never hides a readable saturated one.)
+    """
+    rows, problems = _parse_usage_lenient(text)
+    if problems:
+        raise LimitsError("; ".join(problems))
     return rows
 
 
@@ -238,36 +248,29 @@ def _reasons(saturated: list[dict]) -> list[str]:
     ]
 
 
-def _until(saturated: list[dict], blind: bool, now: float) -> float | None:
-    known = [float(r["resets_at"]) for r in saturated]
-    until = max(known) if known else None
-    if until is not None and until <= now:
-        return now + RETRY_S  # a stale reset is no reset
-    if until is None and blind:
-        return now + RETRY_S  # refused on partial data: retry after the usual pause
-    return until
+def _until(saturated: list[dict], now: float) -> float:
+    """The latest reset among saturated rows; every parsed row has one."""
+    until = max(float(r["resets_at"]) for r in saturated)
+    return now + RETRY_S if until <= now else until  # a stale reset is no reset
 
 
 def check_usage(rows: list[dict], threshold_pct: int, now: float) -> Availability:
     """Whether the Gemini rows allow a round. Rows of other groups are ignored.
 
-    Needs at least one `Gemini Models` row. Unavailable until the latest reset among the
-    saturated rows.
+    Unavailable until the latest reset among the saturated rows. Without a `Gemini Models` row and
+    nothing saturated the answer is unknown, so unavailable for the usual pause.
     """
-    if not any(r.get("group") == GEMINI_MODELS for r in rows):
-        return Availability(
-            False, until=now + RETRY_S, reason=f"usage has no {GEMINI_MODELS!r} rows"
-        )
     saturated = _saturated(rows, threshold_pct)
     usage = _usage_summary(rows, None)
-    if not saturated:
-        return Availability(True, usage=usage)
-    return Availability(
-        False,
-        until=_until(saturated, False, now),
-        reason="; ".join(_reasons(saturated)),
-        usage=usage,
-    )
+    if saturated:  # a clear refusal wins, even without a `Gemini Models` row
+        return Availability(
+            False, until=_until(saturated, now), reason="; ".join(_reasons(saturated)), usage=usage
+        )
+    if not any(r.get("group") == GEMINI_MODELS for r in rows):
+        return Availability(
+            False, until=now + RETRY_S, reason=f"usage has no {GEMINI_MODELS!r} rows", usage=usage
+        )
+    return Availability(True, usage=usage)
 
 
 @dataclass(frozen=True)
@@ -291,10 +294,8 @@ def _evaluate(reading: Reading, threshold_pct: int, now: float) -> Eval:
     if isinstance(reading.usage, Exception):
         blind.append(f"/usage failed: {reading.usage}")
     else:
-        try:
-            rows = parse_usage(reading.usage)
-        except LimitsError as exc:
-            blind.append(f"/usage unreadable: {exc}")
+        rows, problems = _parse_usage_lenient(reading.usage)
+        blind.extend(f"/usage unreadable: {p}" for p in problems)
     if isinstance(reading.credits, Exception):
         blind.append(f"/credits failed: {reading.credits}")
     else:
@@ -307,7 +308,7 @@ def _evaluate(reading: Reading, threshold_pct: int, now: float) -> Eval:
     usage = _usage_summary(rows, balance)
     if not saturated and not blind:
         return Eval(Availability(True, usage=usage), False, False, balance)
-    until = _until(saturated, bool(blind), now) if saturated else now + RETRY_S
+    until = _until(saturated, now) if saturated else now + RETRY_S
     if saturated:
         text = "; ".join(_reasons(saturated) + [f"unreadable: {b}" for b in blind])
     else:
@@ -413,10 +414,6 @@ class AntigravityAdapter:
 
     def run_round(self, prompt: str, ctx: RoundContext) -> RoundResult:
         guard = Guard(self.cfg, self._read, _evaluate, self._poll_clock, self._wall_clock)
-        refused = guard.start()
-        if refused is not None:
-            return refused
-
         problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
         reported = False
         final: dict | None = None
@@ -439,39 +436,17 @@ class AntigravityAdapter:
             return None
 
         argv = self.argv(prompt, ctx.session_id)
-        spawned = False
 
-        def on_spawn(pid: int) -> None:
-            nonlocal spawned
-            spawned = True
-            ctx.on_spawn(pid)
-
-        try:
+        def start(run_ctx: RoundContext) -> RoundResult:
             # The prompt travels in argv; stdin stays closed (None), or agy waits on it.
             exit_ = run_streaming(
-                argv,
-                ctx.workdir,
-                None,
-                replace(ctx, on_spawn=on_spawn),
-                on_line,
-                guard.tick,
-                tick_s=self.tick_s,
+                argv, ctx.workdir, None, run_ctx, on_line, guard.tick, tick_s=self.tick_s
             )
-        except OSError as exc:
-            if not spawned:
-                return RoundResult(TRANSIENT, reason=f"cannot start {self.cfg.bin}: {exc}")
-            # The agent ran (and may have spent something) before the runner failed.
-            result = RoundResult(TRANSIENT, reason=f"runner failed after the agent started: {exc}")
-        else:
-            result = exit_.stopped
-            if result is None:
-                result = self._outcome(exit_.timed_out, final, problems, ctx)
-        # The process is gone; the closing read catches a debit made since the previous poll.
-        if result.outcome != CREDIT_GUARD:
-            late = guard.close()
-            if late is not None:
-                return late
-        return result
+            if exit_.stopped is not None:
+                return exit_.stopped
+            return self._outcome(exit_.timed_out, final, problems, ctx)
+
+        return run_guarded(guard, ctx, self.cfg.bin, start)
 
     def _outcome(
         self, timed_out: bool, final: dict | None, problems: deque[str], ctx: RoundContext

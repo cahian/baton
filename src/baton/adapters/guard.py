@@ -9,11 +9,18 @@ being blind counted, two in a row stopping the round. Unknown means stop.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
-from baton.adapters.base import CREDIT_GUARD, LIMIT, Availability, RoundResult
+from baton.adapters.base import (
+    CREDIT_GUARD,
+    LIMIT,
+    TRANSIENT,
+    Availability,
+    RoundContext,
+    RoundResult,
+)
 from baton.config import AgentConfig
 
 # How long an agent rests after a failed or unreadable limits read.
@@ -140,3 +147,39 @@ class Guard:
         return RoundResult(
             CREDIT_GUARD, reason=f"cannot confirm the balance after the round: {why}"
         )
+
+
+def run_guarded(
+    guard: Guard,
+    ctx: RoundContext,
+    bin_path: str,
+    start: Callable[[RoundContext], RoundResult],
+) -> RoundResult:
+    """Run one round inside the guard: baseline read, the round, then the closing read.
+
+    `start` runs the process (with the context it is given, whose `on_spawn` is tracked) and
+    returns how the round ended. An OSError before the process existed is a plain transient; one
+    after it means the agent ran and may have spent something, so the closing read still happens.
+    """
+    refused = guard.start()
+    if refused is not None:
+        return refused
+    spawned = False
+
+    def on_spawn(pid: int) -> None:
+        nonlocal spawned
+        spawned = True
+        ctx.on_spawn(pid)
+
+    try:
+        result = start(replace(ctx, on_spawn=on_spawn))
+    except OSError as exc:
+        if not spawned:
+            return RoundResult(TRANSIENT, reason=f"cannot start {bin_path}: {exc}")
+        result = RoundResult(TRANSIENT, reason=f"runner failed after the agent started: {exc}")
+    # The process is gone; the closing read catches a debit made since the previous poll.
+    if result.outcome != CREDIT_GUARD:
+        late = guard.close()
+        if late is not None:
+            return late
+    return result

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from baton.adapters.antigravity import (
+    GEMINI_MODELS,
     AntigravityAdapter,
     LimitsError,
     check_usage,
@@ -356,7 +357,18 @@ def test_classify_auth(text):
     assert res is not None and res.outcome == AUTH
 
 
-@pytest.mark.parametrize("text", ["", "boom", "conversation not found", "internal error 500"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "boom",
+        "conversation not found",
+        "internal error 500",
+        "could not assign interface",
+        "the catalog index is stale",
+        "design signing in progress elsewhere",
+    ],
+)
 def test_classify_other_text_is_left_to_the_caller(text):
     assert classify(text, NOW) is None
 
@@ -538,11 +550,12 @@ def test_non_json_line_is_scanned_for_a_failure(fake, tmp_path, monkeypatch):
 
 def test_agent_text_mentioning_limits_does_not_classify(fake, tmp_path, monkeypatch):
     # Only the result's error and non-JSON lines are scanned, never what the agent says.
+    monkeypatch.setenv("FAKE_AGY_TEXT", "I hit a quota wall, HTTP 429, please log in again")
     monkeypatch.setenv("FAKE_AGY_RESULT_STATUS", "ERROR")
     monkeypatch.setenv("FAKE_AGY_EXEC_EXIT", "1")
     reads = Reads()
     res = adapter(fake.bin, reads).run_round("go", make_ctx(tmp_path))
-    assert res.outcome == TRANSIENT  # delta said "working on it", the error said "boom"
+    assert res.outcome == TRANSIENT  # the delta said quota/429/log in, the error said "boom"
 
 
 def test_exit_without_a_result_event_is_transient(fake, tmp_path, monkeypatch):
@@ -703,6 +716,62 @@ def test_clear_refusal_is_honoured_when_credits_are_blind(fake, tmp_path, monkey
     res = adapter(fake.bin, reads).run_round("go", make_ctx(tmp_path))
     assert res.outcome == LIMIT and abs(res.until - reset) < 1
     assert reads.calls["/usage"] == 3  # the third is the closing read
+
+
+# --- one broken row must not hide a clear refusal --------------------------------------------
+
+BROKEN_ROW = "Gemini 4 Argon\tGemini 4 Argon Weekly Limit\tlots\t2026-11-11T17:56:01Z\n"
+
+
+def test_saturated_row_beside_a_broken_gemini_row_still_refuses_with_its_reset():
+    reset = time.time() + 3600
+    text = usage(five=0, five_reset=reset) + BROKEN_ROW
+    res = AntigravityAdapter(make_cfg(), read=Reads([text])).availability()
+    assert not res.ok and abs(res.until - reset) < 1  # the reset, not a 300 s pause
+    assert "Five Hour" in res.reason and "unreadable" in res.reason
+
+
+def test_saturated_model_row_without_gemini_models_rows_refuses_with_its_reset():
+    reset = time.time() + 3600
+    only_model = f"Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t0%\t{iso(reset)}\n"
+    res = AntigravityAdapter(make_cfg(), read=Reads([only_model])).availability()
+    assert not res.ok and abs(res.until - reset) < 1
+
+
+def test_check_usage_saturated_model_row_wins_without_gemini_models_rows():
+    only_model = [
+        r for r in rows_of(model=0, weekly_reset=NOW + 700) if r["group"] != GEMINI_MODELS
+    ]
+    a = check_usage(only_model, 90, NOW)
+    assert not a.ok and a.until == NOW + 700
+
+
+def test_round_stops_at_threshold_even_when_another_gemini_row_is_broken(
+    fake, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FAKE_AGY_EXEC_SLEEP", "30")
+    reset = time.time() + 3600
+    reads = Reads([usage(), usage(five=10, five_reset=reset) + BROKEN_ROW, usage()])
+    pids = []
+    res = adapter(fake.bin, reads).run_round("go", make_ctx(tmp_path, on_spawn=pids.append))
+    # One blind poll is not the second in a row; the clear refusal must stop the round now.
+    assert res.outcome == LIMIT and abs(res.until - reset) < 1
+    assert reads.calls["/usage"] == 3  # baseline, the refusing poll, the closing read
+    assert wait_dead(pids[0])
+
+
+def test_a_broken_gemini_row_alone_is_still_unknown_so_unavailable():
+    res = AntigravityAdapter(make_cfg(), read=Reads([usage() + BROKEN_ROW])).availability()
+    assert not res.ok and "unreadable" in res.reason
+
+
+def test_default_read_timeout_is_thirty_seconds():
+    import inspect
+
+    from baton.adapters import antigravity
+
+    assert antigravity.READ_TIMEOUT_S == 30
+    assert inspect.signature(read_text).parameters["timeout_s"].default == 30
 
 
 # --- the closing read ------------------------------------------------------------------------
