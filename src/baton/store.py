@@ -23,6 +23,10 @@ class AlreadyRunning(Exception):
     """Another runner holds the lock for this goal."""
 
 
+class StateError(Exception):
+    """state.json exists but cannot be read. The file is left untouched."""
+
+
 def state_dir(name: str) -> Path:
     """State directory for a goal. `BATON_STATE_DIR` overrides `~/.local/state/baton`."""
     if not _SAFE_RE.fullmatch(name):
@@ -136,19 +140,24 @@ class Store:
     # state
 
     def load_state(self) -> dict:
+        """Saved state, or {} when none exists yet.
+
+        Raises StateError when the file exists but cannot be read or parsed. It is never
+        moved or reset here: cooldowns and the active group live in it, and any reader
+        (including the read-only panel) may call this.
+        """
         try:
-            data = json.loads(self._state.read_text(encoding="utf-8"))
+            text = self._state.read_text(encoding="utf-8")
         except FileNotFoundError:
             return {}
-        except (ValueError, OSError):
-            data = None
+        except OSError as exc:
+            raise StateError(f"cannot read {self._state}: {exc}") from exc
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise StateError(f"corrupt state file {self._state}: {exc}") from exc
         if not isinstance(data, dict):
-            # Unreadable state: keep it for inspection and start clean.
-            try:
-                os.replace(self._state, self.root / "state.json.corrupt")
-            except OSError:
-                pass
-            return {}
+            raise StateError(f"corrupt state file {self._state}: not a JSON object")
         return data
 
     def save_state(self, state: dict) -> None:

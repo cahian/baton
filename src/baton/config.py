@@ -131,7 +131,7 @@ def _load_agent(name: str, table: dict[str, Any]) -> AgentConfig:
         enabled=_bool(table, "enabled", d["enabled"], where),
         model=_str(table, "model", d["model"], where),
         effort=_str(table, "effort", d["effort"], where),
-        threshold_pct=_int(table, "threshold_pct", d["threshold_pct"], where, 1, 100),
+        threshold_pct=_int(table, "threshold_pct", d["threshold_pct"], where, 1, 99),
         poll_s=_int(table, "poll_s", d["poll_s"], where, 1, 3600),
         bin=_str(table, "bin", d["bin"], where),
         full_access=_bool(table, "full_access", d["full_access"], where),
@@ -171,7 +171,7 @@ def load_goal(path: Path) -> Goal:
 
     workdir = Path(_required_str(data, "workdir")).expanduser()
     if not workdir.is_absolute():
-        workdir = path.parent / workdir
+        workdir = path.resolve().parent / workdir
     objective = _required_str(data, "objective")
 
     order_raw = data.get("order", list(DEFAULT_ORDER))
@@ -201,6 +201,8 @@ def load_goal(path: Path) -> Goal:
         if not isinstance(sub, dict):
             raise GoalError(f"agents.{agent} must be a table")
         agents[agent] = _load_agent(agent, sub)
+    if not any(agents[a].enabled for a in order_raw):
+        raise GoalError("every agent in order is disabled; nothing could ever run")
 
     return Goal(
         name=name,

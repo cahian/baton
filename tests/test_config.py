@@ -75,6 +75,7 @@ def test_overrides_are_applied(tmp_path):
     "extra",
     [
         "[agents.codex]\nthreshold_pct = 0\n",
+        "[agents.claude]\nthreshold_pct = 100\n",
         "[agents.codex]\nthreshold_pct = 'high'\n",
         "[agents.codex]\nenabled = 1\n",
         "[agents.nope]\nenabled = true\n",
@@ -104,3 +105,34 @@ def test_relative_workdir_resolves_against_goal_file(tmp_path):
     text = minimal().replace('workdir = "/work/demo"', 'workdir = "proj"')
     goal = load_goal(write(tmp_path, text))
     assert goal.workdir == tmp_path / "proj"
+
+
+def test_relative_goal_path_gives_absolute_workdir(tmp_path, monkeypatch):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "goal.toml").write_text(minimal().replace("/work/demo", "proj"))
+    monkeypatch.chdir(tmp_path)
+    goal = load_goal(Path("sub/goal.toml"))
+    assert goal.workdir.is_absolute()
+    assert goal.workdir == (tmp_path / "sub" / "proj").resolve()
+
+
+def test_all_ordered_agents_disabled_raises(tmp_path):
+    text = (
+        minimal()
+        + "[agents.codex]\nenabled = false\n[agents.claude]\nenabled = false\n"
+        + "[agents.antigravity]\nenabled = false\n"
+    )
+    with pytest.raises(GoalError, match="disabled"):
+        load_goal(write(tmp_path, text))
+
+
+def test_enabled_agent_outside_order_does_not_count(tmp_path):
+    text = minimal().replace('objective = "Ship it."', 'objective = "x"\norder = ["codex"]')
+    text += "[agents.codex]\nenabled = false\n"
+    with pytest.raises(GoalError, match="disabled"):
+        load_goal(write(tmp_path, text))
+
+
+def test_threshold_99_is_accepted(tmp_path):
+    goal = load_goal(write(tmp_path, minimal() + "[agents.codex]\nthreshold_pct = 99\n"))
+    assert goal.agents["codex"].threshold_pct == 99

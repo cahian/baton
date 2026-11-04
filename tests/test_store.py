@@ -4,7 +4,7 @@ import os
 import pytest
 
 from baton import store as store_mod
-from baton.store import AlreadyRunning, Store, state_dir
+from baton.store import AlreadyRunning, StateError, Store, state_dir
 
 
 @pytest.fixture
@@ -43,6 +43,20 @@ def test_events_roundtrip_and_rotation(st, monkeypatch):
     assert [e["kind"] for e in again.events(after=12)] == ["after-restart"]
 
 
+def test_events_merge_rotated_file(st, monkeypatch):
+    for i in range(3):
+        st.emit("old", i=i)
+    monkeypatch.setattr(store_mod, "MAX_EVENTS_BYTES", (st.root / "events.jsonl").stat().st_size)
+    st.emit("new")  # rotates seq 1-3 into events.jsonl.1, current holds seq 4
+    monkeypatch.undo()
+    st.emit("newer")
+    assert (st.root / "events.jsonl.1").exists()
+    assert [e["seq"] for e in st.events()] == [1, 2, 3, 4, 5]
+    assert [e["seq"] for e in st.events(after=1)] == [2, 3, 4, 5]
+    assert [e["seq"] for e in st.events(after=3)] == [4, 5]
+    assert st.events(after=5) == []
+
+
 def test_events_skip_partial_line(st):
     st.emit("ok")
     with (st.root / "events.jsonl").open("a") as fh:
@@ -75,10 +89,33 @@ def test_save_state_atomic(st, monkeypatch):
     assert [p.name for p in st.root.iterdir() if p.name.endswith(".tmp")] == []
 
 
-def test_corrupt_state_is_kept_aside(st):
-    (st.root / "state.json").write_text("{not json")
-    assert st.load_state() == {}
-    assert (st.root / "state.json.corrupt").read_text() == "{not json"
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", ""])
+def test_corrupt_state_raises_and_file_is_untouched(st, content):
+    path = st.root / "state.json"
+    path.write_text(content)
+    with pytest.raises(StateError):
+        st.load_state()
+    assert path.read_text() == content
+    assert [p.name for p in st.root.iterdir() if "corrupt" in p.name] == []
+
+
+def test_unreadable_state_raises_and_file_is_untouched(st, monkeypatch):
+    st.save_state({"round": 5})
+    path = st.root / "state.json"
+    before = path.read_bytes()
+    real = type(path).read_text
+
+    def denied(self, *a, **k):
+        if self.name == "state.json":
+            raise PermissionError("denied")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(type(path), "read_text", denied)
+    with pytest.raises(StateError):
+        st.load_state()
+    monkeypatch.undo()
+    assert path.read_bytes() == before
+    assert st.load_state() == {"round": 5}
 
 
 def test_round_log_path(st):
