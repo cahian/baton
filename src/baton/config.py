@@ -56,6 +56,19 @@ _CLAUDE_FIXED = {"threshold_pct": 95, "poll_s": 15, "full_access": True}
 
 # Budget settings shared by every goal: they live only in the defaults file, because the one
 # ledger they describe is shared too.
+GOAL_KEYS = frozenset(
+    {
+        "name",
+        "workdir",
+        "objective",
+        "order",
+        "round_max_s",
+        "idle_s",
+        "snapshot",
+        "verify",
+        "agents",
+    }
+)
 GLOBAL_ONLY = ("monthly_budget_usd", "reserve_pct", "budget_reset_day")
 
 
@@ -258,21 +271,7 @@ def load_goal(path: Path) -> Goal:
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise GoalError(f"invalid goal file {path}: {exc}") from exc
 
-    _check_keys(
-        data,
-        {
-            "name",
-            "workdir",
-            "objective",
-            "order",
-            "round_max_s",
-            "idle_s",
-            "snapshot",
-            "verify",
-            "agents",
-        },
-        "goal file",
-    )
+    _check_keys(data, GOAL_KEYS, "goal file")
 
     name = _required_str(data, "name")
     if not _NAME_RE.fullmatch(name):
@@ -282,6 +281,21 @@ def load_goal(path: Path) -> Goal:
     if not workdir.is_absolute():
         workdir = path.resolve().parent / workdir
     objective = _required_str(data, "objective")
+
+    rest = {k: v for k, v in data.items() if k not in ("name", "workdir", "objective")}
+    return goal_from_table(rest, name=name, workdir=workdir, objective=objective, path=path)
+
+
+def goal_from_table(
+    data: dict[str, Any], *, name: str, workdir: Path, objective: str, path: Path
+) -> Goal:
+    """The Goal for a parsed goal table (`order`, timings, `[verify]`, `[agents.*]`).
+
+    The one place a goal is validated and the defaults file applied, whether the table came from
+    a goal file or from the `baton.toml` of an OpenCode session. `name`, `workdir` and
+    `objective` are given, not read from the table, so a table that carries them is rejected.
+    """
+    _check_keys(data, GOAL_KEYS - {"name", "workdir", "objective"}, "goal table")
 
     order_raw = data.get("order", list(DEFAULT_ORDER))
     if (

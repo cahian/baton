@@ -189,7 +189,11 @@ def gw(fakes, monkeypatch, tmp_path):
     make_db(db, [(SESSION, str(fakes.work)), ("ses_other", str(fakes.work))])
     monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
     agents = {"claude_api": Fake("claude_api"), "codex": Fake("codex")}
-    server, manager = make_server(0, lambda goal: agents)
+
+    def adapters_for(goal):  # like build_adapters: only what the goal enables
+        return {n: a for n, a in agents.items() if goal.agents[n].enabled}
+
+    server, manager = make_server(0, adapters_for)
     threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
     ).start()
@@ -330,6 +334,30 @@ def test_invalid_baton_toml_is_reported_not_ignored(gw):
     assert "invalid" in gw.stream("go").read_all()
 
 
+def test_baton_toml_cannot_set_a_global_setting(gw):
+    (gw.work / "baton.toml").write_text("[agents.claude_api]\nmonthly_budget_usd = 99999\n")
+    text = gw.stream("go").read_all()
+    assert "global setting" in text and "monthly_budget_usd" in text
+    assert gw.agents["claude_api"].prompts == [] and gw.agents["codex"].prompts == []
+
+
+def test_the_defaults_file_applies_to_a_session_job(gw, tmp_path, monkeypatch):
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text("[agents.claude_api]\nenabled = false\n")
+    monkeypatch.setenv("BATON_CONFIG", str(defaults))
+    text = gw.stream("go").read_all()
+    assert gw.agents["claude_api"].prompts == []
+    assert len(gw.agents["codex"].prompts) == 1 and "[baton] done" in text
+
+
+def test_a_broken_defaults_file_is_reported(gw, tmp_path, monkeypatch):
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text("[agents.claude_api]\nbogus = 1\n")
+    monkeypatch.setenv("BATON_CONFIG", str(defaults))
+    assert "bogus" in gw.stream("go").read_all()
+    assert gw.agents["claude_api"].prompts == []
+
+
 # jobs and connections
 
 
@@ -358,7 +386,7 @@ def test_second_message_interrupts_and_reaches_agent(gw):
     assert "first request" in prompts[0]
     assert "second request, changed my mind" in prompts[1]
     assert "Notes from the person" in prompts[1]
-    assert "new message received" in text
+    assert "message received" in text
     ended = [e for e in gw.events() if e["kind"] == "round_end"]
     assert ended[0]["interrupted"] is True
     assert "[baton] done" in text
@@ -384,6 +412,101 @@ def test_reattach_after_disconnect_streams_remaining_output(gw):
     text = again.read_all()
     assert "beta" in text and "alpha" not in text
     assert "[baton] done" in text
+
+
+def _second_session_in(gw, tmp_path, directory, session="ses_second"):
+    conn = sqlite3.connect(os.environ["BATON_OPENCODE_DB"])
+    conn.execute("insert into session_v2 values (?, ?)", (session, str(directory)))
+    conn.commit()
+    conn.close()
+    return session
+
+
+def test_one_running_job_per_directory(gw, tmp_path):
+    gw.agents["claude_api"].script = [until_killed("busy here")]
+    first = gw.stream("first session work")
+    first.read_until("busy here")
+    # the same directory through a symlink is the same directory
+    link = tmp_path / "link"
+    link.symlink_to(gw.work)
+    other = _second_session_in(gw, tmp_path, link)
+    text = gw.stream("second session work", session=other).read_all()
+    assert "already running" in text and SESSION in text and "events.jsonl" in text
+    assert gw.job(other) is None
+    assert len(gw.agents["claude_api"].prompts) == 1
+    # a different directory is not in the way
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    free = _second_session_in(gw, tmp_path, elsewhere, "ses_free")
+    assert "[baton] done" in gw.stream("third", session=free).read_all()
+    # and the directory is free again once the first job is over
+    gw.stream("stop that", session=SESSION)  # interrupts the busy round
+    assert wait_for(lambda: not gw.job().is_running())
+    assert "[baton] done" in gw.stream("second session work", session=other).read_all()
+    first.close()
+
+
+def test_submit_after_shutdown_starts_nothing(gw):
+    gw.manager.shutdown(timeout=5)
+    text = gw.stream("late message").read_all()
+    assert "shutting down" in text
+    assert gw.job() is None
+    assert gw.agents["claude_api"].prompts == []
+
+
+def test_a_message_during_a_passing_verify_gets_a_follow_up_run(gw):
+    (gw.work / "baton.toml").write_text(
+        'order = ["claude_api"]\nsnapshot = false\n[verify]\ncommand = "test -f GATE"\n'
+    )
+
+    def open_the_gate_then_work(agent, prompt, ctx):
+        (gw.work / "GATE").write_text("x")
+        return until_killed("working")(agent, prompt, ctx)
+
+    gw.agents["claude_api"].script = [open_the_gate_then_work]
+    first = gw.stream("first request")
+    first.read_until("working")
+    second = gw.stream("a late correction nobody has read")
+    text = second.read_all()
+    prompts = gw.agents["claude_api"].prompts
+    assert len(prompts) == 2 and "a late correction nobody has read" in prompts[1]
+    assert "follow-up" in text and text.count("[baton] done") == 2
+    assert "to deliver it" not in text
+    assert Store(state_dir(gateway.job_name(SESSION))).take_inbox() == ""
+    first.close()
+
+
+def test_a_message_never_read_is_not_reported_as_delivered(gw):
+    # a job that is stopped does not start a follow-up for what it never read
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    job = gw.job()
+    job.request_stop(now=True)
+    assert wait_for(lambda: not job.is_running())
+    assert len(gw.agents["claude_api"].prompts) == 1
+    assert "follow-up" not in s.read_all()
+
+
+def test_other_sessions_are_not_held_up_while_one_hands_over(gw, tmp_path, monkeypatch):
+    real = gateway.Job._unread_notes
+
+    def slow(self):
+        time.sleep(1.5)
+        return real(self)
+
+    monkeypatch.setattr(gateway.Job, "_unread_notes", slow)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    free = _second_session_in(gw, tmp_path, elsewhere, "ses_free")
+    gw.stream("one").read_until("[baton] done")  # the job is now wrapping up for 1.5 s
+    waiting = threading.Thread(target=lambda: gw.stream("two").read_all(), daemon=True)
+    waiting.start()
+    time.sleep(0.2)  # the second message of SESSION is now waiting for the handover
+    started = time.monotonic()
+    gw.stream("quick", session=free).read_until("[baton] round 1")
+    assert time.monotonic() - started < 1.0
+    waiting.join(20)
 
 
 def test_a_finished_job_is_replaced_by_a_new_one(gw):
@@ -439,7 +562,7 @@ def test_fresh_job_includes_history_resumed_job_does_not(gw):
     assert "Conversation so far" not in resumed
 
 
-def test_an_agent_without_a_session_in_a_resumed_job_gets_only_the_new_message(gw):
+def test_an_agent_without_a_session_in_a_resumed_job_still_gets_the_history(gw):
     history = [
         {"role": "user", "content": "earlier question about parsers"},
         {"role": "assistant", "content": "earlier answer about tokens"},
@@ -450,8 +573,8 @@ def test_an_agent_without_a_session_in_a_resumed_job_gets_only_the_new_message(g
     gw.agents["claude_api"].script = [lambda a, p, c: RoundResult(LIMIT, until=time.time() + 3600)]
     gw.stream("and add a test", history=history).read_all()
     fresh = gw.agents["codex"].prompts[0]
-    assert "Objective:\nand add a test\n" in fresh
-    assert "earlier question about parsers" not in fresh
+    assert "and add a test" in fresh
+    assert "earlier question about parsers" in fresh and "earlier answer about tokens" in fresh
 
 
 def test_a_stop_left_over_does_not_end_a_new_job(gw):

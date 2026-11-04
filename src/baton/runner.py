@@ -283,14 +283,18 @@ def run_goal(
     store: Store,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    first_gate: bool = True,
 ) -> int:
     """Run `goal` until the gate passes or a stop is honoured. Returns 0 either way.
+
+    `first_gate=False` runs a round before the first verify, for a goal that has just been given
+    new work and so cannot be judged done by a gate that already passes.
 
     Holds the goal's lock for the duration; raises AlreadyRunning when another runner has it.
     Everything else that goes wrong is logged as an `error` event, followed by a 60 s sleep.
     """
     with store.lock():
-        return _Run(goal, adapters, store, clock, sleep).run()
+        return _Run(goal, adapters, store, clock, sleep, first_gate).run()
 
 
 class _Run:
@@ -301,6 +305,7 @@ class _Run:
         store: Store,
         clock: Callable[[], float],
         sleep: Callable[[float], None],
+        first_gate: bool = True,
     ) -> None:
         self.goal = goal
         self.adapters = adapters
@@ -315,7 +320,7 @@ class _Run:
         self.gate_tail = ""
         self.group: int | None = None
         self.group_start = ""
-        self.need_gate = True
+        self.need_gate = first_gate
         self.prev_agent: str | None = None
         self.carried_notes = ""
         self.heads: dict[str, str] = {}

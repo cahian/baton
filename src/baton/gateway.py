@@ -24,9 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-from baton import config
 from baton.adapters.base import Adapter
-from baton.config import Goal, GoalError
+from baton.config import Goal, GoalError, goal_from_table
 from baton.proc import OURS, check_group, kill_group
 from baton.runner import run_goal
 from baton.store import AlreadyRunning, StateError, Store, state_dir
@@ -45,6 +44,9 @@ FEED_MAX_ITEMS = 5000
 # A job that is wrapping up has this long to release its lock before a new one is refused.
 HANDOVER_S = 10.0
 SHUTDOWN_S = 25.0
+# Messages that arrive while a goal is finishing each get a follow-up run, up to this many.
+MAX_FOLLOWUPS = 5
+SETTLE_POLL_S = 0.05
 GATE_SHOWN_CHARS = 1500
 NAME_MAX_CHARS = 100
 
@@ -179,24 +181,12 @@ def job_name(session: str) -> str:
 # the goal
 
 
-_GOAL_KEYS = {
-    "name",
-    "workdir",
-    "objective",
-    "order",
-    "round_max_s",
-    "idle_s",
-    "snapshot",
-    "verify",
-    "agents",
-}
-
-
 def build_goal(name: str, workdir: Path, objective: str) -> Goal:
-    """The goal for a session job, in memory. The workdir's `baton.toml` supplies the verify
-    command, the agent settings and the timings; `name`, `workdir` and `objective` in it are
-    ignored, since the session decides those. Without one there is no gate. A `baton.toml` that
-    cannot be read or is invalid is an error, never a silent fall back to no gate."""
+    """The goal for a session job, in memory, through the same builder as a goal file. The
+    workdir's `baton.toml` supplies the verify command, the agent settings and the timings;
+    `name`, `workdir` and `objective` in it are ignored, since the session decides those. Without
+    one there is no gate. A `baton.toml` that cannot be read or is invalid is an error, never a
+    silent fall back to no gate."""
     path = workdir / "baton.toml"
     data: dict = {}
     if path.exists():
@@ -204,51 +194,11 @@ def build_goal(name: str, workdir: Path, objective: str) -> Goal:
             data = tomllib.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise GoalError(f"invalid {path}: {exc}") from None
-    config._check_keys(data, _GOAL_KEYS, "baton.toml")
-
-    order_raw = data.get("order", list(config.DEFAULT_ORDER))
-    if (
-        not isinstance(order_raw, list)
-        or not order_raw
-        or not all(isinstance(a, str) for a in order_raw)
-    ):
-        raise GoalError("order must be a non-empty list of agent names")
-    for agent in order_raw:
-        if agent not in config.AGENT_NAMES:
-            raise GoalError(f"unknown agent in order: {agent!r}")
-    if len(set(order_raw)) != len(order_raw):
-        raise GoalError("order lists an agent more than once")
-
-    verify = config._table(data, "verify", "")
-    config._check_keys(verify, {"command", "timeout_s"}, "[verify]")
-    command = config._required_str(verify, "command", "verify.") if "command" in verify else None
-
-    agents_table = config._table(data, "agents", "")
-    unknown = sorted(set(agents_table) - set(config.AGENT_NAMES))
-    if unknown:
-        raise GoalError(f"unknown agent in [agents]: {', '.join(unknown)}")
-    agents = {}
-    for agent in config.AGENT_NAMES:
-        sub = agents_table.get(agent, {})
-        if not isinstance(sub, dict):
-            raise GoalError(f"agents.{agent} must be a table")
-        agents[agent] = config._load_agent(agent, sub)
-    if not any(agents[a].enabled for a in order_raw):
-        raise GoalError("every agent in order is disabled; nothing could ever run")
-
-    return Goal(
-        name=name,
-        workdir=workdir,
-        objective=objective,
-        order=tuple(order_raw),
-        round_max_s=config._int(data, "round_max_s", 3600, "", 1, 10**7),
-        idle_s=config._int(data, "idle_s", 1200, "", 1, 10**7),
-        snapshot=config._bool(data, "snapshot", True, ""),
-        verify_command=command,
-        verify_timeout_s=config._int(verify, "timeout_s", 3600, "verify.", 1, 10**7),
-        agents=agents,
-        path=path,
-    )
+    rest = {k: v for k, v in data.items() if k not in ("name", "workdir", "objective")}
+    try:
+        return goal_from_table(rest, name=name, workdir=workdir, objective=objective, path=path)
+    except GoalError as exc:
+        raise GoalError(f"{path}: {exc}" if data else str(exc)) from None
 
 
 # what the person reads
@@ -328,11 +278,17 @@ class Job:
         workdir: Path,
         goal: Goal,
         adapters_for: Callable[[Goal], Mapping[str, Adapter]],
+        context: list[dict],
     ) -> None:
         self.session = session
         self.name = name
         self.workdir = workdir
+        self.resolved = workdir.resolve()
         self.goal = goal
+        # The conversation up to the newest message handed to this job.
+        self.context = context
+        # Builds the goal for messages left unread when a run ends; set by the manager.
+        self.followup: Callable[[str], Goal] | None = None
         self._adapters_for = adapters_for
         self._cond = threading.Condition()
         self._items: list[str] = []
@@ -340,7 +296,8 @@ class Job:
         self._closing = False  # the run has said it is over
         self._done = False
         self._delivered = 0
-        self._ended_cleanly = False
+        self._end = ""  # how the last run ended: "finished", "stopped" or ""
+        self._stopping = False
         self.store = _JobStore(state_dir(name), self._on_event)
         self._thread = threading.Thread(target=self._run, name=f"baton-{name}", daemon=True)
 
@@ -360,7 +317,24 @@ class Job:
     def _run(self) -> None:
         try:
             adapters = self._adapters_for(self.goal)
-            run_goal(self.goal, adapters, self.store)
+            goal, first_gate = self.goal, True
+            for attempt in range(MAX_FOLLOWUPS + 1):
+                self._end = ""
+                run_goal(goal, adapters, self.store, first_gate=first_gate)
+                notes = self._unread_notes()
+                if not notes:
+                    break
+                if attempt == MAX_FOLLOWUPS:
+                    self._push("\n[baton] messages left unread, send them again:\n" + notes + "\n")
+                    break
+                assert self.followup is not None
+                goal, first_gate = self.followup(notes), False
+                self._push(
+                    "\n[baton] a message arrived while the goal was finishing and no agent had "
+                    "read it: starting a follow-up run for it\n\n"
+                )
+                with self._cond:
+                    self._closing = False
         except AlreadyRunning as exc:
             self._push(f"\n[baton] cannot start: {exc}\n")
         except Exception as exc:  # one job crashing must never take the server with it
@@ -370,7 +344,18 @@ class Job:
                 self._done = True
                 self._cond.notify_all()
 
+    def _unread_notes(self) -> str:
+        """Notes still in the inbox after a run that finished: the person wrote them and no
+        agent ever got them. A run that was stopped leaves them alone."""
+        if self._end != "finished" or self._stopping or self.followup is None:
+            return ""
+        try:
+            return self.store.take_inbox().strip()
+        except OSError:
+            return ""
+
     def request_stop(self, now: bool = True) -> None:
+        self._stopping = True
         try:
             self.store.request_stop(now=now)
         except OSError:
@@ -393,18 +378,34 @@ class Job:
         if kind in ("finished", "stopped"):
             with self._cond:
                 self._closing = True
+                self._end = kind
         self._push(render_event(kind, fields))
 
     def add_note(self, text: str) -> bool:
-        """Hand a new message to the running job: a note, and the current round is ended so
-        the agent reads it now. False when the job is over or about to be."""
+        """Queue a new message for the running job and end the current round, so the next one
+        reads it. False when the job is over or about to be."""
         with self._cond:
             if self._done or self._closing:
                 return False
             self.store.say(text)
             self.store.request_interrupt()
-        self._push("\n[baton] new message received: ending the current round to deliver it\n\n")
+        self._push(
+            "\n[baton] message received: ending the current round so the next one reads it\n\n"
+        )
         return True
+
+    def settle(self, text: str, timeout: float) -> str:
+        """For a job that is wrapping up: wait until it takes the note ("accepted", it went
+        on with a follow-up) or is over ("gone"). "timeout" when it is still neither."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.add_note(text):
+                return "accepted"
+            if not self.is_running():
+                return "gone"
+            if time.monotonic() >= deadline:
+                return "timeout"
+            time.sleep(SETTLE_POLL_S)
 
     @property
     def delivered(self) -> int:
@@ -449,6 +450,7 @@ class JobManager:
         self._adapters_for = adapters_for
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
+        self._closed = False
 
     def get(self, session: str) -> Job | None:
         with self._lock:
@@ -456,45 +458,84 @@ class JobManager:
 
     def submit(self, session: str, workdir: Path, messages: list[dict]) -> Job:
         """Deliver the last user message to the session's job: as a note with an interrupt when
-        one is running, otherwise as the objective of a new one. Raises GatewayError or
-        GoalError when the job cannot be built."""
+        one is running, otherwise as the objective of a new one. At most one job runs in a
+        directory. Raises GatewayError or GoalError when nothing can be started."""
         index = last_user_index(messages)
         text = _text_of(messages[index]).strip() if index is not None else ""
         if index is None or not text:
             raise GatewayError("the last message is empty, so there is nothing to work on.")
-        with self._lock:
-            old = self._jobs.get(session)
-            if old is not None:
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise GatewayError("baton is shutting down, so it started nothing.")
+                old = self._jobs.get(session)
+                if old is None or not old.is_running():
+                    self._refuse_if_busy(session, workdir)
+                    job = self._create(session, workdir, messages[:index], text)
+                    self._jobs[session] = job
+                    job.start()
+                    return job
                 if old.add_note(text):
                     return old
-                old.join(HANDOVER_S)  # it is wrapping up and still holds the goal's lock
-            job = self._create(session, workdir, messages[:index], text)
-            self._jobs[session] = job
-            job.start()
-            return job
+            # It is wrapping up and still holds the goal's lock: wait outside our own lock, so
+            # other sessions are not held up.
+            outcome = old.settle(text, HANDOVER_S)
+            if outcome == "accepted":
+                return old
+            if outcome == "timeout":
+                raise GatewayError(
+                    "the previous run of this session is still shutting down; send the "
+                    "message again in a moment."
+                )
 
-    def _create(self, session: str, workdir: Path, before: list, text: str) -> Job:
-        name = job_name(session)
-        root = state_dir(name)
-        probe = Store(root)
+    def _refuse_if_busy(self, session: str, workdir: Path) -> None:
+        resolved = workdir.resolve()
+        for other in self._jobs.values():
+            if other.session != session and other.resolved == resolved and other.is_running():
+                raise GatewayError(
+                    f"a baton job is already running in {workdir} (OpenCode session "
+                    f"{other.session}), and two jobs in one directory would commit each "
+                    "other's work. Nothing was started for this message. Follow that job in its "
+                    f"OpenCode session or in {state_dir(other.name) / 'events.jsonl'}, and send "
+                    "this again when it is done."
+                )
+
+    def _briefing(self, name: str, workdir: Path, before: list, text: str) -> tuple[Goal, bool]:
+        """The goal for `text` as the newest message, and whether an agent has a session of its
+        own to resume (its prompt then carries only notes, so `text` must also go in the inbox)."""
         try:
-            state = probe.load_state()
+            state = Store(state_dir(name)).load_state()
         except StateError as exc:
             raise GatewayError(str(exc)) from None
         sessions = state.get("sessions")
         resumed = (
             state.get("workdir") == str(workdir) and isinstance(sessions, dict) and bool(sessions)
         )
-        # An agent that resumes its own conversation already knows the history; a fresh one does
-        # not, and the objective is all of the briefing it gets.
-        history = "" if resumed else history_text(before)
+        # The objective is the briefing of an agent with no session of its own, however the
+        # rotation got to it, so it always carries the conversation.
+        history = history_text(before)
         objective = (
             f"Conversation so far (oldest first):\n{history}\n\nLatest message:\n{text}"
             if history
             else text
         )
-        goal = build_goal(name, workdir, objective)
-        job = Job(session, name, workdir, goal, self._adapters_for)
+        return build_goal(name, workdir, objective), resumed
+
+    def _create(self, session: str, workdir: Path, before: list, text: str) -> Job:
+        name = job_name(session)
+        goal, resumed = self._briefing(name, workdir, before, text)
+        context = [*before, {"role": "user", "content": text}]
+        job = Job(session, name, workdir, goal, self._adapters_for, context)
+
+        def followup(notes: str) -> Goal:
+            next_goal, next_resumed = self._briefing(name, workdir, job.context, notes)
+            job.context.append({"role": "user", "content": notes})
+            job.store.take_interrupt()
+            if next_resumed:
+                job.store.say(notes)
+            return next_goal
+
+        job.followup = followup
         # A stop or interrupt left by something earlier is not about this message.
         job.store.clear_stop()
         job.store.take_interrupt()
@@ -505,6 +546,7 @@ class JobManager:
     def shutdown(self, timeout: float = SHUTDOWN_S) -> None:
         """Stop every running job, killing its agent's process group, and wait for them."""
         with self._lock:
+            self._closed = True  # from here on submit starts nothing
             jobs = list(self._jobs.values())
         running = [j for j in jobs if j.is_running()]
         for job in running:
