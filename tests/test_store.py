@@ -99,6 +99,15 @@ def test_corrupt_state_raises_and_file_is_untouched(st, content):
     assert [p.name for p in st.root.iterdir() if "corrupt" in p.name] == []
 
 
+def test_non_utf8_state_raises_and_file_is_untouched(st):
+    path = st.root / "state.json"
+    path.write_bytes(b'{"round": "\xff\xfe"}')
+    before = path.read_bytes()
+    with pytest.raises(StateError):
+        st.load_state()
+    assert path.read_bytes() == before
+
+
 def test_unreadable_state_raises_and_file_is_untouched(st, monkeypatch):
     st.save_state({"round": 5})
     path = st.root / "state.json"

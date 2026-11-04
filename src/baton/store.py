@@ -150,6 +150,8 @@ class Store:
             text = self._state.read_text(encoding="utf-8")
         except FileNotFoundError:
             return {}
+        except UnicodeDecodeError as exc:
+            raise StateError(f"corrupt state file {self._state}: not valid UTF-8") from exc
         except OSError as exc:
             raise StateError(f"cannot read {self._state}: {exc}") from exc
         try:
