@@ -200,6 +200,7 @@ The verify command runs through the shell in the working directory with `verify.
 - `state.json`: round number, per-agent cooldown and backoff, active group. Written atomically.
 - `rounds/<n>-<agent>.log`: raw agent output.
 - `inbox.md`: notes from the person, consumed into the next prompt.
+- `interrupt`: presence ends the current round now. The note is delivered at once to the next round, which resumes the same agent when it is still available. The file is consumed when the round ends.
 - `stop`: presence requests a stop after the current round. Second form, `stop now`, kills the round.
 
 ### Goal file
@@ -246,7 +247,7 @@ Every value except `name`, `workdir`, `objective` and `verify.command` has the d
 - `baton panel <goal.toml>`: the interface.
 - `baton up <goal.toml>`: runner and panel together in a tmux session named `baton-<name>`, reattached if it exists.
 - `baton status <goal.toml>`: one-shot text.
-- `baton say <goal.toml> "note"`: adds to the inbox.
+- `baton say <goal.toml> [--now] "note"`: adds to the inbox. `--now` also interrupts the current round.
 - `baton stop <goal.toml> [--now]`: requests a stop.
 
 ### Panel
@@ -256,7 +257,7 @@ A Textual app that only reads state and events and writes to the inbox and stop 
 - one card per agent: state, usage percentages, countdown to reset
 - current round, elapsed time, last gate result
 - a live feed of normalized agent output
-- an input line that sends notes to the inbox
+- an input line that sends notes to the inbox; a note starting with `!` interrupts the current round
 
 ## Constraints
 
