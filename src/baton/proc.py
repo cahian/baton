@@ -115,6 +115,50 @@ def kill_group(pgid: int, grace_s: float = 10) -> None:
     _kill_group(pgid, grace_s, None)
 
 
+PS_TIMEOUT_S = 5
+
+
+def process_start(pid: int) -> str | None:
+    """When process `pid` started, as `ps` prints it ("" when no such process).
+
+    None when `ps` itself could not be run or answered nonsense. Two processes that ever held the
+    same pid have different start times, which is what tells a recycled number from ours.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=PS_TIMEOUT_S,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if out.returncode not in (0, 1):
+        return None
+    return " ".join(out.stdout.split())
+
+
+def group_is_ours(pgid: int, recorded_start: object) -> bool:
+    """Whether the group recorded in state.json can still be the one baton started.
+
+    Never our own group, 0 or 1. When the start time of the group leader was recorded, it must
+    still match: a different time means the number was recycled for an unrelated process. A leader
+    that is gone while the group lives is ours (a pid cannot be reused while a group carries it).
+    Without a recorded start time, or when `ps` cannot answer, a group that cannot be verified
+    is not ours.
+    """
+    if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp():
+        return False
+    if not isinstance(recorded_start, str) or not recorded_start:
+        return True  # state written before start times were kept: only the guards above apply
+    now = process_start(pgid)
+    if now is None:
+        return False
+    return now == "" or now == recorded_start
+
+
 @dataclass
 class Exit:
     returncode: int | None

@@ -129,6 +129,11 @@ def _load_agent(name: str, table: dict[str, Any]) -> AgentConfig:
     )
 
 
+def default_agent(name: str) -> AgentConfig:
+    """An agent with every documented default, for commands that run without a goal file."""
+    return _load_agent(name, {})
+
+
 def load_goal(path: Path) -> Goal:
     path = Path(path)
     try:

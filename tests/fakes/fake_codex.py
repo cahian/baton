@@ -11,7 +11,8 @@ Subcommands:
               with the argv and the stdin text). `FAKE_CODEX_THREAD_ID` is the thread id to
               announce, `FAKE_CODEX_EXEC_SLEEP` the seconds to stay alive afterwards,
               `FAKE_CODEX_EXEC_EXIT` the exit code, `FAKE_CODEX_EXEC_FAIL` a line to print
-              (non-JSON, to stderr-like stdout) before exiting.
+              (non-JSON, to stderr-like stdout) before exiting. `FAKE_CODEX_EXEC_PIDFILE` gets
+              the exec process's pid.
 """
 
 import json
@@ -78,6 +79,9 @@ def app_server() -> None:
 
 
 def exec_cmd() -> None:
+    pidfile = os.environ.get("FAKE_CODEX_EXEC_PIDFILE")
+    if pidfile:
+        Path(pidfile).write_text(str(os.getpid()))
     stdin_text = sys.stdin.read()
     calls = os.environ.get("FAKE_CODEX_CALLS")
     if calls:

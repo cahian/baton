@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["textual>=1.0"]
 
+[project.scripts]
+baton = "baton.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8",

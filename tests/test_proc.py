@@ -743,3 +743,33 @@ def test_raising_on_line_still_stops_the_group(tmp_path):
         )
     assert time.monotonic() - t0 < 5
     assert wait_dead(spawned[0])
+
+
+def test_process_start_is_stable_and_empty_for_a_dead_pid():
+    from baton.proc import process_start
+
+    first = process_start(os.getpid())
+    assert first and first == process_start(os.getpid())
+    child = subprocess.Popen(["true"])
+    child.wait()
+    assert process_start(child.pid) == ""
+
+
+def test_group_is_ours_never_accepts_unsafe_ids():
+    from baton.proc import group_is_ours
+
+    for bad in (0, 1, -5, True, None, "12", os.getpgrp()):
+        assert group_is_ours(bad, None) is False  # type: ignore[arg-type]
+
+
+def test_group_is_ours_checks_the_recorded_start_time():
+    from baton.proc import group_is_ours, process_start
+
+    child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        assert group_is_ours(child.pid, process_start(child.pid)) is True
+        assert group_is_ours(child.pid, "Mon Jan  1 00:00:00 2001") is False
+        assert group_is_ours(child.pid, None) is True  # state from before start times existed
+    finally:
+        child.kill()
+        child.wait()
