@@ -981,3 +981,62 @@ def test_run_gate_kills_its_session_on_ctrl_c(tmp_path, work):
             return
         time.sleep(0.05)
     raise AssertionError("the gate's process group survived")
+
+
+# fix round 2
+
+
+def test_refused_retry_after_a_failed_resume_keeps_notes_tail_and_heads(
+    tmp_path, repo, commit, agents, store, world
+):
+    goal = make_goal(tmp_path, repo)
+    old_head = runner._head(repo)
+    store.save_state(
+        {
+            "workdir": str(repo),
+            "sessions": {"codex": "stale"},
+            "round_tail": "tail of the last real round",
+            "heads": {"codex": old_head},
+        }
+    )
+    store.say("do not lose me")
+    commit("later.txt", "later commit")
+
+    def failing_resume(agent, prompt, ctx):
+        ctx.on_output("noise from the dead resume")
+        return RoundResult(TRANSIENT, reason="resume failed: gone", resume_failed=True)
+
+    agents["codex"].script = [failing_resume, refused(TRANSIENT, reason="start refused")]
+    agents["antigravity"].script = [done(repo)]
+    assert run_goal(goal, agents, store, world.clock, world.sleep) == 0
+    handed_over = agents["antigravity"].prompts[0]
+    assert "do not lose me" in handed_over
+    assert "tail of the last real round" in handed_over
+    assert "noise from the dead resume" not in handed_over
+    assert agents["codex"].sessions == ["stale", None]
+    assert "do not lose me" in agents["codex"].prompts[1]  # the fresh retry carried them
+    assert store.load_state()["heads"]["codex"] == old_head  # nothing ran, nothing was seen
+
+
+@pytest.mark.timeout(20)
+def test_gate_background_children_do_not_survive_a_normal_exit(tmp_path, work):
+    goal = make_goal(tmp_path, work, verify="sleep 30 & echo $! > bgpid; exit 0")
+    ok, _ = run_gate(goal)
+    assert ok is True
+    pid = int((work / "bgpid").read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise AssertionError("the gate's background child survived")
+
+
+def test_pause_wait_event_carries_seconds_and_agents(go, agents, work, store, world):
+    agents["codex"].script = [result(COMPLETED), done(work)]
+    assert go() == 0
+    waits = [e for e in store.events() if e["kind"] == "wait"]
+    assert len(waits) == 1
+    assert waits[0]["seconds"] == 30 and set(waits[0]["agents"]) == {"codex", "antigravity"}

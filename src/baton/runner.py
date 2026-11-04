@@ -21,7 +21,7 @@ from baton.adapters.base import (
     RoundResult,
 )
 from baton.config import Goal
-from baton.proc import kill_group
+from baton.proc import group_is_ours, kill_group, process_start
 from baton.scheduler import Scheduler
 from baton.store import Store
 
@@ -129,6 +129,8 @@ def run_gate(goal: Goal, should_kill: Callable[[], bool] | None = None) -> tuple
                 try:
                     code = proc.wait(timeout=GATE_POLL_S)
                     note = f"[exit code {code}]"
+                    # Whatever the command left running in its session goes with it.
+                    _signal_group(proc.pid, signal.SIGKILL)
                     break
                 except subprocess.TimeoutExpired:
                     pass
@@ -312,6 +314,7 @@ class _Run:
         self.round_tail = ""
         self.gate_tail = ""
         self.group: int | None = None
+        self.group_start = ""
         self.need_gate = True
         self.prev_agent: str | None = None
         self.carried_notes = ""
@@ -374,6 +377,7 @@ class _Run:
             "round_tail": self.round_tail,
             "heads": dict(self.heads),
             "group": self.group,
+            "group_start": self.group_start if self.group is not None else None,
         }
 
     def persist(self) -> None:
@@ -408,10 +412,20 @@ class _Run:
         sched = Scheduler(goal.order, self.adapters, self.store, self.clock)
         group = state.get("group")
         if isinstance(group, int) and not isinstance(group, bool) and group > 1:
-            if group != os.getpgrp():
+            # Under the lock, so this can never be another live runner's agent.
+            if group == os.getpgrp():
+                pass
+            elif group_is_ours(group, state.get("group_start")):
                 kill_group(group)
                 self.emit("alert", message="stopped a process group left by a previous run")
+            else:
+                self.emit(
+                    "alert",
+                    message=f"process group {group} from the last run is not the one baton "
+                    "started (or could not be checked): not killed",
+                )
         self.group = None
+        self.group_start = ""
         same_dir = state.get("workdir") == str(goal.workdir)
         saved = state.get("sessions")
         heads = state.get("heads")
@@ -450,7 +464,13 @@ class _Run:
         self.need_gate = False
         if self.pause_until:
             until, self.pause_until = self.pause_until, 0.0
-            self.emit("wait", reason="the last round ended at once", until=until)
+            self.emit(
+                "wait",
+                reason="the last round ended at once",
+                until=until,
+                seconds=max(0.0, until - self.clock()),
+                agents=self.sched.snapshot()["agents"] if self.sched else {},
+            )
             self.nap_until(until)
         if self.honour_stop():
             return 0
@@ -534,6 +554,7 @@ class _Run:
             spawned = True
             self.carried_notes = ""
             self.group = pgid
+            self.group_start = (process_start(pgid) or "") if pgid > 1 else ""
             self.persist_softly()
 
         def on_session(session: str) -> None:
@@ -579,6 +600,11 @@ class _Run:
         if result.resume_failed and sid is not None:
             self.sessions.pop(agent, None)
             self.emit("alert", agent=agent, message="resume failed: running the round fresh")
+            # The failed attempt delivered nothing that the fresh one should treat as spent: if
+            # its start is refused too, the notes and context must still be waiting.
+            self.carried_notes = notes
+            spawned = False
+            buf = ""
             result = attempt(None)
 
         self.group = None
