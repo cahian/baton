@@ -16,6 +16,7 @@ from baton.adapters.base import (
     AUTH,
     COMPLETED,
     CREDIT_GUARD,
+    TIMEOUT,
     TRANSIENT,
     Adapter,
     RoundContext,
@@ -285,20 +286,23 @@ def run_goal(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     objective: Callable[[], str] | None = None,
+    owes_round: bool = False,
 ) -> int:
     """Run `goal` until the gate passes or a stop is honoured. Returns 0 either way.
 
     A passing gate (or, with no gate, a completed round) only finishes the goal when no note from
-    the person is left unread, in the inbox or carried over from a start that was refused: the
-    rotation goes on until a round that actually started has taken them. A stop request wins over
-    notes. `objective`, when given, supplies the objective of each fresh round, for a caller whose
-    briefing grows while the goal runs.
+    the person is left unread, in the inbox or carried over from a round that never got to them:
+    the rotation goes on until a round has taken them. A stop request wins over notes. `objective`,
+    when given, supplies the objective of each fresh round, for a caller whose briefing grows while
+    the goal runs. `owes_round` says the objective is a message from a person, which gets a round
+    of its own even if the gate already passes; like the notes, that is remembered in state.json
+    until a round has taken it.
 
     Holds the goal's lock for the duration; raises AlreadyRunning when another runner has it.
     Everything else that goes wrong is logged as an `error` event, followed by a 60 s sleep.
     """
     with store.lock():
-        return _Run(goal, adapters, store, clock, sleep, objective).run()
+        return _Run(goal, adapters, store, clock, sleep, objective, owes_round).run()
 
 
 class _Run:
@@ -310,6 +314,7 @@ class _Run:
         clock: Callable[[], float],
         sleep: Callable[[float], None],
         objective: Callable[[], str] | None = None,
+        owes_round: bool = False,
     ) -> None:
         self.goal = goal
         self.adapters = adapters
@@ -328,6 +333,7 @@ class _Run:
         self.objective = objective
         self.prev_agent: str | None = None
         self.carried_notes = ""
+        self.owes_round = owes_round
         self.heads: dict[str, str] = {}
         self.pause_until = 0.0
 
@@ -388,6 +394,8 @@ class _Run:
             "heads": dict(self.heads),
             "group": self.group,
             "group_start": self.group_start if self.group is not None else None,
+            "notes": self.carried_notes,
+            "owes_round": self.owes_round,
         }
 
     @staticmethod
@@ -475,6 +483,9 @@ class _Run:
         self.round_no = rounds if isinstance(rounds, int) and rounds > 0 else 0
         tail = state.get("round_tail")
         self.round_tail = tail if isinstance(tail, str) else ""
+        notes = state.get("notes")
+        self.carried_notes = notes if isinstance(notes, str) else ""
+        self.owes_round = self.owes_round or state.get("owes_round") is True
         prepare_workdir(goal)
         self.sched = sched
         self.persist()
@@ -488,7 +499,7 @@ class _Run:
             passed, self.gate_tail = run_gate(goal, should_kill=self.stop_now)
             self.need_gate = False
             self.emit("gate", passed=passed, tail=self.gate_tail)
-            if passed and not self.unread_notes():
+            if passed and not self.owes_round and not self.unread_notes():
                 return self.finish("verify passed")
         self.need_gate = False
         if self.pause_until:
@@ -558,13 +569,17 @@ class _Run:
         since = commits_since(goal.workdir, self.heads.get(agent, ""))
 
         buf = ""
+        worked = False
         killed = False
         interrupted = False
 
         def on_output(line: str) -> None:
-            nonlocal buf
+            nonlocal buf, worked
             try:
                 text = adapter.render(line)
+                is_work = getattr(adapter, "is_work", None)
+                if text and (is_work is None or is_work(line)):
+                    worked = True
             except Exception:
                 text = None
             if text:
@@ -587,10 +602,8 @@ class _Run:
         spawned = False
 
         def on_spawn(pgid: int) -> None:
-            # The process exists, so the prompt was delivered: notes are spent from here on.
             nonlocal spawned
             spawned = True
-            self.carried_notes = ""
             self.group = pgid
             self.group_start = self.start_time(pgid)
             self.persist_softly()
@@ -638,10 +651,8 @@ class _Run:
         if result.resume_failed and sid is not None:
             self.sessions.pop(agent, None)
             self.emit("alert", agent=agent, message="resume failed: running the round fresh")
-            # The failed attempt delivered nothing that the fresh one should treat as spent: if
-            # its start is refused too, the notes and context must still be waiting.
-            self.carried_notes = notes
-            spawned = False
+            # The failed attempt delivered nothing: the fresh one decides what was spent.
+            spawned = worked = False
             buf = ""
             result = attempt(None)
 
@@ -652,8 +663,14 @@ class _Run:
         if result.outcome in (CREDIT_GUARD, AUTH):
             self.emit("alert", agent=agent, outcome=result.outcome, reason=result.reason)
         snapshotted = snapshot_work(goal, n, agent)
-        if spawned:  # a start that was refused leaves the context for the next round
+        # A process that exists has not read its prompt: one that dies at once with a 429, or is
+        # ended before it says anything, leaves the notes and the context for the next round.
+        finished_its_turn = result.outcome in (COMPLETED, TIMEOUT) and not killed
+        if spawned and (worked or finished_its_turn):
+            self.carried_notes = ""
+            self.owes_round = False
             self.round_tail = buf
+        if spawned:
             self.prev_agent = agent
             head = _head(goal.workdir)
             if head:

@@ -406,6 +406,14 @@ class CodexAdapter:
             return RoundResult(TRANSIENT, reason=f"resume failed: {summary}", resume_failed=True)
         return RoundResult(TRANSIENT, reason=summary)
 
+    def is_work(self, line: str) -> bool:
+        event = _parse_event(line)
+        return (
+            event is not None
+            and event.get("type") not in ("error", "turn.failed")
+            and bool(self.render(line))
+        )
+
     def render(self, line: str) -> str | None:
         event = _parse_event(line)
         if event is None:

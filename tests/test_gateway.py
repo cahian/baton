@@ -326,6 +326,15 @@ def test_baton_toml_gate_holds_stream_open_until_pass(gw):
     assert "ignored" not in gw.agents["codex"].prompts[0]
 
 
+def test_a_message_gets_a_round_even_when_the_gate_already_passes(gw):
+    (gw.work / "baton.toml").write_text('[verify]\ncommand = "true"\n')
+    gw.agents["claude_api"].script = [say("on it")]
+    text = gw.stream("add a test").read_all()
+    assert "add a test" in gw.agents["claude_api"].prompts[0]
+    assert "on it" in text
+    assert "done: verify passed (round 1)" in text
+
+
 def test_invalid_baton_toml_is_reported_not_ignored(gw):
     (gw.work / "baton.toml").write_text("[verify]\ntimeout_s = 0\n")
     text = gw.stream("go").read_all()

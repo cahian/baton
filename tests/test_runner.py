@@ -871,6 +871,154 @@ def test_delivered_notes_are_consumed_once_started(go, agents, work, store):
     assert "once" in agents["codex"].prompts[0] and "once" not in agents["codex"].prompts[1]
 
 
+def dies_at_once(outcome=LIMIT, **kw):
+    """A process that started and then died without reading anything, as with a 429."""
+    return result(outcome, reason="429", **kw)
+
+
+@pytest.mark.parametrize("outcome", [LIMIT, TRANSIENT, AUTH, CREDIT_GUARD])
+def test_notes_survive_an_agent_that_dies_at_once(go, agents, work, store, world, outcome):
+    store.say("do not lose me")
+    agents["codex"].script = [dies_at_once(outcome, until=world.now + 3600)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert "do not lose me" in agents["codex"].prompts[0]
+    assert "do not lose me" in agents["antigravity"].prompts[0]
+    assert store.take_inbox() == ""
+
+
+def test_a_round_that_dies_at_once_leaves_the_previous_tail(go, agents, work, store, world):
+    agents["codex"].script = [say(["tail of the real round"]), dies_at_once(until=world.now + 60)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert "tail of the real round" in agents["antigravity"].prompts[0]
+
+
+@pytest.mark.parametrize("outcome", [COMPLETED, TIMEOUT])
+def test_notes_are_spent_by_a_round_that_ended_normally(go, agents, work, store, outcome):
+    store.say("once")
+    agents["codex"].script = [result(outcome), done(work)]
+    assert go() == 0
+    assert "once" in agents["codex"].prompts[0] and "once" not in agents["codex"].prompts[1]
+
+
+def test_notes_are_spent_by_a_failed_round_that_produced_output(go, agents, work, store, world):
+    store.say("once")
+    agents["codex"].script = [
+        say(["I read your note"], then=result(TRANSIENT, reason="crashed later"))
+    ]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert "once" not in agents["antigravity"].prompts[0]
+
+
+def test_an_error_line_is_not_output_that_spends_the_notes(go, agents, work, store, world):
+    """Every adapter renders error text too, and that must not pass for the agent working."""
+    codex = agents["codex"]
+    codex.is_work = lambda line: not line.startswith("error:")
+    store.say("do not lose me")
+    codex.script = [say(["error: 429"], then=result(LIMIT, until=world.now + 3600))]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert "do not lose me" in agents["antigravity"].prompts[0]
+
+
+def test_an_interrupted_round_that_said_nothing_keeps_its_notes(go, agents, work, store):
+    def first(agent, prompt, ctx):
+        store.say("the newer note")
+        store.request_interrupt()
+        ctx.should_kill()
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    store.say("the first note")
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    second = agents["codex"].prompts[1]
+    assert "the first note" in second and "the newer note" in second
+
+
+def test_notes_carried_by_a_round_are_in_state_json_while_it_runs(go, agents, work, store):
+    seen = {}
+
+    def peek(agent, prompt, ctx):
+        seen.update(store.load_state())
+        (work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    store.say("still mine")
+    agents["codex"].script = [peek]
+    assert go() == 0
+    assert "still mine" in seen["notes"]
+    assert store.load_state()["notes"] == ""
+
+
+def test_notes_left_by_a_run_that_died_reach_the_next_run(go, agents, work, store):
+    store.save_state({"workdir": str(work), "notes": "from the run that died\n\n"})
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "from the run that died" in agents["codex"].prompts[0]
+    assert store.load_state()["notes"] == ""
+
+
+# a round owed to a person's message
+
+
+@pytest.fixture
+def owed(tmp_path, work, store, agents, world):
+    def run(verify="true"):
+        return run_goal(
+            make_goal(tmp_path, work, verify=verify),
+            agents,
+            store,
+            clock=world.clock,
+            sleep=world.sleep,
+            owes_round=True,
+        )
+
+    return run
+
+
+def test_a_passing_gate_does_not_swallow_a_message(owed, agents, store):
+    agents["codex"].script = [result(COMPLETED)]
+    assert owed() == 0
+    assert len(agents["codex"].prompts) == 1
+    finished = [e for e in store.events() if e["kind"] == "finished"]
+    assert finished[-1]["round"] == 1
+
+
+def test_without_a_message_a_passing_gate_still_finishes_at_round_0(go, agents, store, tmp_path):
+    assert go(make_goal(tmp_path, tmp_path, verify="true")) == 0
+    assert agents["codex"].prompts == []
+
+
+def test_the_owed_round_is_only_paid_by_a_round_that_took_the_message(owed, agents, store, world):
+    agents["codex"].script = [dies_at_once(until=world.now + 3600)]
+    agents["antigravity"].script = [result(COMPLETED)]
+    assert owed() == 0
+    assert len(agents["codex"].prompts) == 1 and len(agents["antigravity"].prompts) == 1
+
+
+def test_a_refused_start_does_not_pay_the_owed_round(owed, agents, world):
+    agents["codex"].script = [refused(TRANSIENT, reason="no")]
+    agents["antigravity"].script = [result(COMPLETED)]
+    assert owed() == 0
+    assert len(agents["antigravity"].prompts) == 1
+
+
+def test_an_owed_round_survives_a_restart(go, agents, store, tmp_path, work):
+    store.save_state({"workdir": str(work), "owes_round": True})
+    agents["codex"].script = [result(COMPLETED)]
+    assert go(make_goal(tmp_path, work, verify="true")) == 0
+    assert len(agents["codex"].prompts) == 1
+    assert store.load_state()["owes_round"] is False
+
+
+def test_a_stop_wins_over_an_owed_round(owed, agents, store):
+    store.request_stop()
+    assert owed() == 0
+    assert agents["codex"].prompts == []
+
+
 # commits since the agent's last round
 
 

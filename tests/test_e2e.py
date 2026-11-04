@@ -53,6 +53,22 @@ def agy_ran(fakes) -> str:
     return f"test -f {fakes.agy_calls_file}"
 
 
+def test_e2e_a_note_survives_an_agent_that_dies_with_a_429(fakes, monkeypatch):
+    fakes.claude_key("fake-test-key-0123456789")
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "API Error: 429 Too Many Requests")
+    goal = fakes.goal(
+        order=("claude_api", "codex"), claude="", verify=f"test -f {fakes.codex_calls_file}"
+    )
+    Store(state_dir("demo")).say("do not lose me")
+    assert main(["run", str(goal)]) == 0
+    assert "do not lose me" in fakes.claude_calls()[0]["stdin"]
+    assert "do not lose me" in fakes.codex_calls()[-1]["stdin"]
+    ends = [(e["agent"], e["outcome"]) for e in events(fakes) if e["kind"] == "round_end"]
+    assert ends[0] == ("claude_api", "limit")
+
+
 def test_e2e_rotation_with_fake_clis(fakes, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_EXEC_SLEEP", "30")
     # reads: availability, the baseline before the round, then the first poll finds 95% used

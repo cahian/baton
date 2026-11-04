@@ -685,6 +685,15 @@ class ClaudeApiAdapter:
 
     # rendering
 
+    def is_work(self, line: str) -> bool:
+        event = _parse(line)
+        return (
+            event is not None
+            and event.get("type") == "assistant"
+            and not event.get("error")  # the CLI's own message about a failed API call
+            and bool(self.render(line))
+        )
+
     def render(self, line: str) -> str | None:
         event = _parse(line)
         if event is None:

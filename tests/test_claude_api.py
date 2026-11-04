@@ -1103,3 +1103,23 @@ def test_a_long_round_keeps_counting_after_the_month_turns(env, monkeypatch):
     later = Ledger(env.ledger.path, CEILING, 1, lambda: NEXT_PERIOD + 86400)
     assert later.spent() == Decimal("10.00")  # the new month still counts the live round
     assert later.reserve(Decimal("175"))[1] == Decimal("170")  # 10 + 170, never 190
+
+
+def assistant(text, **fields):
+    message = {"content": [{"type": "text", "text": text}]}
+    return json.dumps({"type": "assistant", "message": message, **fields})
+
+
+@pytest.mark.parametrize(
+    ("line", "work"),
+    [
+        (assistant("reading the code"), True),
+        (assistant("API Error: 429", error="rate_limit"), False),
+        (json.dumps({"type": "result", "is_error": True, "result": "API Error: 429"}), False),
+        ("429 Too Many Requests", False),
+    ],
+)
+def test_only_the_agent_acting_counts_as_work(env, line, work):
+    adapter = make_adapter(env)
+    assert adapter.render(line)  # the person sees all of them
+    assert adapter.is_work(line) is work

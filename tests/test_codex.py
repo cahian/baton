@@ -831,3 +831,19 @@ def test_closing_read_with_blind_field_still_sees_a_drop(fake, tmp_path):
     blind_drop = without(limits(balance="9"), "rateLimits", "rateLimitReachedType")
     a, _ = closing_adapter(fake, limits(balance="10"), blind_drop)
     assert a.run_round("go", make_ctx(tmp_path)).outcome == CREDIT_GUARD
+
+
+@pytest.mark.parametrize(
+    ("line", "work"),
+    [
+        ('{"type":"item.completed","item":{"type":"agent_message","text":"done"}}', True),
+        ('{"type":"item.started","item":{"type":"command_execution","command":"ls"}}', True),
+        ('{"type":"error","message":"429 Too Many Requests"}', False),
+        ('{"type":"turn.failed","error":{"message":"rate limit"}}', False),
+        ("429 Too Many Requests", False),
+    ],
+)
+def test_only_the_agent_acting_counts_as_work(line, work):
+    adapter = CodexAdapter(make_cfg(), read=lambda: {})
+    assert adapter.render(line)  # the person sees all of them
+    assert adapter.is_work(line) is work

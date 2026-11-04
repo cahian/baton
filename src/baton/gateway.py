@@ -327,7 +327,13 @@ class Job:
             adapters = self._adapters_for(self.goal)
             for attempt in range(MAX_RESTARTS + 1):
                 self._end = ""
-                run_goal(self.goal, adapters, self.store, objective=self.objective)
+                run_goal(
+                    self.goal,
+                    adapters,
+                    self.store,
+                    objective=self.objective,
+                    owes_round=attempt == 0,
+                )
                 # The run only finishes with no note left unread, but a message can land in the
                 # inbox between that check and the end of the run: start again for it.
                 if not self._note_waiting():

@@ -966,3 +966,17 @@ def test_read_text_sees_a_scrubbed_environment(fake, tmp_path, monkeypatch):
     script.chmod(0o755)
     monkeypatch.setenv("GEMINI_API_KEY", "secret")
     assert read_text(str(script), "/usage", timeout_s=10) == usage()
+
+
+@pytest.mark.parametrize(
+    ("line", "work"),
+    [
+        ('{"event":"step_update","step_update":{"text_delta":"reading the code"}}', True),
+        ('{"event":"result","result":{"status":"ERROR","error":"RESOURCE_EXHAUSTED"}}', False),
+        ("429 Too Many Requests", False),
+    ],
+)
+def test_only_the_agent_acting_counts_as_work(line, work):
+    adapter = AntigravityAdapter(make_cfg())
+    assert adapter.render(line)  # the person sees all of them
+    assert adapter.is_work(line) is work
