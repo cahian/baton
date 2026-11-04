@@ -34,7 +34,7 @@ Any of these is a failure even if the goal finishes:
 
 - **goal**: a TOML file describing the objective, working directory and verification command.
 - **agent**: a vendor CLI behind an adapter: `codex`, `antigravity`, `claude`.
-- **round**: one agent process, started fresh, working until it exits or is stopped.
+- **round**: one agent process, fresh or resuming that vendor's conversation, working until it exits or is stopped.
 - **gate**: the verification command, run before the first round and after every round.
 
 ## Behaviour
@@ -163,9 +163,21 @@ Agents start in their own session. Stopping sends SIGTERM to the process group, 
 
 On macOS the runner holds `caffeinate -is -w <pid>`.
 
+### Context between rounds
+
+Context has three layers:
+
+1. **Shared by every agent:** the repository, its commits, `.baton/HANDOFF.md`, the last gate output, and the rendered tail of the previous round (8000 chars). The tail covers what an agent had not yet written down when it was stopped.
+2. **Private to each vendor:** when an agent's turn comes again, baton resumes that vendor's own conversation, so it keeps its full history. The prompt then only adds what changed since its last round: other agents' commits, the handoff, the gate output and the tail.
+3. **Everything else stays local:** raw logs in `rounds/` are for people, not prompts.
+
+Session ids come from the stream: `thread_id` in Codex `thread.started`, `session_id` in the Claude `init` event, `conversation_id` in the Antigravity `init` event. They are stored per agent in `state.json`.
+
+Resume commands: `codex exec resume <id>` with the same flags, `claude -p --resume <id>`, `agy --conversation <id>`. If a resume fails for any reason, or the working directory changed, clear the id and run the same round fresh with the full prompt. A failed resume never counts against the agent.
+
 ### Prompt and handoff
 
-Each round's prompt contains: the objective, the verify command, the tail of the last gate output (4000 chars), unread notes from the person, the handoff file, and these rules:
+A fresh round's prompt contains: the objective, the verify command, the tail of the last gate output (4000 chars), the tail of the previous round, unread notes from the person, the handoff file, and these rules:
 
 - You are one shift of a relay. Another agent may continue after you at any moment.
 - Commit working progress often, in small steps.
