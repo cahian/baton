@@ -64,9 +64,12 @@ NO_KEY_RETRY_S = 3600
 MAX_KEY_BYTES = 4096
 # How many error lines of a round are kept to classify its failure.
 MAX_PROBLEMS = 20
-# A line this long is a piece of an event (the runner cuts lines at 64 KB): agent output, never an
-# error message. A line that follows one is the rest of it.
+# A line this many BYTES long is a piece of an event (the runner cuts lines at 64 KB of bytes, so
+# a line of multi-byte characters is far fewer characters than that): agent output, never an error
+# message. A line that follows one is the rest of it.
 LARGE_LINE = 32 * 1024
+# How long after its time limit a round's reservation is still taken to belong to a live round.
+EXPIRY_MARGIN_S = 3600
 # The longest line that may be read as an error message when it is not JSON.
 SHORT_ERROR_LINE = 300
 
@@ -200,6 +203,7 @@ class _Stream:
     def __init__(self) -> None:
         self.verified = False  # an init event named the key
         self.active = False  # something other than system events was said
+        self.events = 0  # how many lines were JSON events
         self.rejected_init = False  # the init event named a credential other than the key
         self.large = False  # some line was (a piece of) a big event: the agent did real work
         self.continuing = False  # the previous line was a piece of a longer one
@@ -212,11 +216,20 @@ class _Stream:
         self.kinds: set[str] = set()
         self.problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
 
-    def error_text(self) -> str:
-        lines = [*self.problems, *(_ERROR_KINDS[k] for k in sorted(self.kinds))]
+    def structured_text(self) -> str:
+        """What the API said in the fields made for it: the error kind of an assistant message
+        and the text of a failed result."""
+        lines = [_ERROR_KINDS[k] for k in sorted(self.kinds)]
         if self.result_text:
             lines.append(self.result_text)
         return "\n".join(lines)
+
+    def plain_text(self) -> str:
+        """The short plain lines the process printed itself."""
+        return "\n".join(self.problems)
+
+    def error_text(self) -> str:
+        return "\n".join(t for t in (self.plain_text(), self.structured_text()) if t)
 
 
 # --- spend -----------------------------------------------------------------------------------
@@ -448,7 +461,11 @@ class ClaudeApiAdapter:
             return RoundResult(AUTH, reason=str(exc))
         try:
             floor = self._floor()
-            reservation = self.ledger.reserve(self.cfg.round_budget_usd, floor=floor)
+            reservation = self.ledger.reserve(
+                self.cfg.round_budget_usd,
+                floor=floor,
+                live_for_s=ctx.round_max_s + EXPIRY_MARGIN_S,
+            )
         except LedgerError as exc:
             return RoundResult(LIMIT, until=now + RETRY_S, reason=f"ledger unreadable: {exc}")
         except Exception as exc:
@@ -506,15 +523,17 @@ class ClaudeApiAdapter:
         return self._outcome(exit_.timed_out, exit_.returncode, stream, ctx)
 
     def _on_line(self, line: str, stream: _Stream, ctx: RoundContext) -> RoundResult | None:
-        size = len(line)
+        size = len(line.encode("utf-8", errors="replace"))
         continuing, stream.continuing = stream.continuing, size >= LARGE_LINE
         if size >= LARGE_LINE:
             stream.large = True
+        event = _parse(line)
+        if event is not None:
+            stream.events += 1
         stop = evaluate_line(line)
         if stop is not None:
             stream.rejected_init = True
             return stop
-        event = _parse(line)
         if event is None:
             # Only a short line of plain text can be an error message (the process's own stderr).
             # A piece of a big event is agent output: a "billing" inside a file it wrote says
@@ -576,26 +595,40 @@ class ClaudeApiAdapter:
     def _never_reached_the_api(exit_: Exit, stream: _Stream) -> bool:
         """True only when it is certain that no model call was made, so nothing was spent.
 
-        The process ended by itself (or was stopped by the wrong-source init, which comes before
-        any call), no init named the key, nothing but noise was said, no cost was reported and no
-        big event went by. Anything else could hide a call, and then the reservation stays.
+        That is: the process left no JSON event at all (a binary that cannot even start prints
+        noise), or its first and only event was the init that named the wrong credential, which
+        comes before any call. Any other event, even a bare `api_retry` or `rate_limit_event`,
+        can mean a request was made; and a timeout, a stop, a cost or a big line mean the round
+        did something. Then the reservation stays.
         """
-        if exit_.timed_out or stream.verified or stream.active or stream.large:
+        if exit_.timed_out or stream.large or stream.cost is not None:
             return False
-        if stream.cost is not None:
-            return False
-        return exit_.stopped is None or stream.rejected_init
+        if stream.rejected_init:
+            return stream.events == 1
+        return exit_.stopped is None and stream.events == 0
 
-    def _refusal(self, text: str) -> RoundResult | None:
-        """`limit` or `auth` from the error text of a failed round, or None."""
-        if _CREDIT_RE.search(text):
+    def _refusal(self, stream: _Stream) -> RoundResult | None:
+        """`limit` or `auth` from the error text of a failed round, or None.
+
+        The credit is marked gone for every goal and for the whole period only on what the API
+        said in its own structured fields. The process's plain stderr can say it too, and ends
+        this round the same way, but a stray line is not allowed to block everyone for a month."""
+        structured, plain = stream.structured_text(), stream.plain_text()
+        if _CREDIT_RE.search(structured):
             try:
                 self.ledger.mark_exhausted()
             except Exception:
                 pass
             return RoundResult(
-                LIMIT, until=self.ledger.next_period(), reason=_summary(text) or "no credit left"
+                LIMIT,
+                until=self.ledger.next_period(),
+                reason=_summary(structured) or "no credit left",
             )
+        if _CREDIT_RE.search(plain):
+            return RoundResult(
+                LIMIT, until=self.ledger.next_period(), reason=_summary(plain) or "no credit left"
+            )
+        text = stream.error_text()
         if _AUTH_RE.search(text):
             return RoundResult(AUTH, reason=_summary(text))
         if _RATE_RE.search(text):
@@ -618,7 +651,7 @@ class ClaudeApiAdapter:
                 text = _summary(stream.error_text())
                 if text:
                     summary = f"{summary}: {text}"
-                refusal = self._refusal(stream.error_text())
+                refusal = self._refusal(stream)
                 if refusal is not None:
                     return refusal
                 if ctx.session_id is not None:
@@ -640,7 +673,7 @@ class ClaudeApiAdapter:
         if stream.has_result and stream.subtype in _BOUNDED_SUBTYPES:
             return RoundResult(COMPLETED, reason=_summary(stream.result_text) or stream.subtype)
         text = stream.error_text()
-        refusal = self._refusal(text)
+        refusal = self._refusal(stream)
         if refusal is not None:
             return refusal
         if not stream.has_result:

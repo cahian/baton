@@ -921,3 +921,78 @@ def test_the_held_back_end_of_an_unfinished_last_line_still_reaches_the_log(tmp_
         extra_env={"K": "fake-ant-api03-NOTPRINTED"},
     )
     assert ctx.log_path.read_text() == "y" * 65536
+
+
+# --- a secret at the edge of a stopped round's log ---------------------------------------------
+
+SECRET = "fake-ant-api03-EDGEEDGEEDGEEDGE"
+KEEP = len(SECRET) - 1  # what the redactor holds back from the end of a cut line
+
+
+def stop_at_first_line(line):
+    return RoundResult(LIMIT, reason="stop") if line == "go" else None
+
+
+def edge_run(tmp_path, monkeypatch, code, cap=None):
+    if cap is not None:
+        monkeypatch.setattr(proc, "STOP_LOG_BYTES", cap)
+    monkeypatch.setattr(proc, "KILL_GRACE_S", 0.2)
+    ctx = make_ctx(tmp_path)
+    run_streaming(
+        py(code),
+        tmp_path,
+        None,
+        ctx,
+        stop_at_first_line,
+        lambda: None,
+        extra_env={"K": SECRET},
+    )
+    return ctx.log_path.read_text()
+
+
+def test_a_key_split_at_the_log_cap_of_a_stopped_round_is_not_written(tmp_path, monkeypatch):
+    """After a stop the log takes at most STOP_LOG_BYTES more. The last chunk it took ended with
+    the key minus one character, held back; the cap then cut the rest off, and the end of the
+    round used to flush that held tail into the log."""
+    code = (
+        "import os, sys, time\n"
+        "k = os.environ['K']\n"
+        "sys.stdout.write('go\\n'); sys.stdout.flush()\n"
+        f"sys.stdout.write('A' * (65536 - {KEEP}) + k[:{KEEP}]); sys.stdout.flush()\n"
+        "sys.stdout.write('B' * 70000 + '\\n'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    log = edge_run(tmp_path, monkeypatch, code, cap=65536)
+    assert SECRET[:8] not in log and SECRET[2:12] not in log
+    assert "A" * 100 in log  # the part before it was logged
+
+
+def test_the_held_tail_is_dropped_when_the_log_is_full(tmp_path, monkeypatch):
+    code = (
+        "import sys, time\n"
+        "sys.stdout.write('go\\n'); sys.stdout.flush()\n"
+        f"sys.stdout.write('A' * (65536 - {KEEP}) + 'Z' * {KEEP}); sys.stdout.flush()\n"
+        "sys.stdout.write('B' * 70000 + '\\n'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    log = edge_run(tmp_path, monkeypatch, code, cap=65536)
+    assert "Z" not in log  # nothing more is written once the cap is reached
+
+
+def test_a_held_tail_that_starts_the_secret_is_not_flushed_at_the_end(tmp_path, monkeypatch):
+    """No cap involved: the process just ends after a chunk whose end is the key's beginning."""
+    code = (
+        "import os, sys\n"
+        "k = os.environ['K']\n"
+        f"sys.stdout.write('A' * (65536 - 3 - {KEEP}) + 'xyz' + k[:{KEEP}])\n"
+    )
+    log = edge_run(tmp_path, monkeypatch, code)
+    assert SECRET[:8] not in log
+    assert log == "A" * (65536 - 3 - KEEP) + "xyz"  # the harmless part is kept
+
+
+def test_a_held_tail_that_cannot_start_the_secret_is_still_flushed_at_the_end(
+    tmp_path, monkeypatch
+):
+    code = f"import sys; sys.stdout.write('A' * (65536 - {KEEP}) + 'Z' * {KEEP})"
+    assert edge_run(tmp_path, monkeypatch, code) == "A" * (65536 - KEEP) + "Z" * KEEP

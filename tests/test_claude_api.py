@@ -917,6 +917,50 @@ def test_a_pre_init_exit_with_a_huge_output_keeps_the_reservation(env, monkeypat
     assert env.ledger.spent() == Decimal("10.00")
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "system", "subtype": "api_retry", "attempt": 1, "error_status": 529},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}},
+        {"type": "system", "subtype": "hook_started"},
+        {"type": "something_new"},
+    ],
+)
+def test_any_event_before_the_exit_keeps_the_reservation(env, monkeypatch, event):
+    """An api_retry or a rate_limit_event means a request went out: nothing may be released."""
+    monkeypatch.setenv("FAKE_CLAUDE_PRE_EVENT", json.dumps(event))
+    monkeypatch.setenv("FAKE_CLAUDE_EARLY_EXIT", "1")
+    result = run(env)
+    assert result.outcome == TRANSIENT
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_a_valid_init_then_an_exit_keeps_the_reservation(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_EXIT", "1")
+    run(env)
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_noise_lines_before_a_wrong_source_init_are_still_the_only_event(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_STDERR", "warning: something harmless")
+    monkeypatch.setenv("FAKE_CLAUDE_API_KEY_SOURCE", "none")
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    assert run(env).outcome == CREDIT_GUARD
+    assert env.ledger.spent() == 0
+
+
+def test_an_event_before_a_wrong_source_init_keeps_the_reservation(env, monkeypatch):
+    monkeypatch.setenv(
+        "FAKE_CLAUDE_PRE_EVENT", json.dumps({"type": "system", "subtype": "api_retry"})
+    )
+    monkeypatch.setenv("FAKE_CLAUDE_API_KEY_SOURCE", "none")
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    assert run(env).outcome == CREDIT_GUARD
+    assert env.ledger.spent() == Decimal("10.00")  # the init was not the only event
+
+
 def test_a_pre_init_timeout_keeps_the_reservation(env, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_NO_INIT", "1")
     monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
@@ -965,13 +1009,35 @@ def test_billing_words_in_a_long_stderr_line_are_not_a_refusal(env, monkeypatch)
     assert not env.ledger.exhausted()
 
 
-def test_a_short_stderr_line_after_init_is_still_a_refusal(env, monkeypatch):
+def test_a_short_stderr_line_ends_the_round_but_never_blocks_every_goal(env, monkeypatch):
+    """Plain stderr is not a structured API error: it limits this agent until the next period for
+    now, but only the API's own error fields may mark the credit gone for everyone."""
     monkeypatch.setenv("FAKE_CLAUDE_STDERR", "Error: Credit balance is too low")
     monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
     monkeypatch.setenv("FAKE_CLAUDE_EXIT", "1")
     result = run(env)
     assert result.outcome == LIMIT and result.until == NEXT_PERIOD
+    assert not env.ledger.exhausted()
+
+
+def test_a_structured_billing_error_marks_the_credit_gone(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "Your credit balance is too low")
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "0")
+    assert run(env).outcome == LIMIT
     assert env.ledger.exhausted()
+
+
+def test_the_cut_of_a_multibyte_line_is_not_read_as_an_error(env, monkeypatch):
+    """A 64 KB event of Chinese text is about 21 000 characters, so a size in characters called it
+    small, and its short last piece, ending in credit-balance words, marked every goal exhausted."""
+    monkeypatch.setenv("FAKE_CLAUDE_BIG_CJK", "1")
+    adapter = make_adapter(env)
+    result = run(env, adapter)
+    assert result.outcome == TRANSIENT and result.until is None
+    assert not env.ledger.exhausted()
+    assert adapter.availability().ok
+    assert env.ledger.spent() == Decimal("10.00")  # a big event went by: the round did work
 
 
 def test_a_short_stderr_line_before_init_is_still_a_refusal(env, monkeypatch):
@@ -1014,3 +1080,26 @@ def test_a_deleted_ledger_makes_claude_unavailable(env):
     calls = len(env.calls())
     assert run(env, adapter).outcome == LIMIT and len(env.calls()) == calls
     assert not env.ledger.path.exists()
+
+
+# --- a reservation lives as long as its round -------------------------------------------------
+
+
+def test_the_reservation_outlives_the_rounds_time_limit_by_an_hour(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")  # so the reservation is still there
+    run(env, round_max_s=7200)
+    (stored,) = json.loads(env.ledger.path.read_text())["reservations"].values()
+    assert stored["expires_at"] == NOW + 7200 + 3600
+
+
+def test_a_long_round_keeps_counting_after_the_month_turns(env, monkeypatch):
+    """round_max_s of three days: the 24-hour rule used to drop this reservation at midnight."""
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    evening = datetime(2026, 11, 30, 23, 0, tzinfo=UTC).timestamp()
+    ledger = Ledger(env.ledger.path, CEILING, 1, lambda: evening)
+    ClaudeApiAdapter(make_cfg(env), ledger, wall_clock=lambda: evening).run_round(
+        "go", make_ctx(env.root, round_max_s=3 * 86400)
+    )
+    later = Ledger(env.ledger.path, CEILING, 1, lambda: NEXT_PERIOD + 86400)
+    assert later.spent() == Decimal("10.00")  # the new month still counts the live round
+    assert later.reserve(Decimal("175"))[1] == Decimal("170")  # 10 + 170, never 190

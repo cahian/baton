@@ -20,6 +20,10 @@ does: "ANTHROPIC_API_KEY" when that variable is set, "none" otherwise, unless ov
   FAKE_CLAUDE_STDERR          a short line on stderr before any event
   FAKE_CLAUDE_EARLY_EXIT      exit with this code right away, before any event
   FAKE_CLAUDE_EARLY_BYTES     before exiting early, print one line of this many "x" characters
+  FAKE_CLAUDE_PRE_EVENT       a JSON event printed before anything else (an api_retry, say)
+  FAKE_CLAUDE_BIG_CJK         like BIG_WRITE, but the text is Chinese: 3 bytes per character, so
+                              a line past the 64 KB cut is only about 21 000 characters, and
+                              its short last piece ends in credit-balance words
   FAKE_CLAUDE_BIG_WRITE       after init, an assistant event whose tool input is this many
                               characters of text full of billing words, then a crash (exit 1,
                               no result)
@@ -53,6 +57,9 @@ def main() -> None:
         }
         with open(env["FAKE_CLAUDE_CALLS"], "a") as fh:
             fh.write(json.dumps(record) + "\n")
+    if env.get("FAKE_CLAUDE_PRE_EVENT"):
+        sys.stdout.write(env["FAKE_CLAUDE_PRE_EVENT"] + "\n")
+        sys.stdout.flush()
     if env.get("FAKE_CLAUDE_STDERR"):
         sys.stderr.write(env["FAKE_CLAUDE_STDERR"] + "\n")
         sys.stderr.flush()
@@ -93,6 +100,24 @@ def main() -> None:
         )
     if not env.get("FAKE_CLAUDE_ASSISTANT_FIRST") and not env.get("FAKE_CLAUDE_NO_ASSISTANT"):
         emit(assistant)
+    if env.get("FAKE_CLAUDE_BIG_CJK"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        n = 20000
+        while True:
+            blob = "額度不足" * n + " Credit balance is too low, billing error, spend limit"
+            event = {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "name": "Write", "input": {"content": blob}}]
+                },
+            }
+            line = json.dumps(event, ensure_ascii=False)
+            if 60 <= (len(line.encode("utf-8")) + 1) % 65536 <= 150:
+                break
+            n += 1
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        sys.exit(1)
     if env.get("FAKE_CLAUDE_BIG_WRITE"):
         words = "Credit balance is too low, billing error, spend limit reached. "
         blob = (words * (int(env["FAKE_CLAUDE_BIG_WRITE"]) // len(words) + 1))[

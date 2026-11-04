@@ -237,10 +237,12 @@ def without(key) -> str:
         document(spent="-5"),
         document(spent="NaN"),
         document(reservations=[]),
-        document(reservations={"a": "10"}),  # the old shape: no time
-        document(reservations={"a": {"usd": "x", "at": 1}}),
+        document(reservations={"a": "10"}),
+        document(reservations={"a": {"usd": "10", "at": 1}}),  # the old shape: "at", no expiry
+        document(reservations={"a": {"usd": "x", "expires_at": 1}}),
         document(reservations={"a": {"usd": "10"}}),
-        document(reservations={"a": {"usd": "10", "at": True}}),
+        document(reservations={"a": {"usd": "10", "expires_at": True}}),
+        document(reservations={"a": {"usd": "10", "expires_at": "soon"}}),
         document(period="yesterday"),
         document(exhausted="yes"),
         document(ceiling=180),
@@ -485,3 +487,68 @@ def test_default_path_is_under_the_real_home_and_ignores_the_environment(monkeyp
 def test_baton_ledger_overrides_the_default_path(monkeypatch, tmp_path):
     monkeypatch.setenv("BATON_LEDGER", str(tmp_path / "elsewhere.json"))
     assert default_path() == tmp_path / "elsewhere.json"
+
+
+# --- reservations live as long as their round -------------------------------------------------
+
+DAY = 86400
+
+
+def test_a_reservation_stores_its_expiry(path, clock):
+    make(path, clock).reserve(Decimal("10"), live_for_s=3600 + 600)
+    (stored,) = json.loads(path.read_text())["reservations"].values()
+    assert stored["expires_at"] == clock.now + 4200
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, "1", float("nan")])
+def test_a_reservation_needs_a_positive_lifetime(path, clock, bad):
+    with pytest.raises(ValueError):
+        make(path, clock).reserve(Decimal("10"), live_for_s=bad)
+    assert not path.exists() or make(path, clock).spent() == 0
+
+
+def test_a_long_round_across_the_rollover_keeps_its_reservation(path, clock):
+    """A round allowed three days (and 10 USD) that is still running two days after the month
+    turned: 24 hours used to drop it, and the new month could then be granted 180 more."""
+    clock.now = at(2026, 11, 30, 23, 59)
+    ledger = make(path, clock)
+    rid, _ = ledger.reserve(Decimal("10"), live_for_s=3 * DAY + 3600)
+    ledger.settle("old", Decimal("100"))
+    clock.now = at(2026, 12, 2, 12)  # 36 hours later, round_max not yet reached
+    assert ledger.spent() == Decimal("10")  # last month's spend is gone, the live round is not
+    _, granted = ledger.reserve(Decimal("175"))
+    assert granted == Decimal("170")
+    assert ledger.spent() == Decimal("180")  # never 190
+    ledger.settle(rid, Decimal("9"))
+    assert ledger.spent() == Decimal("179")
+
+
+def test_a_reservation_survives_several_rollovers_until_its_expiry(path, clock):
+    clock.now = at(2026, 11, 20)
+    ledger = make(path, clock)
+    ledger.reserve(Decimal("10"), live_for_s=50 * DAY)
+    clock.now = at(2027, 1, 5)  # two rollovers later, still inside its 50 days
+    assert ledger.spent() == Decimal("10")
+    clock.now = at(2027, 1, 20)  # past its expiry, and the period has rolled once more
+    clock.now = at(2027, 2, 1)
+    assert ledger.spent() == 0
+
+
+def test_an_expired_reservation_is_dropped_only_by_a_rollover(path, clock):
+    """Within its period a reservation is never dropped, however old: a round that died may have
+    spent the money, and the ledger errs on the side of counting it."""
+    clock.now = at(2026, 11, 2)
+    ledger = make(path, clock)
+    ledger.reserve(Decimal("10"), live_for_s=60)
+    clock.now = at(2026, 11, 28)  # long past its expiry, same period
+    assert ledger.spent() == Decimal("10")
+    clock.now = at(2026, 12, 1)
+    assert ledger.spent() == 0
+
+
+def test_the_expiry_is_exclusive(path, clock):
+    clock.now = at(2026, 11, 30, 12)
+    ledger = make(path, clock)
+    ledger.reserve(Decimal("10"), live_for_s=12 * 3600)  # expires exactly at the rollover
+    clock.now = at(2026, 12, 1)
+    assert ledger.spent() == 0

@@ -7,9 +7,12 @@ every goal and every process shares, updated under a lock. Nothing in it is a fl
 The rules that keep a round from passing the ceiling:
 
 - A round first *reserves* its budget. Spent plus every live reservation plus the new one may not
-  pass the ceiling; the grant shrinks to what is left and below 1 USD there is none.
+  pass the ceiling; the grant shrinks to what is left and below 5 USD there is none.
 - A finished round *settles*: its reservation is replaced by the actual cost. A round that never
-  settles (a crash, a kill) keeps its whole reservation counted, so a failure overcounts.
+  settles (a crash, a kill) keeps its whole reservation counted, so a failure overcounts. The
+  period rolling does not release a reservation: one still within its `expires_at` (the round's
+  time limit plus a margin) belongs to a round that may be running, and counts against the new
+  period. Only one past its expiry, whose round is surely dead, is dropped when the period rolls.
 - A ledger that cannot be read or understood raises `LedgerError`, and the file is never touched or
   recreated. The only empty ledger is one that has never existed: a lock file with no ledger beside
   it means the ledger was deleted, and that is an error too.
@@ -26,6 +29,7 @@ from __future__ import annotations
 import calendar
 import fcntl
 import json
+import math
 import os
 import pwd
 import tempfile
@@ -44,8 +48,7 @@ __all__ = ["MIN_GRANT_USD", "Ledger", "LedgerError", "ceiling_for", "default_pat
 # CLI's `--max-budget-usd` is checked between steps, so a round can overshoot its cap; a grant this
 # large keeps the overshoot inside the reserve.
 MIN_GRANT_USD = Decimal("5")
-# A reservation older than this when the period rolls belongs to a round that died, not to one
-# still running across the boundary.
+# How long a reservation made without an explicit lifetime is considered to belong to a live round.
 LIVE_RESERVATION_S = 24 * 3600
 _CENTS = Decimal("0.01")
 _PROCESS_LOCK = threading.RLock()
@@ -184,12 +187,12 @@ class Ledger:
             "exhausted": exhausted,
         }
         for key, item in reservations.items():
-            at = item.get("at") if isinstance(item, dict) else None
-            if isinstance(at, bool) or not isinstance(at, int | float):
-                raise LedgerError(f"{self.path.name} has a reservation without a time")
+            expires = item.get("expires_at") if isinstance(item, dict) else None
+            if isinstance(expires, bool) or not isinstance(expires, int | float):
+                raise LedgerError(f"{self.path.name} has a reservation without an expiry")
             state["reservations"][str(key)] = {
                 "usd": _money(item.get("usd"), "a reservation"),
-                "at": float(at),
+                "expires_at": float(expires),
             }
         self._check_settings(data)
         return state
@@ -229,9 +232,7 @@ class Ledger:
                 "period": period,
                 "spent": Decimal(0),
                 "reservations": {
-                    k: r
-                    for k, r in state["reservations"].items()
-                    if now - r["at"] < LIVE_RESERVATION_S
+                    k: r for k, r in state["reservations"].items() if r["expires_at"] > now
                 },
                 "exhausted": False,
             }
@@ -245,7 +246,7 @@ class Ledger:
                 "period": state["period"],
                 "spent": format(state["spent"], "f"),
                 "reservations": {
-                    k: {"usd": format(r["usd"], "f"), "at": r["at"]}
+                    k: {"usd": format(r["usd"], "f"), "expires_at": r["expires_at"]}
                     for k, r in state["reservations"].items()
                 },
                 "exhausted": state["exhausted"],
@@ -318,10 +319,22 @@ class Ledger:
         """True when the Console said the credit is gone, until the period rolls."""
         return bool(self._state()["exhausted"])
 
-    def reserve(self, usd: Decimal, floor: Decimal | None = None) -> tuple[str, Decimal] | None:
-        """Reserve up to `usd` for one round: (id, granted), or None when less than 1 USD fits
-        under the ceiling (or the credit is exhausted). The grant is whole cents, rounded down."""
+    def reserve(
+        self, usd: Decimal, floor: Decimal | None = None, live_for_s: float = LIVE_RESERVATION_S
+    ) -> tuple[str, Decimal] | None:
+        """Reserve up to `usd` for one round: (id, granted), or None when less than 5 USD fits
+        under the ceiling (or the credit is exhausted). The grant is whole cents, rounded down.
+
+        `live_for_s` is how long the round can run (its time limit plus a margin). Until then the
+        reservation survives a period rollover; it is never dropped within its period."""
         _amount(usd, "usd", positive=True)
+        if (
+            not isinstance(live_for_s, int | float)
+            or isinstance(live_for_s, bool)
+            or not math.isfinite(live_for_s)
+            or live_for_s <= 0
+        ):
+            raise ValueError("live_for_s must be a positive, finite number of seconds")
         if floor is not None:
             _amount(floor, "floor", positive=False)
         with self._locked():
@@ -334,7 +347,10 @@ class Ledger:
             if grant < MIN_GRANT_USD:
                 return None
             reservation_id = uuid.uuid4().hex
-            state["reservations"][reservation_id] = {"usd": grant, "at": self._clock()}
+            state["reservations"][reservation_id] = {
+                "usd": grant,
+                "expires_at": self._clock() + live_for_s,
+            }
             self._write(state)
             return reservation_id, grant
 

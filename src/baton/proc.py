@@ -214,6 +214,15 @@ def _reader(stream, out: queue.Queue, stop: threading.Event, abandon: threading.
     _put(out, _EOF, abandon)
 
 
+def _without_secret_start(data: bytes, secrets: Sequence[bytes]) -> bytes:
+    """`data` without its longest ending that is the beginning of one of the secrets."""
+    for size in range(min(len(data), max(len(x) for x in secrets) - 1), 0, -1):
+        ending = data[-size:]
+        if any(x.startswith(ending) for x in secrets):
+            return data[:-size]
+    return data
+
+
 def _log_quietly(operation: Callable[..., object], *args: object) -> None:
     """Run a log operation: a full disk must never reach the kill or the on_line path."""
     try:
@@ -324,7 +333,7 @@ def run_streaming(
 
     def take(timeout: float) -> bool:
         """Handle the next queued item; False if none arrived within `timeout`."""
-        nonlocal stopped, delivering, eof, last_output, logged_after_stop
+        nonlocal stopped, delivering, eof, last_output, logged_after_stop, held
         try:
             item = lines.get(timeout=timeout)
         except queue.Empty:
@@ -342,6 +351,11 @@ def run_streaming(
             elif logged_after_stop < STOP_LOG_BYTES:
                 logged_after_stop += len(item)
                 record(item)
+            else:
+                # The log is full and this line's next piece is dropped, so the end held back
+                # from the last one can never be checked against it: it may be the start of a
+                # secret, and it is dropped too.
+                held = b""
         if lines.empty():
             _log_quietly(log.flush)  # buffered while a backlog is being worked off
         return item is not None
@@ -418,8 +432,11 @@ def run_streaming(
                 child.stdout.close()
             except (OSError, ValueError):
                 pass
-        if held:  # the end of a last line that never got its next chunk: too short to be a secret
-            _log_quietly(log.write, held)
+        if held:
+            # The end of a last line that never got its next chunk. Written, but never a stretch
+            # that could be the start of a secret: with nothing after it to complete the match,
+            # that stretch cannot be told from the secret's own beginning.
+            _log_quietly(log.write, _without_secret_start(held, secrets))
         _log_quietly(log.close)
 
     return Exit(returncode=returncode, stopped=stopped, timed_out=timed_out, tail=tail)
