@@ -310,7 +310,6 @@ def test_baton_toml_gate_holds_stream_open_until_pass(gw):
         'name = "ignored"\nworkdir = "/nowhere"\nobjective = "ignored"\n'
         'order = ["codex"]\nsnapshot = false\n'
         '[verify]\ncommand = "test -f DONE"\n'
-        "[agents.codex]\npoll_s = 1\n"
     )
 
     def finish(agent, prompt, ctx):
@@ -363,6 +362,8 @@ def test_baton_toml_cannot_set_a_global_setting(gw):
         '[agents.claude_api]\nadmin_key_file = "./stolen.key"\n',
         "[agents.codex]\nfull_access = true\n",
         "[agents.antigravity]\nfull_access = false\n",
+        "[agents.codex]\npoll_s = 3600\n",
+        "[agents.antigravity]\npoll_s = 3600\n",
     ],
 )
 def test_baton_toml_cannot_choose_executables_or_credentials(gw, line):

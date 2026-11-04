@@ -72,8 +72,9 @@ GOAL_KEYS = frozenset(
 )
 GLOBAL_ONLY = ("monthly_budget_usd", "reserve_pct", "budget_reset_day")
 # What a `baton.toml` may not set: it comes with the repository, so it must not choose which
-# executables run, which credentials are read or whether the sandbox is on.
-REPO_FORBIDDEN = ("bin", "key_file", "admin_key_file", "full_access")
+# executables run, which credentials are read, whether the sandbox is on or how rarely the guard
+# reads the limits.
+REPO_FORBIDDEN = ("bin", "key_file", "admin_key_file", "full_access", "poll_s")
 MAX_THRESHOLD_PCT = 90
 ANTIGRAVITY_MODEL_PREFIX = "gemini-"
 
@@ -324,7 +325,8 @@ def check_repo_table(data: dict[str, Any]) -> None:
             if isinstance(table, dict) and key in table:
                 raise GoalError(
                     f"agents.{agent}.{key} may not be set here: a file that comes with a "
-                    f"repository must not choose executables or credentials (use {defaults_path()})"
+                    "repository must not choose executables or credentials, or slow the guard's "
+                    f"limit reads (use {defaults_path()})"
                 )
 
 

@@ -408,3 +408,13 @@ def test_bounds_of_claude_api_values_are_accepted(tmp_path, monkeypatch):
 def test_claude_api_can_be_the_only_agent(tmp_path):
     text = minimal().replace('objective = "Ship it."', 'objective = "x"\norder = ["claude_api"]')
     assert load_goal(write(tmp_path, text)).order == ("claude_api",)
+
+
+def test_a_goal_file_may_set_poll_s(tmp_path):
+    path = tmp_path / "goal.toml"
+    path.write_text(
+        f'name = "demo"\nworkdir = "{tmp_path}"\nobjective = "x"\n'
+        "[agents.codex]\npoll_s = 120\n[agents.antigravity]\npoll_s = 240\n"
+    )
+    goal = load_goal(path)
+    assert (goal.agents["codex"].poll_s, goal.agents["antigravity"].poll_s) == (120, 240)

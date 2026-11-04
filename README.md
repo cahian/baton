@@ -186,9 +186,11 @@ of the goal file: its `[verify]`, timings and `[agents.*]` settings apply. `name
 the job finishes when a round completes. An invalid `baton.toml` is an error, never a silent
 fall-back to no gate.
 
-A `baton.toml` comes with the repository, so it may not set `bin`, `key_file`, `admin_key_file` or
-`full_access`: a file in a repository must not choose executables or credentials. Everywhere,
-`threshold_pct` may not go above 90, and an `antigravity.model` must start with `gemini-`.
+A `baton.toml` comes with the repository, so it may not set `bin`, `key_file`, `admin_key_file`,
+`full_access` or `poll_s`: a file in a repository must not choose executables or credentials, or
+slow the guard's limit reads. A goal file you pass yourself and the defaults file may set `poll_s`.
+Everywhere, `threshold_pct` may not go above 90, and an `antigravity.model` must start with
+`gemini-`.
 
 ## Using it from OpenCode
 
