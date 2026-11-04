@@ -2,13 +2,13 @@
 
 ## Intent
 
-A single long coding goal should keep moving for days across two subscription-based coding agents, Codex and Antigravity (Gemini 4 Argon),, without a person restarting anything and without ever spending pay-as-you-go credits.
+A single long coding goal should keep moving for days across three agents, Codex, Antigravity (Gemini 4 Argon) and optionally Claude through an organization API key,, without a person restarting anything and without ever spending pay-as-you-go credits.
 
 The real failure this exists to prevent: at 100% of its included usage, the Codex CLI keeps working and silently debits account credits. No error is raised and no 429 reaches the client. Any design that waits for a limit error loses money first. Limits must be read and acted on before they are reached.
 
 ## Goals
 
-1. Run one goal to completion: stay on the current agent until its limit, pass to the other, and when both are exhausted resume with whichever returns first.
+1. Run one goal to completion: stay on the current agent until its limit, pass to the next, and when all are exhausted resume with whichever returns first.
 2. Finish only when a verification command exits 0. An agent saying "done" means nothing.
 3. Never spend credits: stop an agent before its included usage ends, and kill it if a credit balance moves.
 4. Never give up: when every agent is exhausted, wait for the earliest reset and continue.
@@ -16,7 +16,7 @@ The real failure this exists to prevent: at 100% of its included usage, the Code
 
 ## Non-goals
 
-- Claude. It is deliberately out of the rotation.
+- Claude subscriptions. Claude only runs with a Console API key.
 - Reimplementing a coding agent. Every agent runs through its vendor's own CLI.
 - Merging conversation history between vendors. Continuity comes from the repository and a handoff file.
 - Pushing code, opening PRs, or touching anything beyond the working directory on the agent's behalf. Goals may instruct agents to do so.
@@ -34,7 +34,7 @@ Any of these is a failure even if the goal finishes:
 ## Vocabulary
 
 - **goal**: a TOML file describing the objective, working directory and verification command.
-- **agent**: a vendor CLI behind an adapter: `codex`, `antigravity`.
+- **agent**: a vendor CLI behind an adapter: `codex`, `antigravity`, `claude_api`.
 - **round**: one agent process, fresh or resuming that vendor's conversation, working until it exits or is stopped.
 - **gate**: the verification command, run before the first round and after every round.
 
@@ -52,7 +52,7 @@ snapshot uncommitted work
 run gate
 ```
 
-The current agent keeps working until it becomes unavailable, then the rotation moves to the other agent. With a limited reset time known for both, the wait ends at the earliest one, and that agent continues. Rotation is sticky: an agent coming back does not preempt the one working. The initial agent is the first in `order`.
+The current agent keeps working until it becomes unavailable, then the rotation moves to the other agent. With a limited reset time known for both, the wait ends at the earliest one, and that agent continues. Rotation is sticky and cyclic through `order`: an agent coming back does not preempt the one working. The initial agent is the first in `order`.
 
 Exceptions in the loop are logged, followed by a 60 s sleep, then the loop continues. Only a passing gate, a stop request or a termination signal ends the process.
 
@@ -138,9 +138,44 @@ Start a round only if every relevant row has used percent below `threshold_pct` 
 
 The final stream line is `{"event":"result","result":{"status":"SUCCESS","response":"...","error":"..."}}`. Text deltas appear in `step_update.text_delta`. A status other than `SUCCESS` is classified by pattern on error text and output: `RESOURCE_EXHAUSTED|quota|rate.?limit|429` is `limit`; `authentication|sign in|log in` is `auth`; otherwise `transient`.
 
+### Claude API adapter
+
+Runs the Claude Code CLI against a Console API key, billed to the organization's monthly promotional credit. No subscription login is involved.
+
+```
+claude -p --output-format stream-json --verbose --bare --model <model> --effort <effort> \
+  --dangerously-skip-permissions --max-budget-usd <round cap>
+```
+
+Prompt on stdin. The key is read from `key_file` at spawn and passed only in that process's environment as `ANTHROPIC_API_KEY`. It is never logged, stored in state, or passed to other agents. The file must be a regular file with mode 600.
+
+**There is no API that returns the credit balance.** The budget is therefore baton's own: `monthly_budget_usd` (default 200) minus `reserve_pct` (default 10) gives a spend ceiling of 180.
+
+Spend tracking is a ledger shared across all goals at `~/.local/state/baton/claude-spend.json`, updated under a lock:
+
+- Spend comes from `total_cost_usd` in the `result` event. It is a local estimate, so `reserve_pct` also absorbs its error.
+- A period starts on `budget_reset_day` (default 1) at 00:00 UTC.
+- Before a round, atomically reserve `round_budget_usd` (default 10). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 1 USD the agent is unavailable until the next period.
+- After a round, replace the reservation with the actual cost. If a round ends with no `result` event, the full reservation stays counted. Crashes therefore overcount and never undercount.
+- An unreadable or corrupt ledger means unavailable. Never recreate it silently.
+
+If `admin_key_file` is set, also read `GET /v1/organizations/cost_report` for the current period, and treat spend as the larger of that and the ledger. Reporting may lag, so it never lowers the ledger. A failed read when the file is set means unavailable.
+
+Stream checks:
+
+- `{"type":"system","subtype":"init","apiKeySource":...}`: anything other than `ANTHROPIC_API_KEY` stops the round with `credit_guard`.
+- Sum `total_cost_usd` is only final at `result`; `--max-budget-usd` is the in-round stop.
+- Output or exit text matching credit balance, billing or spend limit is `limit` until the next period. HTTP 429 and `overloaded` are `limit` with the no-known-reset backoff.
+
+Availability with `enabled = true` and no key file: unavailable, with a clear reason, retried after 1 hour. This never blocks the other agents.
+
+`--bare` keeps the CLI from falling back to the subscription login. It also skips project instructions, which the prompt's handoff replaces.
+
+The account owner must, in the Console: turn auto-reload off and hold no purchased credits, since otherwise spending continues after the promotional credit ends; and put the key in a dedicated workspace with a monthly spend limit at the ceiling. `baton doctor` prints this reminder, since neither can be checked with the key.
+
 ### Environment
 
-Every agent process has `OPENAI_API_KEY`, `GEMINI_API_KEY` and `GOOGLE_API_KEY` removed from its environment, so a vendor CLI cannot fall back to paid API access.
+Every agent process has `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `GEMINI_API_KEY` and `GOOGLE_API_KEY`, plus the Codex key variables, removed from its environment, so a vendor CLI cannot fall back to paid API access. The Claude adapter then adds its own key back for its process only.
 
 ### Process control
 
@@ -156,9 +191,9 @@ Context has three layers:
 2. **Private to each vendor:** when an agent's turn comes again, baton resumes that vendor's own conversation, so it keeps its full history. The prompt then only adds what changed since its last round: other agents' commits, the handoff, the gate output and the tail.
 3. **Everything else stays local:** raw logs in `rounds/` are for people, not prompts.
 
-Session ids come from the stream: `thread_id` in Codex `thread.started`, `conversation_id` in the Antigravity `init` event. They are stored per agent in `state.json`.
+Session ids come from the stream: `thread_id` in Codex `thread.started`, `conversation_id` in the Antigravity `init` event, `session_id` in the Claude `init` event. They are stored per agent in `state.json`.
 
-Resume commands: `codex exec resume <id>` with the same flags, `agy --conversation <id>`. If a resume fails for any reason, or the working directory changed, clear the id and run the same round fresh with the full prompt. A failed resume never counts against the agent.
+Resume commands: `codex exec resume <id>` with the same flags, `agy --conversation <id>`, `claude -p --resume <id>`. If a resume fails for any reason, or the working directory changed, clear the id and run the same round fresh with the full prompt. A failed resume never counts against the agent.
 
 ### Prompt and handoff
 
@@ -194,7 +229,7 @@ The verify command runs through the shell in the working directory with `verify.
 name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
-order = ["codex", "antigravity"]
+order = ["codex", "antigravity", "claude_api"]
 round_max_s = 3600
 idle_s = 1200
 snapshot = true
@@ -216,13 +251,24 @@ model = "gemini-4-argon-medium"
 threshold_pct = 90
 poll_s = 30
 
+[agents.claude_api]
+enabled = true
+model = "claude-sonnet-5-5"
+effort = "high"
+monthly_budget_usd = 200
+reserve_pct = 10
+round_budget_usd = 10
+budget_reset_day = 1
+key_file = "~/.config/baton/anthropic.key"
+admin_key_file = ""
+
 ```
 
 Every value except `name`, `workdir` and `objective` has the default shown. Without `verify.command` the goal is finished when a round ends as `completed`. Binary paths are resolved from `PATH`, overridable with `bin`, since tmux and launchd may not load shell aliases.
 
 ### Commands
 
-- `baton doctor [goal]`: binaries, logins, stray API keys, live limits for both agents. Spends nothing. Non-zero exit on a blocking problem.
+- `baton doctor [goal]`: binaries, logins, stray API keys, live limits, Claude spend against its ceiling. Spends nothing. Non-zero exit on a blocking problem.
 - `baton run <goal.toml>`: one goal in the foreground, without OpenCode.
 - `baton serve [--port 18777]`: the OpenCode gateway.
 - `baton status <goal.toml>`: one-shot text.
@@ -258,6 +304,8 @@ History: when a job starts with no vendor session id, the prompt includes the Op
 - Tests never call a real vendor. Fake CLIs and fake limit readers stand in.
 
 ## Risks to state plainly
+
+- Claude spend is an estimate. The hard stops are the credit running out, auto-reload being off, and the workspace spend limit, all configured in the Console.
 
 - A round can cross from threshold to 100% between polls. The 10% margin exists for this, and it cannot be mathematically zero. If the account's own setting for credits is available, it remains the only hard stop.
 - A response held open for days through OpenCode is untested beyond seconds. The job does not depend on it: `baton status` and reattaching still work.
