@@ -404,6 +404,56 @@ def test_setsid_survivor_holding_stdout_does_not_hang_the_runner(tmp_path):
     assert elapsed < 5
 
 
+def test_setsid_infinite_producer_does_not_wedge_the_runner(tmp_path):
+    flood = "import os; b = b'y\\n' * 4096\nwhile True:\n    os.write(1, b)"
+    code = (
+        "import subprocess, sys\n"
+        f"g = subprocess.Popen([sys.executable, '-c', {flood!r}], start_new_session=True)\n"
+        "print('GC', g.pid, flush=True)\n"
+    )
+    seen = {}
+
+    def on_line(line):
+        if line.startswith("GC "):
+            seen["gc"] = int(line.split()[1])
+
+    t0 = time.monotonic()
+    try:
+        ex = run_streaming(
+            py(code), tmp_path, None, make_ctx(tmp_path), on_line, lambda: None, tick_s=0.1
+        )
+        elapsed = time.monotonic() - t0
+    finally:
+        if "gc" in seen:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(seen["gc"], signal.SIGKILL)
+    assert ex.returncode == 0 and not ex.timed_out
+    assert elapsed < 8
+
+
+def test_every_line_written_before_leader_exit_reaches_on_line(tmp_path):
+    n = 4000
+    got = []
+
+    def slow_on_line(line):
+        got.append(line)
+        time.sleep(0.0002)  # far slower than the drain window allows for all lines
+        return None
+
+    ex = run_streaming(
+        py(f"for i in range({n}): print('L', i)\nprint('GUARD')"),
+        tmp_path,
+        None,
+        make_ctx(tmp_path),
+        slow_on_line,
+        lambda: None,
+        tick_s=0.1,
+    )
+    assert ex.returncode == 0
+    assert len(got) == n + 1
+    assert got[-1] == "GUARD"
+
+
 def test_round_context_and_result_defaults(tmp_path):
     assert RoundResult(COMPLETED).resume_failed is False
     ctx = make_ctx(tmp_path)

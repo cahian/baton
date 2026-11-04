@@ -30,7 +30,7 @@ TAIL_CHARS = 4000
 # How often the loop looks for the leader's exit while the child is silent.
 POLL_S = 0.1
 # After the leader exits, how long to keep reading what is still in the pipe.
-DRAIN_S = 0.5
+DRAIN_S = 0.25
 # How long to wait for the reader thread once the group is dead.
 JOIN_S = 1.0
 
@@ -108,9 +108,17 @@ class Exit:
 _EOF = object()
 
 
-def _reader(stream, out: queue.Queue) -> None:
+def _reader(stream, out: queue.Queue, limit: list[float]) -> None:
+    """Feed `out` with raw chunks until EOF or until a chunk is read after `limit[0]`.
+
+    The limit is what makes the queue finite once the leader is gone: a process outside the
+    group (setsid survivor) can hold the pipe open and write forever, and nothing it writes
+    after the deadline is wanted.
+    """
     try:
         for chunk in iter(lambda: stream.readline(MAX_LINE_BYTES), b""):
+            if time.monotonic() > limit[0]:
+                break
             out.put(chunk)
     except (OSError, ValueError):
         pass
@@ -170,17 +178,19 @@ def run_streaming(
     timed_out = False
     reader: threading.Thread | None = None
     lines: queue.Queue = queue.Queue()
+    # Chunks read after this monotonic time are dropped by the reader. Infinite until the
+    # leader exits or the round is being stopped.
+    limit = [float("inf")]
 
     def record(chunk: bytes) -> str:
         nonlocal tail
         log.write(chunk)
-        log.flush()
         line = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
         tail = (tail + line + "\n")[-TAIL_CHARS:]
         return line
 
     try:
-        reader = threading.Thread(target=_reader, args=(child.stdout, lines), daemon=True)
+        reader = threading.Thread(target=_reader, args=(child.stdout, lines, limit), daemon=True)
         reader.start()
         if stdin_text is not None and child.stdin is not None:
             feeder = threading.Thread(target=_feed_stdin, args=(child.stdin, stdin_text))
@@ -196,6 +206,8 @@ def run_streaming(
             except queue.Empty:
                 item = None
             now = time.monotonic()
+            if item is None or lines.empty():
+                log.flush()  # buffered while a backlog is being worked off
             if item is _EOF:
                 eof = True
             elif item is not None:
@@ -206,10 +218,12 @@ def run_streaming(
                 if stopped is not None:
                     break
             # The leader's exit ends the round even if a grandchild still holds the pipe.
-            # Lines already queued keep flowing to on_line for a short drain window first.
+            # Everything the reader got before exit + DRAIN_S still reaches on_line, however
+            # slow on_line is; the reader refuses later data, so that backlog is finite.
             if exited_at is None and _leader_exited(child):
                 exited_at = now
-            if exited_at is not None and (eof or now - exited_at >= DRAIN_S):
+                limit[0] = min(limit[0], now + DRAIN_S)
+            if exited_at is not None and (eof or (lines.empty() and now >= limit[0])):
                 break
             if now - last_check >= tick_s:
                 last_check = now
@@ -222,6 +236,8 @@ def run_streaming(
                         timed_out = True
     finally:
         try:
+            # A stop or timeout also gets a bounded window to collect what is already in flight.
+            limit[0] = min(limit[0], time.monotonic() + DRAIN_S)
             # Always sweep the group, also after a normal exit, so nothing outlives the round.
             _kill_group(pgid, KILL_GRACE_S, child.poll)
             returncode = child.wait()
@@ -230,6 +246,7 @@ def run_streaming(
                 reader.join(timeout=JOIN_S)
                 reader_alive = reader.is_alive()
             # Whatever the child wrote before dying still belongs in the log and the tail.
+            # Finite: the reader stopped at `limit`, which has passed by now.
             while True:
                 try:
                     item = lines.get_nowait()
@@ -245,6 +262,6 @@ def run_streaming(
                 except (OSError, ValueError):
                     pass
         finally:
-            log.close()
+            log.close()  # flushes
 
     return Exit(returncode=returncode, stopped=stopped, timed_out=timed_out, tail=tail)
