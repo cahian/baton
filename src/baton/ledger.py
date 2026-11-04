@@ -219,9 +219,9 @@ class Ledger:
 
     def _state(self) -> dict:
         """The ledger as of the current period. When the stored period is over, spend and the
-        exhausted flag are forgotten, and only reservations young enough to belong to a round that
-        may still be running are carried over. A stored period in the future (the clock went back)
-        is kept, never discarded."""
+        exhausted flag are forgotten, and only the reservations whose `expires_at` is still ahead
+        (their round may still be running) are carried over. A stored period in the future (the
+        clock went back) is kept, never discarded."""
         period = self._period()[0].date().isoformat()
         state = self._read()
         if state is None:

@@ -996,3 +996,80 @@ def test_a_held_tail_that_cannot_start_the_secret_is_still_flushed_at_the_end(
 ):
     code = f"import sys; sys.stdout.write('A' * (65536 - {KEEP}) + 'Z' * {KEEP})"
     assert edge_run(tmp_path, monkeypatch, code) == "A" * (65536 - KEEP) + "Z" * KEEP
+
+
+# --- the last piece of output, when it has no newline -----------------------------------------
+
+
+def final_piece(tmp_path, monkeypatch, code):
+    """Run a child whose output ends without a newline; (log, lines seen, shown, tail)."""
+    monkeypatch.setattr(proc, "KILL_GRACE_S", 0.2)
+    ctx = make_ctx(tmp_path)
+    shown, parsed = [], []
+    ctx.on_output = shown.append
+    ex = run_streaming(
+        py(code),
+        tmp_path,
+        None,
+        ctx,
+        lambda line: parsed.append(line) and None,
+        lambda: None,
+        extra_env={"K": SECRET},
+    )
+    return ctx.log_path.read_text(), parsed, shown, ex.tail
+
+
+def test_a_short_last_piece_ending_in_the_key_minus_one_character_is_not_written(
+    tmp_path, monkeypatch
+):
+    """`hello ` plus the key without its last character, then EOF: the chunk is short and not
+    cut, so it was written unchecked, to the log and to the tail."""
+    log, parsed, shown, tail = final_piece(
+        tmp_path, monkeypatch, "import os, sys; sys.stdout.write('hello ' + os.environ['K'][:-1])"
+    )
+    for place in (log, "".join(parsed), "".join(shown), tail):
+        assert SECRET[:8] not in place and SECRET[:-1] not in place
+    assert log == "hello "
+    assert parsed == ["hello "] and tail == "hello \n"
+
+
+@pytest.mark.parametrize("size", [1, 5, KEEP])
+def test_any_ending_that_starts_the_key_is_trimmed_from_a_last_piece(tmp_path, monkeypatch, size):
+    log, parsed, _, tail = final_piece(
+        tmp_path,
+        monkeypatch,
+        f"import os, sys; sys.stdout.write('line one\\nlast ' + os.environ['K'][:{size}])",
+    )
+    assert log == "line one\nlast "
+    assert parsed == ["line one", "last "]
+    assert SECRET[:size] not in tail
+
+
+def test_a_last_piece_with_the_whole_key_is_redacted_not_trimmed(tmp_path, monkeypatch):
+    log, parsed, _, tail = final_piece(
+        tmp_path, monkeypatch, "import os, sys; sys.stdout.write('hello ' + os.environ['K'])"
+    )
+    assert log == "hello [redacted]" and parsed == ["hello [redacted]"]
+    assert SECRET not in tail
+
+
+def test_a_harmless_last_piece_without_a_newline_is_kept_whole(tmp_path, monkeypatch):
+    log, parsed, _, tail = final_piece(
+        tmp_path, monkeypatch, "import sys; sys.stdout.write('first\\nno newline here')"
+    )
+    assert log == "first\nno newline here"
+    assert parsed == ["first", "no newline here"] and tail.endswith("no newline here\n")
+
+
+def test_a_last_piece_after_a_cut_line_is_checked_together_with_what_was_held(
+    tmp_path, monkeypatch
+):
+    code = (
+        "import os, sys\n"
+        "k = os.environ['K']\n"
+        "sys.stdout.write('A' * (65536 - 4) + k[:4])\n"  # a cut chunk ending in the key's start
+        "sys.stdout.write(k[4:-1])\n"  # and the rest of the key, minus its last character
+    )
+    log, parsed, _, tail = final_piece(tmp_path, monkeypatch, code)
+    assert SECRET[:8] not in log and SECRET[:8] not in tail
+    assert log == "A" * (65536 - 4)

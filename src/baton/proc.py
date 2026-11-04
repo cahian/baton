@@ -321,11 +321,18 @@ def run_streaming(
         chunk, held = held + chunk, b""
         for secret in secrets:
             chunk = chunk.replace(secret, REDACTED)
-        if secrets and cut:
-            # A line is cut into 64 KB chunks and a secret can straddle the cut: keep back the
-            # last bytes that could be the start of one, and look at them again with the next.
-            keep = max(len(x) for x in secrets) - 1
-            chunk, held = chunk[:-keep], chunk[-keep:]
+        if secrets and not chunk.endswith(b"\n"):
+            if cut:
+                # A line is cut into 64 KB chunks and a secret can straddle the cut: keep back
+                # the last bytes that could be the start of one, and look at them again with
+                # the next.
+                keep = max(len(x) for x in secrets) - 1
+                chunk, held = chunk[:-keep], chunk[-keep:]
+            else:
+                # The last piece of the output: nothing follows to complete a match, so an
+                # ending that could be the start of a secret is left out, of the log, of the
+                # tail and of what the callbacks see.
+                chunk = _without_secret_start(chunk, secrets)
         _log_quietly(log.write, chunk)
         line = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
         tail = (tail + line + "\n")[-TAIL_CHARS:]
