@@ -20,10 +20,10 @@ from baton.adapters.claude_api import ClaudeApiAdapter, ledger_for, make_cost_re
 from baton.adapters.codex import CodexAdapter
 from baton.config import AgentConfig, Goal, GoalError, load_goal
 from baton.doctor import run_checks
+from baton.gateway import DEFAULT_PORT, opencode_config, serve
 from baton.runner import run_goal
 from baton.store import AlreadyRunning, StateError, Store, state_dir
 
-DEFAULT_PORT = 18777
 STATUS_EVENTS = 8
 
 
@@ -310,15 +310,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
-# later tasks
+# gateway
 
 
-def _not_yet(name: str) -> Callable[[argparse.Namespace], int]:
-    def command(args: argparse.Namespace) -> int:
-        _err(f"{name} is not implemented yet")
-        return 2
+def cmd_serve(args: argparse.Namespace) -> int:
+    awake = _hold_awake()
+    try:
+        serve(args.port, build_adapters)
+    except OSError as exc:
+        _err(f"cannot serve on 127.0.0.1:{args.port}: {exc.strerror or exc}")
+        return 1
+    finally:
+        _release(awake)
+    return 0
 
-    return command
+
+def cmd_opencode_config(args: argparse.Namespace) -> int:
+    print(json.dumps(opencode_config(args.port), indent=2))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -337,7 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("serve", help="the OpenCode gateway")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    p.set_defaults(func=_not_yet("serve"))
+    p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("status", help="one-shot status of a goal")
     p.add_argument("goal", help="goal file")
@@ -356,7 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("opencode-config", help="print the provider JSON for opencode.json")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    p.set_defaults(func=_not_yet("opencode-config"))
+    p.set_defaults(func=cmd_opencode_config)
     return parser
 
 

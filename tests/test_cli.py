@@ -166,12 +166,6 @@ def test_missing_goal_file_exits_2(fakes, capsys):
     assert "cannot read" in capsys.readouterr().err
 
 
-def test_serve_and_opencode_config_are_not_there_yet(capsys):
-    assert main(["serve"]) == 2
-    assert main(["opencode-config"]) == 2
-    assert "not implemented" in capsys.readouterr().err
-
-
 def test_no_command_is_a_usage_error(capsys):
     with pytest.raises(SystemExit) as exc:
         main([])
