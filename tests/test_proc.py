@@ -1,4 +1,7 @@
+import contextlib
 import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -268,19 +271,32 @@ def test_on_spawn_reports_pgid(tmp_path):
     spawned = []
     ctx = make_ctx(tmp_path, on_spawn=spawned.append)
     seen = {}
+    stop = RoundResult(COMPLETED, reason="seen")
 
     def on_line(line):
         seen["pgid"] = os.getpgid(int(line))
-        return None
+        return stop
 
-    run_streaming(py("import os; print(os.getpid())"), tmp_path, None, ctx, on_line, lambda: None)
+    # The child stays alive until stopped, so getpgid cannot hit a zombie.
+    run_streaming(
+        py("import os, time; print(os.getpid(), flush=True); time.sleep(60)"),
+        tmp_path,
+        None,
+        ctx,
+        on_line,
+        lambda: None,
+    )
     assert len(spawned) == 1
     assert seen["pgid"] == spawned[0]  # child leads its own session/group
     assert spawned[0] != os.getpgrp()
 
 
 def test_kill_group_on_dead_group_is_a_noop():
-    proc.kill_group(2**22 - 3, grace_s=0.1)
+    done = subprocess.Popen(py("pass"), start_new_session=True)
+    done.wait()  # reaped: this group id no longer exists
+    t0 = time.monotonic()
+    proc.kill_group(done.pid, grace_s=0.1)
+    assert time.monotonic() - t0 < 2
 
 
 def test_nonzero_exit_reported(tmp_path):
@@ -290,12 +306,102 @@ def test_nonzero_exit_reported(tmp_path):
     assert ex.returncode == 3 and ex.stopped is None
 
 
-@pytest.mark.parametrize("bad", [None])
-def test_missing_binary_raises(tmp_path, bad):
+def test_missing_binary_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         run_streaming(
-            ["/nonexistent/baton-bin"], tmp_path, bad, make_ctx(tmp_path), never, lambda: None
+            ["/nonexistent/baton-bin"], tmp_path, None, make_ctx(tmp_path), never, lambda: None
         )
+
+
+def test_unopenable_log_raises_before_spawning(tmp_path):
+    marker = tmp_path / "ran"
+    bad_log = tmp_path / "a-directory"
+    bad_log.mkdir()
+    spawned = []
+    ctx = make_ctx(tmp_path, log_path=bad_log, on_spawn=spawned.append)
+    with pytest.raises(OSError):
+        run_streaming(
+            py(f"import pathlib, time; pathlib.Path({str(marker)!r}).touch(); time.sleep(5)"),
+            tmp_path,
+            None,
+            ctx,
+            never,
+            lambda: None,
+        )
+    time.sleep(0.5)
+    assert spawned == []
+    assert not marker.exists()  # the child was never started
+
+
+def test_grandchild_holding_stdout_does_not_time_out_a_finished_leader(tmp_path):
+    code = (
+        "import subprocess, sys\n"
+        "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print('GC', g.pid, flush=True)\n"
+    )
+    seen = {}
+
+    def on_line(line):
+        seen["gc"] = int(line.split()[1])
+
+    t0 = time.monotonic()
+    ex = run_streaming(
+        py(code),
+        tmp_path,
+        None,
+        make_ctx(tmp_path, round_max_s=30, idle_s=30),
+        on_line,
+        lambda: None,
+        tick_s=0.1,
+    )
+    assert ex.returncode == 0 and not ex.timed_out and ex.stopped is None
+    assert time.monotonic() - t0 < 8
+    assert wait_dead(seen["gc"])  # the sweep killed it
+
+
+def test_grandchild_with_redirected_stdout_is_killed_when_leader_exits(tmp_path):
+    code = (
+        "import subprocess, sys\n"
+        "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "print('GC', g.pid, flush=True)\n"
+    )
+    seen = {}
+
+    def on_line(line):
+        seen["gc"] = int(line.split()[1])
+
+    ex = run_streaming(
+        py(code), tmp_path, None, make_ctx(tmp_path), on_line, lambda: None, tick_s=0.1
+    )
+    assert ex.returncode == 0 and not ex.timed_out
+    assert wait_dead(seen["gc"])
+
+
+def test_setsid_survivor_holding_stdout_does_not_hang_the_runner(tmp_path):
+    code = (
+        "import subprocess, sys\n"
+        "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "                     start_new_session=True)\n"
+        "print('GC', g.pid, flush=True)\n"
+    )
+    seen = {}
+
+    def on_line(line):
+        seen["gc"] = int(line.split()[1])
+
+    t0 = time.monotonic()
+    try:
+        ex = run_streaming(
+            py(code), tmp_path, None, make_ctx(tmp_path), on_line, lambda: None, tick_s=0.1
+        )
+        elapsed = time.monotonic() - t0
+    finally:
+        if "gc" in seen:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(seen["gc"], signal.SIGKILL)
+    assert ex.returncode == 0 and not ex.timed_out
+    assert elapsed < 5
 
 
 def test_round_context_and_result_defaults(tmp_path):

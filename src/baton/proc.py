@@ -27,6 +27,12 @@ KILL_GRACE_S = 10.0
 # Output lines longer than this are split into chunks.
 MAX_LINE_BYTES = 64 * 1024
 TAIL_CHARS = 4000
+# How often the loop looks for the leader's exit while the child is silent.
+POLL_S = 0.1
+# After the leader exits, how long to keep reading what is still in the pipe.
+DRAIN_S = 0.5
+# How long to wait for the reader thread once the group is dead.
+JOIN_S = 1.0
 
 
 def clean_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -43,6 +49,16 @@ def _group_alive(pgid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _leader_exited(child: subprocess.Popen) -> bool:
+    """True once the leader has exited, without reaping it so its process group stays valid."""
+    if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+        try:
+            return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError:
+            return True
+    return child.poll() is not None
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -133,27 +149,29 @@ def run_streaming(
     `timed_out=True`. Raw bytes are appended to `ctx.log_path`.
     """
     ctx.log_path.parent.mkdir(parents=True, exist_ok=True)
-    child = subprocess.Popen(
-        list(argv),
-        cwd=cwd,
-        env=clean_env(),
-        stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    # Open the log before spawning: a failure here must not leave a running, unwatched child.
+    log = ctx.log_path.open("ab")
+    try:
+        child = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=clean_env(),
+            stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except BaseException:
+        log.close()
+        raise
     pgid = child.pid
-    lines: queue.Queue = queue.Queue()
-    reader = threading.Thread(target=_reader, args=(child.stdout, lines), daemon=True)
-    reader.start()
-    if stdin_text is not None and child.stdin is not None:
-        threading.Thread(target=_feed_stdin, args=(child.stdin, stdin_text), daemon=True).start()
-
     tail = ""
     stopped: RoundResult | None = None
     timed_out = False
+    reader: threading.Thread | None = None
+    lines: queue.Queue = queue.Queue()
 
-    def record(chunk: bytes, log) -> str:
+    def record(chunk: bytes) -> str:
         nonlocal tail
         log.write(chunk)
         log.flush()
@@ -161,47 +179,56 @@ def run_streaming(
         tail = (tail + line + "\n")[-TAIL_CHARS:]
         return line
 
-    with ctx.log_path.open("ab") as log:
-        try:
-            ctx.on_spawn(pgid)
-            started = last_output = last_check = time.monotonic()
-            eof = False
-            while stopped is None and not timed_out:
-                if eof:
-                    try:
-                        child.wait(timeout=tick_s)
-                        break
-                    except subprocess.TimeoutExpired:
-                        item = None
+    try:
+        reader = threading.Thread(target=_reader, args=(child.stdout, lines), daemon=True)
+        reader.start()
+        if stdin_text is not None and child.stdin is not None:
+            feeder = threading.Thread(target=_feed_stdin, args=(child.stdin, stdin_text))
+            feeder.daemon = True
+            feeder.start()
+        ctx.on_spawn(pgid)
+        started = last_output = last_check = time.monotonic()
+        eof = False
+        exited_at: float | None = None
+        while stopped is None and not timed_out:
+            try:
+                item = lines.get(timeout=min(tick_s, POLL_S))
+            except queue.Empty:
+                item = None
+            now = time.monotonic()
+            if item is _EOF:
+                eof = True
+            elif item is not None:
+                last_output = now
+                line = record(item)
+                ctx.on_output(line)
+                stopped = on_line(line)
+                if stopped is not None:
+                    break
+            # The leader's exit ends the round even if a grandchild still holds the pipe.
+            # Lines already queued keep flowing to on_line for a short drain window first.
+            if exited_at is None and _leader_exited(child):
+                exited_at = now
+            if exited_at is not None and (eof or now - exited_at >= DRAIN_S):
+                break
+            if now - last_check >= tick_s:
+                last_check = now
+                if ctx.should_kill():
+                    stopped = RoundResult(COMPLETED, reason="stop requested")
                 else:
-                    try:
-                        item = lines.get(timeout=tick_s)
-                    except queue.Empty:
-                        item = None
-                now = time.monotonic()
-                if item is _EOF:
-                    eof = True
-                elif item is not None:
-                    last_output = now
-                    line = record(item, log)
-                    ctx.on_output(line)
-                    stopped = on_line(line)
-                    if stopped is not None:
-                        break
-                if now - last_check >= tick_s:
-                    last_check = now
-                    if ctx.should_kill():
-                        stopped = RoundResult(COMPLETED, reason="stop requested")
-                    else:
-                        stopped = tick()
-                    if stopped is None:
-                        if now - started >= ctx.round_max_s or now - last_output >= ctx.idle_s:
-                            timed_out = True
-        finally:
-            if stopped is not None or timed_out or child.poll() is None:
-                _kill_group(pgid, KILL_GRACE_S, child.poll)
+                    stopped = tick()
+                if stopped is None and exited_at is None:
+                    if now - started >= ctx.round_max_s or now - last_output >= ctx.idle_s:
+                        timed_out = True
+    finally:
+        try:
+            # Always sweep the group, also after a normal exit, so nothing outlives the round.
+            _kill_group(pgid, KILL_GRACE_S, child.poll)
             returncode = child.wait()
-            reader.join(timeout=2)
+            reader_alive = False
+            if reader is not None:
+                reader.join(timeout=JOIN_S)
+                reader_alive = reader.is_alive()
             # Whatever the child wrote before dying still belongs in the log and the tail.
             while True:
                 try:
@@ -209,12 +236,15 @@ def run_streaming(
                 except queue.Empty:
                     break
                 if item is not _EOF:
-                    record(item, log)
-            for stream in (child.stdout, child.stdin):
+                    record(item)
+            # Closing the pipe would block on the reader's buffer lock if a process outside the
+            # group (setsid survivor) still holds it; leave it to the daemon thread then.
+            if not reader_alive and child.stdout is not None:
                 try:
-                    if stream is not None:
-                        stream.close()
+                    child.stdout.close()
                 except (OSError, ValueError):
                     pass
+        finally:
+            log.close()
 
     return Exit(returncode=returncode, stopped=stopped, timed_out=timed_out, tail=tail)
