@@ -44,9 +44,8 @@ from baton.adapters.base import (
 )
 from baton.adapters.guard import RETRY_S
 from baton.config import AgentConfig
-from baton.ledger import MIN_GRANT_USD, Ledger, LedgerError, ceiling_for
-from baton.proc import run_streaming
-from baton.store import state_base
+from baton.ledger import MIN_GRANT_USD, Ledger, LedgerError, ceiling_for, default_path
+from baton.proc import Exit, run_streaming
 
 __all__ = [
     "ClaudeApiAdapter",
@@ -60,12 +59,16 @@ __all__ = [
 ]
 
 KEY_VARIABLE = "ANTHROPIC_API_KEY"
-LEDGER_NAME = "claude-spend.json"
 # Without a usable key file the agent is asked again after this long.
 NO_KEY_RETRY_S = 3600
 MAX_KEY_BYTES = 4096
 # How many error lines of a round are kept to classify its failure.
 MAX_PROBLEMS = 20
+# A line this long is a piece of an event (the runner cuts lines at 64 KB): agent output, never an
+# error message. A line that follows one is the rest of it.
+LARGE_LINE = 32 * 1024
+# The longest line that may be read as an error message when it is not JSON.
+SHORT_ERROR_LINE = 300
 
 API_BASE = "https://api.anthropic.com"
 REPORT_PAGES = 12  # a period is at most 31 daily buckets, which is one page of 31
@@ -197,6 +200,9 @@ class _Stream:
     def __init__(self) -> None:
         self.verified = False  # an init event named the key
         self.active = False  # something other than system events was said
+        self.rejected_init = False  # the init event named a credential other than the key
+        self.large = False  # some line was (a piece of) a big event: the agent did real work
+        self.continuing = False  # the previous line was a piece of a longer one
         self.session_reported = False
         self.has_result = False
         self.is_error = False
@@ -217,9 +223,10 @@ class _Stream:
 
 
 def ledger_for(cfg: AgentConfig, clock: Callable[[], float] = time.time) -> Ledger:
-    """The ledger every goal shares, with this config's ceiling and reset day."""
+    """The one ledger every goal shares. Its ceiling and reset day come from the global budget
+    settings, and the file refuses a goal that disagrees with them."""
     return Ledger(
-        state_base() / LEDGER_NAME,
+        default_path(),
         ceiling_for(cfg.monthly_budget_usd, cfg.reserve_pct),
         cfg.budget_reset_day,
         clock,
@@ -450,7 +457,7 @@ class ClaudeApiAdapter:
             return RoundResult(
                 LIMIT,
                 until=self.ledger.next_period(),
-                reason="the Claude API spend ceiling leaves less than 1 USD for a round",
+                reason=f"the spend ceiling leaves less than {MIN_GRANT_USD} USD for a round",
             )
         reservation_id, granted = reservation
         stream = _Stream()
@@ -490,19 +497,31 @@ class ClaudeApiAdapter:
                 TRANSIENT,
                 reason=f"cannot start {self.cfg.bin}: {exc.strerror or type(exc).__name__}",
             )
-        settled = self._settle(reservation_id, stream)
+        if stream.cost is not None:
+            self._settle(reservation_id, stream.cost)
+        elif self._never_reached_the_api(exit_, stream):
+            self._release(reservation_id)
         if exit_.stopped is not None:
             return exit_.stopped
-        return self._outcome(exit_.timed_out, exit_.returncode, stream, ctx, settled)
+        return self._outcome(exit_.timed_out, exit_.returncode, stream, ctx)
 
     def _on_line(self, line: str, stream: _Stream, ctx: RoundContext) -> RoundResult | None:
+        size = len(line)
+        continuing, stream.continuing = stream.continuing, size >= LARGE_LINE
+        if size >= LARGE_LINE:
+            stream.large = True
         stop = evaluate_line(line)
         if stop is not None:
+            stream.rejected_init = True
             return stop
         event = _parse(line)
         if event is None:
-            if line.strip():
-                stream.problems.append(line.strip()[:500])
+            # Only a short line of plain text can be an error message (the process's own stderr).
+            # A piece of a big event is agent output: a "billing" inside a file it wrote says
+            # nothing about the account.
+            text = line.strip()
+            if text and not continuing and size <= SHORT_ERROR_LINE and text[0] not in '{["':
+                stream.problems.append(text)
             return None
         kind = event.get("type")
         if kind in ("assistant", "user", "stream_event", "result"):
@@ -540,23 +559,34 @@ class ClaudeApiAdapter:
         return None
 
     def _release(self, reservation_id: str) -> None:
-        """Give back a reservation for a process that never existed."""
+        """Give back a reservation for a round that cannot have spent anything."""
         try:
             self.ledger.settle(reservation_id, Decimal(0))
         except Exception:
             pass  # the reservation stays: an overcount
 
-    def _settle(self, reservation_id: str, stream: _Stream) -> bool:
-        """Replace the reservation with the reported cost. Without one, it stays as it is."""
-        if stream.cost is None:
-            return False
+    def _settle(self, reservation_id: str, cost: Decimal) -> None:
+        """Replace the reservation with the reported cost."""
         try:
-            self.ledger.settle(reservation_id, stream.cost)
+            self.ledger.settle(reservation_id, cost)
         except Exception:
-            return False  # the reservation stays: an overcount
-        return True
+            pass  # the reservation stays: an overcount
 
-    def _refusal(self, text: str, stream: _Stream) -> RoundResult | None:
+    @staticmethod
+    def _never_reached_the_api(exit_: Exit, stream: _Stream) -> bool:
+        """True only when it is certain that no model call was made, so nothing was spent.
+
+        The process ended by itself (or was stopped by the wrong-source init, which comes before
+        any call), no init named the key, nothing but noise was said, no cost was reported and no
+        big event went by. Anything else could hide a call, and then the reservation stays.
+        """
+        if exit_.timed_out or stream.verified or stream.active or stream.large:
+            return False
+        if stream.cost is not None:
+            return False
+        return exit_.stopped is None or stream.rejected_init
+
+    def _refusal(self, text: str) -> RoundResult | None:
         """`limit` or `auth` from the error text of a failed round, or None."""
         if _CREDIT_RE.search(text):
             try:
@@ -578,7 +608,6 @@ class ClaudeApiAdapter:
         returncode: int | None,
         stream: _Stream,
         ctx: RoundContext,
-        settled: bool,
     ) -> RoundResult:
         if timed_out:
             return RoundResult(TIMEOUT, reason="round exceeded its time limit")
@@ -589,7 +618,7 @@ class ClaudeApiAdapter:
                 text = _summary(stream.error_text())
                 if text:
                     summary = f"{summary}: {text}"
-                refusal = self._refusal(stream.error_text(), stream)
+                refusal = self._refusal(stream.error_text())
                 if refusal is not None:
                     return refusal
                 if ctx.session_id is not None:
@@ -611,15 +640,14 @@ class ClaudeApiAdapter:
         if stream.has_result and stream.subtype in _BOUNDED_SUBTYPES:
             return RoundResult(COMPLETED, reason=_summary(stream.result_text) or stream.subtype)
         text = stream.error_text()
-        refusal = self._refusal(text, stream)
+        refusal = self._refusal(text)
         if refusal is not None:
             return refusal
         if not stream.has_result:
             summary = f"stream ended without a result event (exit {returncode})"
         else:
             summary = _summary(text) or f"result {stream.subtype or 'error'}"
-        if ctx.session_id is not None:
-            return RoundResult(TRANSIENT, reason=f"resume failed: {summary}", resume_failed=True)
+        # The session was loaded and the key confirmed, so this is not a failed resume.
         return RoundResult(TRANSIENT, reason=summary)
 
     # rendering

@@ -11,7 +11,11 @@ The rules that keep a round from passing the ceiling:
 - A finished round *settles*: its reservation is replaced by the actual cost. A round that never
   settles (a crash, a kill) keeps its whole reservation counted, so a failure overcounts.
 - A ledger that cannot be read or understood raises `LedgerError`, and the file is never touched or
-  recreated. A missing file is the only empty ledger.
+  recreated. The only empty ledger is one that has never existed: a lock file with no ledger beside
+  it means the ledger was deleted, and that is an error too.
+- The ceiling and reset day are written into the file. Goals must agree on them (they are global
+  settings), so a goal that disagrees gets a `LedgerError` instead of a different idea of the
+  period or the budget.
 - Writes are atomic and made under an exclusive `flock` (plus a process-wide lock, since `flock`
   alone is not enough to order threads that share one descriptor table in every platform).
   Reads need no lock, because a write is a rename.
@@ -23,6 +27,7 @@ import calendar
 import fcntl
 import json
 import os
+import pwd
 import tempfile
 import threading
 import time
@@ -33,16 +38,31 @@ from datetime import UTC, date, datetime
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 
-__all__ = ["MIN_GRANT_USD", "Ledger", "LedgerError", "ceiling_for"]
+__all__ = ["MIN_GRANT_USD", "Ledger", "LedgerError", "ceiling_for", "default_path"]
 
-# Below this, a round is not worth starting and the agent is unavailable until the next period.
-MIN_GRANT_USD = Decimal("1")
+# Below this, a round is not started and the agent is unavailable until the next period. The
+# CLI's `--max-budget-usd` is checked between steps, so a round can overshoot its cap; a grant this
+# large keeps the overshoot inside the reserve.
+MIN_GRANT_USD = Decimal("5")
+# A reservation older than this when the period rolls belongs to a round that died, not to one
+# still running across the boundary.
+LIVE_RESERVATION_S = 24 * 3600
 _CENTS = Decimal("0.01")
 _PROCESS_LOCK = threading.RLock()
 
 
 class LedgerError(Exception):
     """The ledger cannot be read, understood or written. The file is left as it is."""
+
+
+def default_path() -> Path:
+    """Where the one ledger lives: under the real user home, whatever `HOME` and
+    `BATON_STATE_DIR` say, so that no goal can have a ledger of its own. `BATON_LEDGER` is the
+    explicit override (for tests)."""
+    override = os.environ.get("BATON_LEDGER")
+    if override:
+        return Path(override).expanduser()
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/baton/claude-spend.json"
 
 
 def ceiling_for(monthly_budget_usd: Decimal, reserve_pct: int) -> Decimal:
@@ -60,6 +80,14 @@ def _money(value: object, what: str) -> Decimal:
     if not number.is_finite() or number < 0:
         raise LedgerError(f"{what} is not a non-negative amount")
     return number
+
+
+def _plain(value: Decimal) -> str:
+    return format(value.normalize() if value == value.to_integral_value() else value, "f")
+
+
+def _reserved(state: dict) -> Decimal:
+    return sum((r["usd"] for r in state["reservations"].values()), Decimal(0))
 
 
 def _amount(value: Decimal, what: str, positive: bool) -> Decimal:
@@ -115,10 +143,20 @@ class Ledger:
 
     # reading and writing
 
+    def _lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
     def _read(self) -> dict | None:
         try:
             raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            if self._lock_path().exists():
+                raise LedgerError(
+                    f"{self.path.name} is missing but its lock file exists: the ledger was "
+                    "deleted. Its spend is unknown, so Claude stays unavailable. Restore the "
+                    f"file, or delete {self._lock_path().name} to start a new ledger (this "
+                    "forgets the spend so far)"
+                ) from None
             return None
         except (OSError, UnicodeDecodeError) as exc:
             raise LedgerError(f"cannot read {self.path.name}: {type(exc).__name__}") from None
@@ -139,29 +177,77 @@ class Ledger:
         exhausted = data.get("exhausted", False)
         if not isinstance(exhausted, bool):
             raise LedgerError(f"{self.path.name} has a bad exhausted flag")
-        return {
+        state = {
             "period": period,
             "spent": _money(data.get("spent"), "spent"),
-            "reservations": {str(k): _money(v, "a reservation") for k, v in reservations.items()},
+            "reservations": {},
             "exhausted": exhausted,
         }
+        for key, item in reservations.items():
+            at = item.get("at") if isinstance(item, dict) else None
+            if isinstance(at, bool) or not isinstance(at, int | float):
+                raise LedgerError(f"{self.path.name} has a reservation without a time")
+            state["reservations"][str(key)] = {
+                "usd": _money(item.get("usd"), "a reservation"),
+                "at": float(at),
+            }
+        self._check_settings(data)
+        return state
+
+    def _check_settings(self, data: dict) -> None:
+        stored_ceiling = _money(data.get("ceiling"), "ceiling")
+        stored_day = data.get("reset_day")
+        if isinstance(stored_day, bool) or not isinstance(stored_day, int):
+            raise LedgerError(f"{self.path.name} has no valid reset_day")
+        if stored_ceiling != self.ceiling or stored_day != self.reset_day:
+            raise LedgerError(
+                f"{self.path.name} was created with a ceiling of {_plain(stored_ceiling)} USD and "
+                f"reset day {stored_day}, but this goal has {_plain(self.ceiling)} USD and day "
+                f"{self.reset_day}. The budget settings are global: monthly_budget_usd, "
+                "reserve_pct and budget_reset_day must be the same in "
+                "~/.config/baton/defaults.toml for every goal. Put them back, or, for a "
+                f"deliberate change, delete {self.path.name} and {self._lock_path().name} "
+                "(this forgets the spend so far)"
+            )
+
+    def _empty(self) -> dict:
+        period = self._period()[0].date().isoformat()
+        return {"period": period, "spent": Decimal(0), "reservations": {}, "exhausted": False}
 
     def _state(self) -> dict:
-        """The ledger as of the current period; a stored period that is over reads as empty. A
-        stored period in the future (the clock went back) is kept, never discarded."""
-        start, _ = self._period()
-        period = start.date().isoformat()
+        """The ledger as of the current period. When the stored period is over, spend and the
+        exhausted flag are forgotten, and only reservations young enough to belong to a round that
+        may still be running are carried over. A stored period in the future (the clock went back)
+        is kept, never discarded."""
+        period = self._period()[0].date().isoformat()
         state = self._read()
-        if state is None or state["period"] < period:
-            return {"period": period, "spent": Decimal(0), "reservations": {}, "exhausted": False}
+        if state is None:
+            return self._empty()
+        if state["period"] < period:
+            now = self._clock()
+            state = {
+                "period": period,
+                "spent": Decimal(0),
+                "reservations": {
+                    k: r
+                    for k, r in state["reservations"].items()
+                    if now - r["at"] < LIVE_RESERVATION_S
+                },
+                "exhausted": False,
+            }
         return state
 
     def _write(self, state: dict) -> None:
         text = json.dumps(
             {
+                "ceiling": format(self.ceiling, "f"),
+                "reset_day": self.reset_day,
                 "period": state["period"],
                 "spent": format(state["spent"], "f"),
-                "reservations": {k: format(v, "f") for k, v in state["reservations"].items()},
+                "reservations": {
+                    k: {"usd": format(r["usd"], "f"), "at": r["at"]}
+                    for k, r in state["reservations"].items()
+                },
                 "exhausted": state["exhausted"],
             },
             indent=2,
@@ -186,18 +272,36 @@ class Ledger:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
+        """Hold the exclusive lock. The first ever use creates the lock file and, before anyone
+        else can look, the ledger beside it (a short lock on the directory orders that): from then
+        on a lock file without a ledger can only mean the ledger was deleted."""
+        lock_path = self._lock_path()
+        dir_fd = lock_fd = -1
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            lock_path = self.path.with_name(self.path.name + ".lock")
-            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        except OSError as exc:
-            raise LedgerError(f"cannot lock {self.path.name}: {type(exc).__name__}") from None
-        try:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                dir_fd = os.open(self.path.parent, os.O_RDONLY)
+                fcntl.flock(dir_fd, fcntl.LOCK_EX)
+                try:
+                    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                    created = True
+                except FileExistsError:
+                    lock_fd = os.open(lock_path, os.O_RDWR)
+                    created = False
+                if created and not self.path.exists():
+                    self._write(self._empty())
+            except OSError as exc:
+                raise LedgerError(f"cannot lock {self.path.name}: {type(exc).__name__}") from None
+            finally:
+                if dir_fd >= 0:
+                    os.close(dir_fd)  # closing releases the directory lock
+                    dir_fd = -1
             with _PROCESS_LOCK:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 yield
         finally:
-            os.close(fd)  # closing releases the flock
+            if lock_fd >= 0:
+                os.close(lock_fd)  # closing releases the flock
 
     # the interface
 
@@ -208,7 +312,7 @@ class Ledger:
         base = state["spent"]
         if floor is not None:
             base = max(base, _amount(floor, "floor", positive=False))
-        return base + sum(state["reservations"].values(), Decimal(0))
+        return base + _reserved(state)
 
     def exhausted(self) -> bool:
         """True when the Console said the credit is gone, until the period rolls."""
@@ -225,12 +329,12 @@ class Ledger:
             if state["exhausted"]:
                 return None
             base = state["spent"] if floor is None else max(state["spent"], floor)
-            committed = base + sum(state["reservations"].values(), Decimal(0))
+            committed = base + _reserved(state)
             grant = min(usd, self.ceiling - committed).quantize(_CENTS, rounding=ROUND_DOWN)
             if grant < MIN_GRANT_USD:
                 return None
             reservation_id = uuid.uuid4().hex
-            state["reservations"][reservation_id] = grant
+            state["reservations"][reservation_id] = {"usd": grant, "at": self._clock()}
             self._write(state)
             return reservation_id, grant
 

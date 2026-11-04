@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from dataclasses import dataclass
@@ -51,6 +52,11 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 # What claude_api carries in AgentConfig without the goal file being able to set it.
 _CLAUDE_FIXED = {"threshold_pct": 95, "poll_s": 15, "full_access": True}
+
+
+# Budget settings shared by every goal: they live only in the defaults file, because the one
+# ledger they describe is shared too.
+GLOBAL_ONLY = ("monthly_budget_usd", "reserve_pct", "budget_reset_day")
 
 
 class GoalError(Exception):
@@ -194,9 +200,51 @@ def _load_agent(name: str, table: dict[str, Any]) -> AgentConfig:
     )
 
 
+def defaults_path() -> Path:
+    """`~/.config/baton/defaults.toml`, or the file `BATON_CONFIG` names."""
+    override = os.environ.get("BATON_CONFIG")
+    return Path(override).expanduser() if override else Path.home() / ".config/baton/defaults.toml"
+
+
+def load_defaults() -> dict[str, dict[str, Any]]:
+    """The `[agents.*]` overrides applied under every goal, as raw tables by agent name.
+
+    A missing file is no overrides. A file that cannot be read or has anything unknown or invalid
+    in it raises GoalError: settings that cannot be trusted are not guessed around. Money is
+    parsed as Decimal.
+    """
+    path = defaults_path()
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise GoalError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    try:
+        data = tomllib.loads(raw.decode("utf-8"), parse_float=Decimal)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise GoalError(f"invalid defaults file {path}: {exc}") from exc
+    try:
+        _check_keys(data, {"agents"}, "the defaults file")
+        agents = _table(data, "agents", "")
+        unknown = sorted(set(agents) - set(AGENT_NAMES))
+        if unknown:
+            raise GoalError(f"unknown agent in [agents]: {', '.join(unknown)}")
+        tables: dict[str, dict[str, Any]] = {}
+        for name, table in agents.items():
+            if not isinstance(table, dict):
+                raise GoalError(f"agents.{name} must be a table")
+            _load_agent(name, table)  # validates every value
+            tables[name] = table
+    except GoalError as exc:
+        raise GoalError(f"{path}: {exc}") from exc
+    return tables
+
+
 def default_agent(name: str) -> AgentConfig:
-    """An agent with every documented default, for commands that run without a goal file."""
-    return _load_agent(name, {})
+    """An agent with every documented default and the defaults file applied, for commands that
+    run without a goal file."""
+    return _load_agent(name, load_defaults().get(name, {}))
 
 
 def load_goal(path: Path) -> Goal:
@@ -256,12 +304,19 @@ def load_goal(path: Path) -> Goal:
     unknown = sorted(set(agents_table) - set(AGENT_NAMES))
     if unknown:
         raise GoalError(f"unknown agent in [agents]: {', '.join(unknown)}")
+    defaults = load_defaults()
     agents: dict[str, AgentConfig] = {}
     for agent in AGENT_NAMES:
         sub = agents_table.get(agent, {})
         if not isinstance(sub, dict):
             raise GoalError(f"agents.{agent} must be a table")
-        agents[agent] = _load_agent(agent, sub)
+        for key in GLOBAL_ONLY if agent == "claude_api" else ():
+            if key in sub:
+                raise GoalError(
+                    f"agents.{agent}.{key} is a global setting: put it in {defaults_path()}, "
+                    "not in a goal file"
+                )
+        agents[agent] = _load_agent(agent, {**defaults.get(agent, {}), **sub})
     if not any(agents[a].enabled for a in order_raw):
         raise GoalError("every agent in order is disabled; nothing could ever run")
 

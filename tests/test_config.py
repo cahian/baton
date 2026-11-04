@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from baton.config import GoalError, load_goal
+from baton.config import GoalError, default_agent, defaults_path, load_defaults, load_goal
 
 BASE = {
     "name": 'name = "demo"',
@@ -174,19 +174,30 @@ def test_claude_api_defaults_match_spec(tmp_path):
     assert cfg.admin_key_file == ""
 
 
-def test_claude_api_overrides_are_applied_as_decimals(tmp_path):
+def defaults(tmp_path, monkeypatch, text: str) -> Path:
+    """Write the defaults file that BATON_CONFIG points at."""
+    path = tmp_path / "defaults.toml"
+    path.write_text(text)
+    monkeypatch.setenv("BATON_CONFIG", str(path))
+    return path
+
+
+def test_claude_api_overrides_are_applied_as_decimals(tmp_path, monkeypatch):
+    defaults(
+        tmp_path,
+        monkeypatch,
+        "[agents.claude_api]\nmonthly_budget_usd = 150.55\nreserve_pct = 20\n"
+        "budget_reset_day = 31\n",
+    )
     text = minimal() + claude(
-        monthly_budget_usd="150.55",
-        reserve_pct=20,
         round_budget_usd=2.5,
-        budget_reset_day=31,
         key_file='"/k/key"',
         admin_key_file='"/k/admin"',
         model='"claude-sonnet-5-5"',
         effort='"max"',
         bin='"/opt/claude"',
         enabled="false",
-    ).replace('"150.55"', "150.55")
+    )
     cfg = load_goal(write(tmp_path, text)).agents["claude_api"]
     assert cfg.monthly_budget_usd == Decimal("150.55")  # exactly, not through a float
     assert cfg.round_budget_usd == Decimal("2.5")
@@ -201,23 +212,117 @@ def test_claude_api_overrides_are_applied_as_decimals(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "key", ["monthly_budget_usd = 100", "reserve_pct = 20", "budget_reset_day = 15"]
+)
+def test_budget_settings_are_rejected_in_a_goal_file(tmp_path, key):
+    """They describe the one shared ledger: a goal that sets its own wipes the others' spend."""
+    with pytest.raises(GoalError, match=r"defaults\.toml") as err:
+        load_goal(write(tmp_path, minimal() + f"[agents.claude_api]\n{key}\n"))
+    assert key.split(" ")[0] in str(err.value)
+
+
+def test_budget_settings_in_defaults_apply_to_every_goal(tmp_path, monkeypatch):
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\nbudget_reset_day = 15\n")
+    first = load_goal(write(tmp_path, minimal())).agents["claude_api"]
+    other = tmp_path / "other"
+    other.mkdir()
+    second = load_goal(write(other, minimal().replace("demo", "second"))).agents["claude_api"]
+    assert first.budget_reset_day == second.budget_reset_day == 15
+
+
+def test_a_goal_overrides_defaults_for_everything_but_the_budget(tmp_path, monkeypatch):
+    defaults(
+        tmp_path,
+        monkeypatch,
+        '[agents.claude_api]\nmodel = "claude-sonnet-5-5"\nround_budget_usd = 20\n'
+        "[agents.codex]\nthreshold_pct = 70\n",
+    )
+    goal = load_goal(write(tmp_path, minimal() + claude(round_budget_usd=7)))
+    assert goal.agents["claude_api"].model == "claude-sonnet-5-5"  # from the defaults
+    assert goal.agents["claude_api"].round_budget_usd == Decimal("7")  # the goal wins
+    assert goal.agents["codex"].threshold_pct == 70
+
+
+def test_no_defaults_file_is_no_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "missing.toml"))
+    assert load_defaults() == {}
+    assert default_agent("claude_api").budget_reset_day == 1
+
+
+def test_load_defaults_returns_the_tables_by_agent(tmp_path, monkeypatch):
+    defaults(
+        tmp_path,
+        monkeypatch,
+        "[agents.claude_api]\nmonthly_budget_usd = 300\n[agents.antigravity]\npoll_s = 60\n",
+    )
+    found = load_defaults()
+    assert set(found) == {"claude_api", "antigravity"}
+    assert found["claude_api"]["monthly_budget_usd"] == 300
+    assert default_agent("claude_api").monthly_budget_usd == Decimal("300")
+    assert default_agent("antigravity").poll_s == 60
+
+
+def test_the_defaults_file_defaults_to_the_config_dir(tmp_path, monkeypatch):
+    monkeypatch.delenv("BATON_CONFIG")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert defaults_path() == tmp_path / ".config/baton/defaults.toml"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[agents.claude_api]\nmonthly_budget_usd = 0\n",
+        "[agents.claude_api]\nmonthly_budget_usd = -5\n",
+        "[agents.claude_api]\nmonthly_budget_usd = nan\n",
+        "[agents.claude_api]\nmonthly_budget_usd = inf\n",
+        '[agents.claude_api]\nmonthly_budget_usd = "200"\n',
+        "[agents.claude_api]\nmonthly_budget_usd = true\n",
+        "[agents.claude_api]\nreserve_pct = 0\n",
+        "[agents.claude_api]\nreserve_pct = 100\n",
+        "[agents.claude_api]\nreserve_pct = 10.5\n",
+        "[agents.claude_api]\nround_budget_usd = 0\n",
+        "[agents.claude_api]\nround_budget_usd = -1\n",
+        "[agents.claude_api]\nround_budget_usd = nan\n",
+        "[agents.claude_api]\nbudget_reset_day = 0\n",
+        "[agents.claude_api]\nbudget_reset_day = 32\n",
+        "[agents.claude_api]\nbudget_reset_day = 1.5\n",
+        '[agents.claude_api]\nkey_file = ""\n',
+        "[agents.claude_api]\nadmin_key_file = 5\n",
+        "[agents.claude_api]\nthreshold_pct = 90\n",
+        "[agents.claude_api]\npoll_s = 15\n",
+        "[agents.claude_api]\nfull_access = false\n",
+        "[agents.claude_api]\ntypo = 1\n",
+        "[agents.codex]\nmonthly_budget_usd = 5\n",
+        "[agents.nope]\nenabled = true\n",
+        "[agents.claude_api]\nenabled = 1\n",
+        'agents = "x"\n',
+        "[other]\nx = 1\n",
+        "name = ",
+    ],
+)
+def test_invalid_defaults_raise(tmp_path, monkeypatch, text):
+    path = defaults(tmp_path, monkeypatch, text)
+    with pytest.raises(GoalError, match="defaults.toml"):
+        load_defaults()
+    with pytest.raises(GoalError):
+        load_goal(write(tmp_path, minimal()))
+    with pytest.raises(GoalError):
+        default_agent("codex")
+    assert path.exists()
+
+
+def test_an_unreadable_defaults_file_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("BATON_CONFIG", str(tmp_path))  # a directory
+    with pytest.raises(GoalError):
+        load_defaults()
+
+
+@pytest.mark.parametrize(
     "fields",
     [
-        {"monthly_budget_usd": 0},
-        {"monthly_budget_usd": -5},
-        {"monthly_budget_usd": "nan"},
-        {"monthly_budget_usd": "inf"},
-        {"monthly_budget_usd": '"200"'},
-        {"monthly_budget_usd": "true"},
-        {"reserve_pct": 0},
-        {"reserve_pct": 100},
-        {"reserve_pct": 10.5},
         {"round_budget_usd": 0},
         {"round_budget_usd": -1},
         {"round_budget_usd": "nan"},
-        {"budget_reset_day": 0},
-        {"budget_reset_day": 32},
-        {"budget_reset_day": 1.5},
         {"key_file": '""'},
         {"admin_key_file": "5"},
         {"threshold_pct": 90},
@@ -248,12 +353,15 @@ def test_claude_fields_are_rejected_on_other_agents(tmp_path, agent, field):
         load_goal(write(tmp_path, minimal() + f"[agents.{agent}]\n{field}\n"))
 
 
-def test_bounds_of_claude_api_values_are_accepted(tmp_path):
-    text = minimal() + claude(
-        monthly_budget_usd="0.01", reserve_pct=1, round_budget_usd="0.01", budget_reset_day=31
-    ).replace('"0.01"', "0.01")
-    load_goal(write(tmp_path, text))
-    load_goal(write(tmp_path, minimal() + claude(reserve_pct=99, budget_reset_day=1)))
+def test_bounds_of_claude_api_values_are_accepted(tmp_path, monkeypatch):
+    defaults(
+        tmp_path,
+        monkeypatch,
+        "[agents.claude_api]\nmonthly_budget_usd = 0.01\nreserve_pct = 1\nbudget_reset_day = 31\n",
+    )
+    load_goal(write(tmp_path, minimal() + claude(round_budget_usd=0.01)))
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\nreserve_pct = 99\nbudget_reset_day = 1\n")
+    load_goal(write(tmp_path, minimal()))
 
 
 def test_claude_api_can_be_the_only_agent(tmp_path):

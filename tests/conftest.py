@@ -49,6 +49,13 @@ def agy_credits(balance="0") -> str:
     return f"Remaining credits\t{balance}\n"
 
 
+@pytest.fixture(autouse=True)
+def isolated_baton_files(tmp_path, monkeypatch):
+    """No test reads the real defaults file or touches the real spend ledger."""
+    monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "config" / "defaults.toml"))
+    monkeypatch.setenv("BATON_LEDGER", str(tmp_path / "ledger" / "claude-spend.json"))
+
+
 class Fakes:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -63,6 +70,8 @@ class Fakes:
         self.agy_usage_file = root / "agy-usage.txt"
         self.agy_credits_file = root / "agy-credits.txt"
         self.state = root / "state"
+        self.ledger_file = root / "ledger" / "claude-spend.json"
+        self.defaults_file = root / "config" / "defaults.toml"
         self.work = root / "work"
 
     def codex_scenario(self, *entries) -> None:
@@ -87,6 +96,10 @@ class Fakes:
 
     def claude_calls(self) -> list:
         return self._lines(self.claude_calls_file)
+
+    def defaults(self, text: str) -> None:
+        self.defaults_file.parent.mkdir(parents=True, exist_ok=True)
+        self.defaults_file.write_text(text)
 
     def claude_key(self, key: str, mode: int = 0o600) -> None:
         self.claude_key_file.write_text(key + "\n")

@@ -415,7 +415,7 @@ def test_build_adapters_adds_claude_api_only_when_enabled(fakes):
     adapter = on["claude_api"]
     assert isinstance(adapter, ClaudeApiAdapter)
     assert adapter._cost_report is None  # no admin key file
-    assert adapter.ledger.path == fakes.state / "claude-spend.json"  # shared by every goal
+    assert adapter.ledger.path == fakes.ledger_file  # one ledger for every goal
     assert adapter.ceiling == 180
 
 

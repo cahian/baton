@@ -862,3 +862,62 @@ def test_extra_env_values_are_redacted_from_log_and_lines(tmp_path):
     assert secret not in ctx.log_path.read_text()
     assert secret not in "".join(shown + parsed) and secret not in ex.tail
     assert "key=[redacted]" in shown and "again [redacted]" in shown
+
+
+def test_a_secret_split_across_two_chunks_is_still_redacted(tmp_path):
+    secret = "sk-ant-api03-SPLITSPLITSPLIT"
+    # one line, longer than the 64 KB chunk, with the secret straddling the cut
+    code = (
+        "import os, sys\n"
+        "k = os.environ['K']\n"
+        "sys.stdout.write('A' * (65536 - 10) + k + 'B' * 100 + '\\n')\n"
+        "sys.stdout.write('after\\n')\n"
+    )
+    ctx = make_ctx(tmp_path)
+    shown, parsed = [], []
+    ctx.on_output = shown.append
+    ex = run_streaming(
+        py(code),
+        tmp_path,
+        None,
+        ctx,
+        lambda line: parsed.append(line) and None,
+        lambda: None,
+        extra_env={"K": secret},
+    )
+    log = ctx.log_path.read_text()
+    assert secret not in log and "SPLITSPLIT" not in log
+    assert "[redacted]" in log
+    assert "SPLITSPLIT" not in "".join(shown + parsed) + ex.tail
+    assert log.count("A") == 65536 - 10 and log.count("B") == 100  # nothing else was lost
+    assert "after" in parsed
+
+
+def test_a_cut_line_without_a_secret_arrives_whole_and_in_order(tmp_path):
+    ctx = make_ctx(tmp_path)
+    parsed = []
+    run_streaming(
+        py("import sys; sys.stdout.write('x' * 200000 + '\\nend\\n')"),
+        tmp_path,
+        None,
+        ctx,
+        lambda line: parsed.append(line) and None,
+        lambda: None,
+        extra_env={"K": "sk-ant-api03-NOTPRINTED"},
+    )
+    assert "".join(parsed[:-1]) == "x" * 200000 and parsed[-1] == "end"
+    assert ctx.log_path.read_text() == "x" * 200000 + "\nend\n"
+
+
+def test_the_held_back_end_of_an_unfinished_last_line_still_reaches_the_log(tmp_path):
+    ctx = make_ctx(tmp_path)
+    run_streaming(
+        py("import sys; sys.stdout.write('y' * 65536)"),  # exactly one chunk, no newline, then EOF
+        tmp_path,
+        None,
+        ctx,
+        never,
+        lambda: None,
+        extra_env={"K": "sk-ant-api03-NOTPRINTED"},
+    )
+    assert ctx.log_path.read_text() == "y" * 65536

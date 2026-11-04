@@ -266,8 +266,8 @@ def test_claude_doctor_never_prints_the_key(fakes, capsys):
 def test_claude_doctor_never_runs_a_round_or_creates_the_ledger(fakes):
     claude(fakes)
     assert fakes.claude_calls() == []
-    assert not (fakes.state / "claude-spend.json").exists()
-    assert not (fakes.state / "claude-spend.json.lock").exists()
+    assert not fakes.ledger_file.exists()
+    assert not fakes.ledger_file.with_name("claude-spend.json.lock").exists()
 
 
 def test_stray_anthropic_variables_are_flagged(fakes, monkeypatch):
@@ -320,8 +320,8 @@ def test_claude_at_the_ceiling_is_a_warning(fakes):
 
 
 def test_claude_corrupt_ledger_is_flagged_and_kept(fakes):
-    fakes.state.mkdir(parents=True)
-    ledger = fakes.state / "claude-spend.json"
+    fakes.ledger_file.parent.mkdir(parents=True)
+    ledger = fakes.ledger_file
     ledger.write_text("{garbage")
     spend = check(claude(fakes), "claude_api spend")
     assert not spend.ok and "claude-spend.json" in spend.detail
@@ -365,3 +365,26 @@ def test_claude_disabled_is_not_checked(fakes):
     checks = run(fakes, claude="enabled = false\n")
     assert "disabled" in check(checks, "claude_api binary").detail
     assert not [c for c in checks if c.name.startswith("claude_api") and "binary" not in c.name]
+
+
+def test_claude_ledger_with_other_budget_settings_is_flagged_with_a_way_out(fakes):
+    from baton.ledger import Ledger
+
+    Ledger(fakes.ledger_file, Decimal("360"), 15).reserve(Decimal("10"))
+    spend = check(claude(fakes), "claude_api spend")
+    assert not spend.ok and "defaults.toml" in spend.detail and "360" in spend.detail
+
+
+def test_claude_deleted_ledger_is_flagged(fakes):
+    claude_ledger(fakes, spent="20")
+    fakes.ledger_file.unlink()
+    spend = check(claude(fakes), "claude_api spend")
+    assert not spend.ok and "deleted" in spend.detail
+    assert not fakes.ledger_file.exists()
+
+
+def test_doctor_reads_the_budget_from_the_defaults_file(fakes):
+    fakes.defaults("[agents.claude_api]\nmonthly_budget_usd = 100\nreserve_pct = 20\n")
+    spend = check(claude(fakes), "claude_api spend")
+    assert "80" in spend.detail and "budget 100" in spend.detail and "20%" in spend.detail
+    assert "spend limit of 80 USD" in check(claude(fakes), "claude_api console").detail

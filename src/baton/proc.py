@@ -304,11 +304,19 @@ def run_streaming(
     eof = False
     last_output = time.monotonic()
     logged_after_stop = 0
+    held = b""  # the end of a cut line, not yet written: see record()
 
     def record(chunk: bytes) -> str:
-        nonlocal tail
+        nonlocal tail, held
+        cut = len(chunk) >= MAX_LINE_BYTES and not chunk.endswith(b"\n")
+        chunk, held = held + chunk, b""
         for secret in secrets:
             chunk = chunk.replace(secret, REDACTED)
+        if secrets and cut:
+            # A line is cut into 64 KB chunks and a secret can straddle the cut: keep back the
+            # last bytes that could be the start of one, and look at them again with the next.
+            keep = max(len(x) for x in secrets) - 1
+            chunk, held = chunk[:-keep], chunk[-keep:]
         _log_quietly(log.write, chunk)
         line = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
         tail = (tail + line + "\n")[-TAIL_CHARS:]
@@ -410,6 +418,8 @@ def run_streaming(
                 child.stdout.close()
             except (OSError, ValueError):
                 pass
+        if held:  # the end of a last line that never got its next chunk: too short to be a secret
+            _log_quietly(log.write, held)
         _log_quietly(log.close)
 
     return Exit(returncode=returncode, stopped=stopped, timed_out=timed_out, tail=tail)

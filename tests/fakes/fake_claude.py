@@ -7,6 +7,7 @@ does: "ANTHROPIC_API_KEY" when that variable is set, "none" otherwise, unless ov
   FAKE_CLAUDE_API_KEY_SOURCE  overrides apiKeySource
   FAKE_CLAUDE_NO_INIT         no init event
   FAKE_CLAUDE_ASSISTANT_FIRST an assistant event before the init event
+  FAKE_CLAUDE_NO_ASSISTANT    no assistant event at all
   FAKE_CLAUDE_TEXT            text of the assistant message (default "working on it")
   FAKE_CLAUDE_ECHO_KEY        also prints the API key inside the assistant text
   FAKE_CLAUDE_SLEEP           seconds to stay alive before the result event
@@ -16,6 +17,12 @@ does: "ANTHROPIC_API_KEY" when that variable is set, "none" otherwise, unless ov
   FAKE_CLAUDE_SUBTYPE         result subtype (default success)
   FAKE_CLAUDE_RESUME_FAIL     with --resume: complain on stderr and exit 1 before any event
   FAKE_CLAUDE_EXIT            exit code (default 0)
+  FAKE_CLAUDE_STDERR          a short line on stderr before any event
+  FAKE_CLAUDE_EARLY_EXIT      exit with this code right away, before any event
+  FAKE_CLAUDE_EARLY_BYTES     before exiting early, print one line of this many "x" characters
+  FAKE_CLAUDE_BIG_WRITE       after init, an assistant event whose tool input is this many
+                              characters of text full of billing words, then a crash (exit 1,
+                              no result)
   FAKE_CLAUDE_PIDFILE         gets the pid
 """
 
@@ -46,6 +53,14 @@ def main() -> None:
         }
         with open(env["FAKE_CLAUDE_CALLS"], "a") as fh:
             fh.write(json.dumps(record) + "\n")
+    if env.get("FAKE_CLAUDE_STDERR"):
+        sys.stderr.write(env["FAKE_CLAUDE_STDERR"] + "\n")
+        sys.stderr.flush()
+    if env.get("FAKE_CLAUDE_EARLY_BYTES"):
+        sys.stdout.write("x" * int(env["FAKE_CLAUDE_EARLY_BYTES"]) + "\n")
+        sys.stdout.flush()
+    if env.get("FAKE_CLAUDE_EARLY_EXIT"):
+        sys.exit(int(env["FAKE_CLAUDE_EARLY_EXIT"]))
     session = env.get("FAKE_CLAUDE_SESSION_ID", "sess-1")
     if "--resume" in argv:
         if env.get("FAKE_CLAUDE_RESUME_FAIL"):
@@ -76,8 +91,22 @@ def main() -> None:
                 "cwd": os.getcwd(),
             }
         )
-    if not env.get("FAKE_CLAUDE_ASSISTANT_FIRST"):
+    if not env.get("FAKE_CLAUDE_ASSISTANT_FIRST") and not env.get("FAKE_CLAUDE_NO_ASSISTANT"):
         emit(assistant)
+    if env.get("FAKE_CLAUDE_BIG_WRITE"):
+        words = "Credit balance is too low, billing error, spend limit reached. "
+        blob = (words * (int(env["FAKE_CLAUDE_BIG_WRITE"]) // len(words) + 1))[
+            : int(env["FAKE_CLAUDE_BIG_WRITE"])
+        ]
+        emit(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "name": "Write", "input": {"content": blob}}]
+                },
+            }
+        )
+        sys.exit(1)
     time.sleep(float(env.get("FAKE_CLAUDE_SLEEP", "0")))
     if not env.get("FAKE_CLAUDE_NO_RESULT"):
         is_error = bool(env.get("FAKE_CLAUDE_IS_ERROR"))

@@ -264,11 +264,27 @@ def test_failed_fresh_round_is_not_a_failed_resume(env, monkeypatch):
     assert result.outcome == TRANSIENT and result.resume_failed is False
 
 
-def test_an_error_result_on_resume_sets_resume_failed(env, monkeypatch):
+def test_an_error_before_any_init_on_resume_sets_resume_failed(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_INIT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "No conversation found")
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "0")
+    result = run(env, session_id="abc")
+    assert result.outcome == TRANSIENT and result.resume_failed is True
+
+
+def test_a_failure_after_a_confirmed_init_is_not_a_failed_resume(env, monkeypatch):
+    """The session loaded and the key was confirmed: whatever went wrong later is not the resume,
+    and a fresh retry would repeat work that already happened."""
     monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
     monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "something odd happened")
     result = run(env, session_id="abc")
-    assert result.outcome == TRANSIENT and result.resume_failed is True
+    assert result.outcome == TRANSIENT and result.resume_failed is False
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")  # and a crash after init is the same
+    monkeypatch.setenv("FAKE_CLAUDE_EXIT", "1")
+    result = run(env, session_id="abc")
+    assert result.outcome == TRANSIENT and result.resume_failed is False
 
 
 # --- the key travels alone -------------------------------------------------------------------
@@ -313,7 +329,7 @@ def test_key_never_in_log_events_or_state(fakes, monkeypatch):
     goal = fakes.goal(claude="", order=("claude_api",))
     assert main(["run", str(goal)]) == 0
     haystack = []
-    for base in (fakes.state, fakes.work):
+    for base in (fakes.state, fakes.work, fakes.ledger_file.parent):
         for path in base.rglob("*"):
             if path.is_file():
                 haystack.append((path, path.read_bytes()))
@@ -409,8 +425,9 @@ def test_a_live_reservation_counts_against_availability(env):
 
 
 def test_round_budget_below_the_minimum_grant_is_unavailable(env):
-    avail = make_adapter(env, round_budget_usd=Decimal("0.50")).availability()
-    assert not avail.ok and "1" in avail.reason
+    avail = make_adapter(env, round_budget_usd=Decimal("4.99")).availability()
+    assert not avail.ok and "5 USD" in avail.reason
+    assert make_adapter(env, round_budget_usd=Decimal("5")).availability().ok
 
 
 def test_corrupt_ledger_is_unavailable_and_kept(env):
@@ -449,6 +466,21 @@ def test_cost_report_larger_than_ledger_wins(env):
     run(env, adapter)
     assert env.calls()[0]["argv"][-1] == "5.00"  # the round is shrunk to what the report leaves
     assert not make_adapter(env, cost_report=lambda: Decimal("180")).availability().ok
+
+
+def test_less_than_five_dollars_left_is_unavailable_until_next_period(env):
+    env.ledger.settle("x", Decimal("175.01"))  # 4.99 left
+    avail = make_adapter(env).availability()
+    assert not avail.ok and avail.until == NEXT_PERIOD
+    assert run(env).outcome == LIMIT and env.calls() == []
+    assert not make_adapter(env, cost_report=lambda: Decimal("175.01")).availability().ok
+
+
+def test_exactly_five_dollars_left_runs_a_five_dollar_round(env):
+    env.ledger.settle("x", Decimal("175"))
+    assert make_adapter(env).availability().ok
+    assert run(env).outcome == COMPLETED
+    assert env.calls()[0]["argv"][-1] == "5.00"
 
 
 def test_cost_report_smaller_than_ledger_never_lowers_it(env):
@@ -550,7 +582,8 @@ def test_api_key_source_other_than_key_stops_round(env, monkeypatch):
     pid = int(env.pidfile.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)  # the group was killed, it did not run for 30 s
-    assert env.ledger.spent() == Decimal("10.00")  # killed before any result: full reservation
+    # the wrong-source init came before any API call: nothing was spent, nothing stays reserved
+    assert env.ledger.spent() == 0
 
 
 def test_an_event_before_init_stops_the_round(env, monkeypatch):
@@ -558,6 +591,7 @@ def test_an_event_before_init_stops_the_round(env, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
     result = run(env)
     assert result.outcome == CREDIT_GUARD and "init" in result.reason
+    assert env.ledger.spent() == Decimal("10.00")  # the model was already talking: it stays
 
 
 def test_no_init_at_all_is_not_a_clean_round(env, monkeypatch):
@@ -857,3 +891,126 @@ def test_signal_is_not_swallowed(env, monkeypatch):
     with pytest.raises(Stop):
         run(env)
     assert env.ledger.spent() == Decimal("10.00")
+
+
+# --- a round that never reached the API ------------------------------------------------------
+
+
+def test_a_broken_binary_cannot_burn_the_ceiling(env, monkeypatch):
+    """18 failing rounds used to reserve 180 USD for nothing and lock Claude out for the month."""
+    monkeypatch.setenv("FAKE_CLAUDE_EARLY_EXIT", "127")
+    monkeypatch.setenv("FAKE_CLAUDE_STDERR", "claude: broken installation")
+    adapter = make_adapter(env)
+    for _ in range(25):
+        result = run(env, adapter)
+        assert result.outcome == TRANSIENT and "exited before the init event" in result.reason
+    assert env.ledger.spent() == 0
+    assert adapter.availability().ok
+    assert len(env.calls()) == 25
+
+
+def test_a_pre_init_exit_with_a_huge_output_keeps_the_reservation(env, monkeypatch):
+    """A 64 KB chunk is real output: not proof that nothing happened."""
+    monkeypatch.setenv("FAKE_CLAUDE_EARLY_BYTES", "70000")
+    monkeypatch.setenv("FAKE_CLAUDE_EARLY_EXIT", "1")
+    run(env)
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_a_pre_init_timeout_keeps_the_reservation(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_INIT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    assert run(env, round_max_s=1).outcome == TIMEOUT
+    assert env.ledger.spent() == Decimal("10.00")  # it may have been mid-call
+
+
+def test_a_stop_before_any_event_keeps_the_reservation(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_INIT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    run(env, should_kill=lambda: True)
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_a_cost_after_a_pre_init_result_is_charged(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_INIT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "2.5")
+    run(env)
+    assert env.ledger.spent() == Decimal("2.5")
+
+
+# --- error text: structured fields and the process's own stderr only -------------------------
+
+
+def test_billing_words_inside_a_big_event_before_a_crash_are_not_a_refusal(env, monkeypatch):
+    """A 200 KB file the agent wrote, full of billing words, then a crash: that is agent output."""
+    monkeypatch.setenv("FAKE_CLAUDE_BIG_WRITE", "200000")
+    adapter = make_adapter(env)
+    result = run(env, adapter)
+    assert result.outcome == TRANSIENT and result.until is None
+    assert not env.ledger.exhausted()
+    assert adapter.availability().ok
+    assert env.ledger.spent() == Decimal("10.00")  # it did work: the reservation stays
+
+
+def test_billing_words_in_a_long_stderr_line_are_not_a_refusal(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_STDERR", "credit balance billing " + "padding " * 60)
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_EXIT", "1")
+    assert run(env).outcome == TRANSIENT
+    assert not env.ledger.exhausted()
+
+
+def test_a_short_stderr_line_after_init_is_still_a_refusal(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_STDERR", "Error: Credit balance is too low")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_EXIT", "1")
+    result = run(env)
+    assert result.outcome == LIMIT and result.until == NEXT_PERIOD
+    assert env.ledger.exhausted()
+
+
+def test_a_short_stderr_line_before_init_is_still_a_refusal(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_STDERR", "Error: Credit balance is too low")
+    monkeypatch.setenv("FAKE_CLAUDE_EARLY_EXIT", "1")
+    assert run(env).outcome == LIMIT
+
+
+# --- one ledger, global settings, no silent reset --------------------------------------------
+
+
+def test_ledger_for_uses_the_global_path_and_the_budget_settings(env, monkeypatch):
+    from baton.ledger import default_path
+
+    cfg = make_cfg(env, monthly_budget_usd=Decimal("100"), reserve_pct=20, budget_reset_day=15)
+    ledger = claude_api.ledger_for(cfg)
+    assert ledger.path == default_path() == Path(os.environ["BATON_LEDGER"])
+    assert ledger.ceiling == Decimal("80") and ledger.reset_day == 15
+    assert claude_api.ledger_for(make_cfg(env)).ceiling == Decimal("180")
+
+
+def test_a_goal_with_other_budget_settings_is_unavailable_with_a_way_out(env):
+    other = Ledger(env.ledger.path, Decimal("360"), 15, lambda: NOW)
+    other.reserve(Decimal("10"))
+    before = env.ledger.path.read_text()
+    adapter = make_adapter(env)
+    avail = adapter.availability()
+    assert not avail.ok and "defaults.toml" in avail.reason and "360" in avail.reason
+    result = run(env, adapter)
+    assert result.outcome == LIMIT and env.calls() == []
+    assert env.ledger.path.read_text() == before  # nothing wiped
+
+
+def test_a_deleted_ledger_makes_claude_unavailable(env):
+    adapter = make_adapter(env)
+    run(env, adapter)
+    env.ledger.path.unlink()
+    avail = adapter.availability()
+    assert not avail.ok and "deleted" in avail.reason
+    calls = len(env.calls())
+    assert run(env, adapter).outcome == LIMIT and len(env.calls()) == calls
+    assert not env.ledger.path.exists()
