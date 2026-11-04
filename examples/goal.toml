@@ -1,0 +1,41 @@
+# A goal file. Run it with:  baton run examples/goal.toml
+# Only name, workdir and objective are required; everything else shows its default.
+
+name = "example"
+workdir = "/path/to/project"
+objective = "Make the build pass on all platforms."
+
+# Rotation order. The first entry starts; when the last runs out it wraps to the first available.
+order = ["claude_api", "antigravity", "codex"]
+round_max_s = 3600   # one round may not run longer than this
+idle_s = 1200        # nor stay silent longer than this
+snapshot = true      # commit uncommitted work locally after each round (never pushes)
+
+# The gate. The goal is finished only when this exits 0. Without it, the goal is finished as
+# soon as one round completes.
+[verify]
+command = "./check.sh"
+timeout_s = 3600
+
+[agents.codex]
+enabled = true
+model = "gpt-6.1-sol"
+effort = "medium"
+threshold_pct = 90   # stop at this percent used of every window
+poll_s = 15
+full_access = true   # false: --sandbox workspace-write instead of bypassing the sandbox
+
+[agents.antigravity]
+enabled = true
+model = "gemini-4-argon-medium"   # the effort is part of the model id
+threshold_pct = 90
+poll_s = 30
+
+# The Claude budget (monthly_budget_usd, reserve_pct, budget_reset_day) is global: it lives in
+# ~/.config/baton/defaults.toml and is refused here.
+[agents.claude_api]
+enabled = true
+model = "claude-opus-5-5"
+effort = "medium"
+round_budget_usd = 10
+key_file = "~/.config/baton/anthropic.key"

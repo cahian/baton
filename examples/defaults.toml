@@ -1,0 +1,27 @@
+# Copy to ~/.config/baton/defaults.toml. These [agents.*] tables apply under every goal, and a
+# goal file may override any of them except the three budget settings, which only live here.
+
+[agents.claude_api]
+enabled = true
+model = "claude-opus-5-5"
+effort = "medium"
+# One budget for every goal, because they all spend the same Console credit.
+monthly_budget_usd = 200   # what the organization holds
+reserve_pct = 10           # kept back; the spend ceiling is 200 - 10% = 180
+budget_reset_day = 1       # day of the month the period starts, 00:00 UTC
+round_budget_usd = 10      # most one round may spend
+key_file = "~/.config/baton/anthropic.key"   # must be a regular file, mode 600
+admin_key_file = ""        # optional: an Admin API key file, to cross-check spend with the Console
+
+[agents.antigravity]
+enabled = true
+model = "gemini-4-argon-medium"
+threshold_pct = 90
+poll_s = 30
+
+[agents.codex]
+enabled = true
+model = "gpt-6.1-sol"
+effort = "medium"
+threshold_pct = 90
+poll_s = 15
