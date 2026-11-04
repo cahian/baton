@@ -17,6 +17,7 @@ from baton.adapters.base import (
     RoundResult,
 )
 from baton.config import load_goal
+from baton.proc import process_start
 from baton.runner import build_prompt, run_gate, run_goal, snapshot_work
 from baton.store import AlreadyRunning, StateError, Store
 
@@ -525,7 +526,9 @@ def test_stray_process_group_is_killed_on_start(go, agents, work, store):
     # In real life the stray is nobody's child; reap it here so it does not linger as a zombie.
     threading.Thread(target=stray.wait, daemon=True).start()
     try:
-        store.save_state({"group": stray.pid, "workdir": str(work)})
+        store.save_state(
+            {"group": stray.pid, "group_start": process_start(stray.pid), "workdir": str(work)}
+        )
         (work / "DONE").write_text("x")
         assert go() == 0
         assert stray.wait(timeout=15) is not None
@@ -533,6 +536,62 @@ def test_stray_process_group_is_killed_on_start(go, agents, work, store):
     finally:
         if stray.poll() is None:
             stray.kill()
+
+
+def _stray(work, store, **state):
+    stray = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    threading.Thread(target=stray.wait, daemon=True).start()
+    store.save_state({"group": stray.pid, "workdir": str(work), **state})
+    return stray
+
+
+def test_a_live_group_that_cannot_be_verified_is_neither_killed_nor_forgotten(
+    go, agents, work, store
+):
+    # No start time was recorded (ps failed at spawn, or old state): unknown means stop.
+    stray = _stray(work, store)
+    try:
+        store.request_stop()  # so the retry loop ends after the first refusal
+        assert go() == 0
+        assert stray.poll() is None, "an unverified group was killed"
+        assert store.load_state()["group"] == stray.pid, "the record was forgotten"
+        assert agents["codex"].prompts == [] and agents["antigravity"].prompts == []
+        kinds = [e for e in store.events() if e["kind"] == "alert"]
+        assert any("could not be verified" in e["message"] for e in kinds)
+    finally:
+        stray.kill()
+
+
+def test_an_unverifiable_group_blocks_every_attempt_until_it_is_gone(go, agents, work, store):
+    stray = _stray(work, store)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            stray.kill()  # it dies; the record is then dead and cleared
+            stray.wait()
+
+    try:
+        (work / "DONE").write_text("x")
+        assert go(sleep=sleep) == 0
+        assert len(sleeps) >= 3 and sleeps[0] > 0
+        assert store.load_state()["group"] is None
+    finally:
+        if stray.poll() is None:
+            stray.kill()
+
+
+def test_a_recycled_group_number_is_forgotten_without_killing(go, agents, work, store):
+    stray = _stray(work, store, group_start="Mon Jan  1 00:00:00 2001")
+    try:
+        (work / "DONE").write_text("x")
+        assert go() == 0
+        assert stray.poll() is None
+        assert store.load_state()["group"] is None
+        assert any("another process" in e.get("message", "") for e in store.events())
+    finally:
+        stray.kill()
 
 
 def test_group_is_recorded_while_running_and_cleared_after(go, agents, work, store):

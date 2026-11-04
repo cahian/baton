@@ -184,3 +184,10 @@ def test_interrupt_is_taken_once(st):
     st.request_interrupt()
     assert st.take_interrupt() is True
     assert st.take_interrupt() is False
+
+
+def test_lock_file_is_emptied_on_release(tmp_path):
+    store = Store(tmp_path / "s")
+    with store.lock():
+        assert (store.root / "lock").read_text().strip() == str(os.getpid())
+    assert (store.root / "lock").read_text() == ""

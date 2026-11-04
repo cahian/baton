@@ -321,6 +321,9 @@ def _evaluate(reading: Reading, threshold_pct: int, now: float) -> Eval:
     )
 
 
+evaluate = _evaluate  # public name for callers that need the verdict
+
+
 def classify(text: str, now: float) -> RoundResult | None:
     """A vendor refusal read from error text: `auth`, `limit`, or None when it is neither.
 

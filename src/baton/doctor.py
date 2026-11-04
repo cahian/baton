@@ -144,10 +144,10 @@ def _codex_limits(cfg: AgentConfig, now: float) -> Check:
     name = "codex limits"
     try:
         result = codex.read_limits(cfg.bin)
-        avail = codex.check_limits(result, cfg.threshold_pct, now)
+        verdict = codex.evaluate(result, cfg.threshold_pct, now)
     except Exception as exc:
         return Check(name, False, True, f"cannot read limits (not logged in?): {exc}")
-    usage = avail.usage
+    avail, usage = verdict.avail, verdict.avail.usage
     limits = result.get("rateLimits") if isinstance(result, dict) else None
     parts = []
     for window in ("primary", "secondary"):
@@ -162,33 +162,35 @@ def _codex_limits(cfg: AgentConfig, now: float) -> Check:
     detail = "; ".join(parts) or "no windows reported"
     if avail.ok:
         return Check(name, True, True, detail)
-    # Readable but not usable right now. That is the quota doing its job, not a setup problem,
-    # unless the data itself was unreadable.
-    blocking = "unreadable" in avail.reason or "missing" in avail.reason
-    return Check(name, False, blocking, f"{detail}; not usable now: {avail.reason}")
+    # Not usable right now. A refusal is the quota doing its job; data baton cannot read (a bad
+    # balance, a missing window) means it could not guard a round, which is a blocking problem.
+    return Check(name, False, verdict.blind, f"{detail}; not usable now: {avail.reason}")
 
 
 def _antigravity_limits(cfg: AgentConfig, now: float) -> Check:
     name = "antigravity limits"
-    try:
-        usage_text = antigravity.read_text(cfg.bin, "/usage")
-        credits_text = antigravity.read_text(cfg.bin, "/credits")
-        rows = antigravity.parse_usage(usage_text)
-        balance = antigravity.parse_credits(credits_text)
-        avail = antigravity.check_usage(rows, cfg.threshold_pct, now)
-    except Exception as exc:
-        return Check(name, False, True, f"cannot read limits (not logged in?): {exc}")
+
+    def read(command: str) -> str | Exception:
+        try:
+            return antigravity.read_text(cfg.bin, command)
+        except Exception as exc:
+            return exc
+
+    reading = antigravity.Reading(usage=read("/usage"), credits=read("/credits"))
+    verdict = antigravity.evaluate(reading, cfg.threshold_pct, now)
+    avail = verdict.avail
     parts = []
     for w in avail.usage.get("windows", []):
         label = str(w["label"]).removesuffix(" Remaining")
         parts.append(
             f"{w['group']} / {label}: {_pct(w['used_pct'])} used, resets {_when(w['resets_at'])}"
         )
-    parts.append(f"credit balance {balance}")
-    detail = "; ".join(parts)
+    if avail.usage.get("balance") is not None:
+        parts.append(f"credit balance {avail.usage['balance']}")
+    detail = "; ".join(parts) or "nothing could be read"
     if avail.ok:
         return Check(name, True, True, detail)
-    return Check(name, False, False, f"{detail}; not usable now: {avail.reason}")
+    return Check(name, False, verdict.blind, f"{detail}; not usable now: {avail.reason}")
 
 
 def _interactive() -> Check:

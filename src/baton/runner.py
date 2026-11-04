@@ -21,7 +21,7 @@ from baton.adapters.base import (
     RoundResult,
 )
 from baton.config import Goal
-from baton.proc import group_is_ours, kill_group, process_start
+from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group, process_start
 from baton.scheduler import Scheduler
 from baton.store import Store
 
@@ -380,6 +380,17 @@ class _Run:
             "group_start": self.group_start if self.group is not None else None,
         }
 
+    @staticmethod
+    def start_time(pgid: int) -> str:
+        """The group leader's start time for state.json, or "" when it cannot be read."""
+        if pgid <= 1:
+            return ""
+        for _ in range(2):
+            found = process_start(pgid)
+            if found is not None:
+                return found
+        return ""
+
     def persist(self) -> None:
         """Write the runner's part of state.json. Raises StateError when it cannot be read."""
         state = self.store.load_state()
@@ -413,16 +424,24 @@ class _Run:
         group = state.get("group")
         if isinstance(group, int) and not isinstance(group, bool) and group > 1:
             # Under the lock, so this can never be another live runner's agent.
-            if group == os.getpgrp():
-                pass
-            elif group_is_ours(group, state.get("group_start")):
+            found = check_group(group, state.get("group_start"))
+            if found == OURS:
                 kill_group(group)
                 self.emit("alert", message="stopped a process group left by a previous run")
-            else:
+            elif found == UNKNOWN:
+                # Alive, and it cannot be proven that it is ours or not. Starting a round beside
+                # a possibly live agent could spend credits twice, so keep the record and retry.
+                message = (
+                    f"process group {group} from the last run is alive but could not be "
+                    "verified: waiting (remove 'group' from state.json if it is not baton's)"
+                )
+                self.emit("alert", message=message)
+                raise RuntimeError(message)
+            elif found != DEAD:
                 self.emit(
                     "alert",
-                    message=f"process group {group} from the last run is not the one baton "
-                    "started (or could not be checked): not killed",
+                    message=f"process group {group} from the last run is now another process: "
+                    "not killed",
                 )
         self.group = None
         self.group_start = ""
@@ -554,7 +573,7 @@ class _Run:
             spawned = True
             self.carried_notes = ""
             self.group = pgid
-            self.group_start = (process_start(pgid) or "") if pgid > 1 else ""
+            self.group_start = self.start_time(pgid)
             self.persist_softly()
 
         def on_session(session: str) -> None:

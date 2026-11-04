@@ -6,7 +6,6 @@ import subprocess
 import sys
 import threading
 import time
-from decimal import Decimal
 
 import pytest
 from conftest import codex_limits
@@ -96,7 +95,6 @@ def test_e2e_credit_drop_kills_codex_process(fakes, monkeypatch):
     ]
     alerts = [e for e in events(fakes) if e["kind"] == "alert"]
     assert any(a.get("outcome") == "credit_guard" and "dropped" in a["reason"] for a in alerts)
-    assert Decimal("100.00") > Decimal("99.99")  # the guard compared exact values
 
 
 def stray(fakes):
@@ -141,7 +139,7 @@ def test_startup_leaves_a_recycled_group_id_alone(fakes):
         proc.kill()
 
 
-@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 def test_signal_stops_the_agent_group_and_exits(fakes, monkeypatch, sig):
     monkeypatch.setenv("FAKE_CODEX_EXEC_SLEEP", "60")
     goal = fakes.goal(verify="test -f /nonexistent/never")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import shutil
@@ -49,10 +48,10 @@ class Terminated(BaseException):
 
 
 class _Signals:
-    """Turns the first SIGTERM or SIGINT into `Terminated` and ignores the rest, so the cleanup
-    that stops the agent's process group cannot itself be cut short."""
+    """Turns the first SIGTERM, SIGINT or SIGHUP into `Terminated` and ignores the rest, so the
+    cleanup that stops the agent's process group cannot itself be cut short."""
 
-    SIGNALS = (signal.SIGTERM, signal.SIGINT)
+    SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)  # HUP: the terminal was closed
 
     def __init__(self) -> None:
         self.armed = False
@@ -118,14 +117,16 @@ def _group_alive(pgid: int) -> bool:
 
 def _forget_group(store: Store) -> None:
     """After an orderly shutdown the recorded group is dead; do not leave it for the next start
-    to signal. A group that somehow survived stays recorded."""
+    to signal. A group that somehow survived stays recorded. Written under the lock, like every
+    other write of the runner's state; if another runner has taken it by now, it owns the file."""
     try:
-        state = store.load_state()
-        group = state.get("group")
-        if isinstance(group, int) and not isinstance(group, bool) and _group_alive(group):
-            return
-        state.update(group=None, group_start=None)
-        store.save_state(state)
+        with store.lock():
+            state = store.load_state()
+            group = state.get("group")
+            if isinstance(group, int) and not isinstance(group, bool) and _group_alive(group):
+                return
+            state.update(group=None, group_start=None)
+            store.save_state(state)
     except Exception:
         pass
 
@@ -164,20 +165,29 @@ def _when(epoch: float) -> str:
 
 
 def _runner_pid(root: Path) -> int | None:
-    """The pid in the lock file when a runner holds the lock, otherwise None. Takes no lock."""
+    """The pid of the runner that holds this goal's lock, or None when there is none.
+
+    Reads the pid the runner wrote into the lock file and checks that the process is alive and is
+    a baton. It never touches the lock itself: even a momentary probe could make a runner that is
+    starting at that instant be refused as "already running".
+    """
     try:
-        fd = os.open(root / "lock", os.O_RDONLY)
-    except OSError:
+        pid = int((root / "lock").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 0 or pid == os.getpid():
         return None
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raw = os.read(fd, 32).decode(errors="replace").strip()
-            return int(raw) if raw.isdigit() else 0
+        command = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
         return None
-    finally:
-        os.close(fd)
+    return pid if "baton" in command else None
 
 
 def _event_line(event: dict) -> str:

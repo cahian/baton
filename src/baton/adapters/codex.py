@@ -276,6 +276,9 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
     )
 
 
+evaluate = _evaluate  # public name for callers that need the verdict
+
+
 def check_limits(result: dict, threshold_pct: int, now: float) -> Availability:
     """Whether a round may start (or go on) given one limits read."""
     return _evaluate(result, threshold_pct, now).avail

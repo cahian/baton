@@ -1,3 +1,4 @@
+import fcntl
 import os
 import signal
 import subprocess
@@ -11,6 +12,7 @@ from baton.adapters.antigravity import AntigravityAdapter
 from baton.adapters.codex import CodexAdapter
 from baton.cli import build_adapters, main
 from baton.config import load_goal
+from baton.proc import process_start
 from baton.store import AlreadyRunning, Store, state_dir
 
 
@@ -105,11 +107,45 @@ def test_status_prints_cooldowns(fakes, capsys):
 
 
 def test_status_reports_a_live_runner(fakes, capsys):
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; from baton.store import Store; "
+            "s = Store(sys.argv[1]); l = s.lock(); l.__enter__(); print('held', flush=True); "
+            "time.sleep(60)  # a stand-in baton runner",
+            str(state_dir("demo")),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert main(["status", str(fakes.goal())]) == 0
+        out = capsys.readouterr().out
+        assert f"running (pid {holder.pid})" in out and "not running" not in out
+    finally:
+        holder.kill()
+        holder.wait()
+        holder.stdout.close()
+
+
+def test_status_never_touches_the_lock(fakes, monkeypatch):
+    # A probe that took the lock, even for a moment, could make a starting runner be refused.
+    store = store_for(fakes)
+    store.save_state({"round": 1})
+    taken = []
+    monkeypatch.setattr(fcntl, "flock", lambda *a: taken.append(a))
+    assert main(["status", str(fakes.goal())]) == 0
+    assert taken == []
+
+
+def test_status_of_a_finished_runner_says_not_running(fakes, capsys):
     store = store_for(fakes)
     with store.lock():
-        assert main(["status", str(fakes.goal())]) == 0
-    out = capsys.readouterr().out
-    assert "running" in out and "not running" not in out
+        pass  # the pid file is emptied on release
+    assert main(["status", str(fakes.goal())]) == 0
+    assert "not running" in capsys.readouterr().out
 
 
 def test_status_of_an_unseen_goal_creates_nothing(fakes, capsys):
@@ -192,7 +228,7 @@ def test_run_does_not_wrap_run_goal_in_the_lock(fakes, monkeypatch):
 
 
 def test_run_installs_and_restores_signal_handlers(fakes, monkeypatch):
-    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
     seen = {}
 
     def fake_run_goal(goal, adapters, store):
@@ -205,7 +241,7 @@ def test_run_installs_and_restores_signal_handlers(fakes, monkeypatch):
     assert {s: signal.getsignal(s) for s in before} == before
 
 
-@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 def test_a_signal_ends_the_run_with_its_conventional_code(fakes, monkeypatch, sig):
     def fake_run_goal(goal, adapters, store):
         os.kill(os.getpid(), sig)
@@ -290,3 +326,58 @@ def test_module_entry_point_runs(fakes):
         env=os.environ.copy(),
     )
     assert out.returncode == 0, out.stderr
+
+
+def test_refused_runner_leaves_the_live_agent_alone(fakes, capsys):
+    # The stale-group kill belongs after the lock: before it, a second runner that is about to be
+    # refused would kill the agent of the runner that is working.
+    store = store_for(fakes)
+    live = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        store.save_state(
+            {
+                "group": live.pid,
+                "group_start": process_start(live.pid),
+                "workdir": str(fakes.work),
+            }
+        )
+        with store.lock():
+            assert main(["run", str(fakes.goal(verify="true"))]) == 1
+        time.sleep(0.3)
+        assert live.poll() is None, "a refused runner killed the live runner's agent"
+        assert store.load_state()["group"] == live.pid
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_forget_group_clears_a_dead_group_under_the_lock(fakes):
+    store = store_for(fakes)
+    child = subprocess.Popen(["true"], start_new_session=True)
+    child.wait()
+    store.save_state({"group": child.pid, "group_start": "x", "round": 3})
+    cli._forget_group(store)
+    state = store.load_state()
+    assert state["group"] is None and state["group_start"] is None and state["round"] == 3
+
+
+def test_forget_group_keeps_a_live_group(fakes):
+    store = store_for(fakes)
+    live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        store.save_state({"group": live.pid, "group_start": "x"})
+        cli._forget_group(store)
+        assert store.load_state()["group"] == live.pid
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_forget_group_does_not_write_while_another_runner_holds_the_lock(fakes):
+    store = store_for(fakes)
+    child = subprocess.Popen(["true"], start_new_session=True)
+    child.wait()
+    store.save_state({"group": child.pid, "round": 3})
+    with Store(store.root).lock():
+        cli._forget_group(store)
+    assert store.load_state()["group"] == child.pid  # not our file to write any more

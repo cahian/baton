@@ -755,21 +755,40 @@ def test_process_start_is_stable_and_empty_for_a_dead_pid():
     assert process_start(child.pid) == ""
 
 
-def test_group_is_ours_never_accepts_unsafe_ids():
-    from baton.proc import group_is_ours
+def test_process_start_does_not_depend_on_the_timezone(monkeypatch):
+    from baton.proc import process_start
+
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    tokyo = process_start(os.getpid())
+    monkeypatch.setenv("TZ", "America/Sao_Paulo")
+    assert tokyo and process_start(os.getpid()) == tokyo
+
+
+def test_check_group_never_accepts_unsafe_ids():
+    from baton.proc import FOREIGN, check_group
 
     for bad in (0, 1, -5, True, None, "12", os.getpgrp()):
-        assert group_is_ours(bad, None) is False  # type: ignore[arg-type]
+        assert check_group(bad, "x") == FOREIGN
 
 
-def test_group_is_ours_checks_the_recorded_start_time():
-    from baton.proc import group_is_ours, process_start
+def test_check_group_classifies_a_group():
+    from baton.proc import DEAD, FOREIGN, OURS, UNKNOWN, check_group, process_start
 
     child = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
-        assert group_is_ours(child.pid, process_start(child.pid)) is True
-        assert group_is_ours(child.pid, "Mon Jan  1 00:00:00 2001") is False
-        assert group_is_ours(child.pid, None) is True  # state from before start times existed
+        started = process_start(child.pid)
+        assert check_group(child.pid, started) == OURS
+        assert check_group(child.pid, "Mon Jan  1 00:00:00 2001") == FOREIGN
+        # Alive but nothing recorded to compare with: never signalled, never forgotten.
+        assert check_group(child.pid, None) == UNKNOWN
+        assert check_group(child.pid, "") == UNKNOWN
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(proc, "process_start", lambda pid: None)  # ps cannot answer
+        try:
+            assert check_group(child.pid, started) == UNKNOWN
+        finally:
+            monkey.undo()
     finally:
         child.kill()
         child.wait()
+    assert check_group(child.pid, started) == DEAD

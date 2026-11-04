@@ -179,3 +179,32 @@ def test_interactive_codex_filter():
         Proc(os.getpid(), 0, "codex"),  # ourselves is never "another"
     ]
     assert [p.pid for p in interactive_codex(procs)] == [1, 2]
+
+
+@pytest.mark.parametrize("balance", ["abc", "NaN", None, ""])
+def test_codex_unreadable_balance_blocks(fakes, balance):
+    fakes.codex_scenario(codex_limits(balance=balance))
+    c = check(run(fakes), "codex limits")
+    assert not c.ok and c.blocking
+
+
+def test_codex_missing_window_blocks(fakes):
+    fakes.codex_scenario(codex_limits(primary=None))
+    c = check(run(fakes), "codex limits")
+    assert not c.ok and c.blocking
+
+
+@pytest.mark.parametrize(
+    "usage", ["garbage\n", "Claude and GPT models\tWeekly\t100%\t2030-01-01T00:00:00Z\n"]
+)
+def test_antigravity_unreadable_usage_blocks(fakes, usage):
+    fakes.agy_files(usage=usage)
+    c = check(run(fakes), "antigravity limits")
+    assert not c.ok and c.blocking
+
+
+@pytest.mark.parametrize("credits", ["Remaining credits\tabc\n", "Remaining credits\n", ""])
+def test_antigravity_unreadable_balance_blocks(fakes, credits):
+    fakes.agy_files(credits=credits)
+    c = check(run(fakes), "antigravity limits")
+    assert not c.ok and c.blocking

@@ -131,7 +131,7 @@ def process_start(pid: int) -> str | None:
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=PS_TIMEOUT_S,
-            env={**os.environ, "LC_ALL": "C"},
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},  # lstart is local time
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -140,23 +140,30 @@ def process_start(pid: int) -> str | None:
     return " ".join(out.stdout.split())
 
 
-def group_is_ours(pgid: int, recorded_start: object) -> bool:
-    """Whether the group recorded in state.json can still be the one baton started.
+OURS, DEAD, FOREIGN, UNKNOWN = "ours", "dead", "foreign", "unknown"
 
-    Never our own group, 0 or 1. When the start time of the group leader was recorded, it must
-    still match: a different time means the number was recycled for an unrelated process. A leader
-    that is gone while the group lives is ours (a pid cannot be reused while a group carries it).
-    Without a recorded start time, or when `ps` cannot answer, a group that cannot be verified
-    is not ours.
+
+def check_group(pgid: object, recorded_start: object) -> str:
+    """What the group recorded in state.json is now.
+
+    `dead`: nothing is running in it. `ours`: it is the group baton started, so it may be killed.
+    `foreign`: the number now belongs to something else (our own group, 0, 1, or a start time that
+    no longer matches). `unknown`: it is alive but cannot be proven ours, because no start time
+    was recorded or `ps` could not answer. Unknown must never be signalled and never be forgotten.
+
+    A leader that is gone while the group lives is ours: a pid cannot be reused while a group
+    still carries it.
     """
     if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp():
-        return False
+        return FOREIGN
+    if not _group_alive(pgid):
+        return DEAD
     if not isinstance(recorded_start, str) or not recorded_start:
-        return True  # state written before start times were kept: only the guards above apply
+        return UNKNOWN
     now = process_start(pgid)
     if now is None:
-        return False
-    return now == "" or now == recorded_start
+        return UNKNOWN
+    return OURS if now == "" or now == recorded_start else FOREIGN
 
 
 @dataclass

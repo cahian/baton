@@ -250,6 +250,12 @@ class Store:
                 raise AlreadyRunning(f"another baton runner holds {self.root}") from exc
             os.ftruncate(fd, 0)
             os.write(fd, f"{os.getpid()}\n".encode())
-            yield
+            try:
+                yield
+            finally:
+                try:
+                    os.ftruncate(fd, 0)  # a pid left behind would name a runner that is gone
+                except OSError:
+                    pass
         finally:
             os.close(fd)  # closing releases the flock

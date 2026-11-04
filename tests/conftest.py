@@ -24,7 +24,7 @@ def codex_limits(primary=12, secondary=31, balance="1000.5000000000", reset=NOW_
     return {
         "ordinaryUsageAllowed": True,
         "rateLimits": {
-            "primary": {"usedPercent": primary, **window},
+            "primary": None if primary is None else {"usedPercent": primary, **window},
             "secondary": None
             if secondary is None
             else {"usedPercent": secondary, **window, "windowDurationMins": 10080},

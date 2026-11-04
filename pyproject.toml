@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Relay one coding goal across subscription coding CLIs without spending paid credits."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["textual>=1.0"]
+dependencies = []
 
 [project.scripts]
 baton = "baton.cli:main"
