@@ -568,11 +568,10 @@ def test_the_gate_gets_no_api_keys(tmp_path, work, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-the-gate")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-the-gate")
     monkeypatch.setenv("KEPT_VARIABLE", "kept")
-    goal = make_goal(tmp_path, work, verify="env")
-    passed, tail = run_gate(goal)
+    show = "a=${ANTHROPIC_API_KEY-unset} o=${OPENAI_API_KEY-unset} k=${KEPT_VARIABLE-unset}"
+    passed, tail = run_gate(make_goal(tmp_path, work, verify=f"echo {show}"))
     assert passed
-    assert "must-not-reach-the-gate" not in tail
-    assert "KEPT_VARIABLE=kept" in tail
+    assert "a=unset o=unset k=kept" in tail
 
 
 def test_stray_process_group_is_killed_on_start(go, agents, work, store):
