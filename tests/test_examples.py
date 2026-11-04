@@ -34,3 +34,19 @@ def test_example_plist_runs_baton_serve_and_keeps_it_alive():
     plist = plistlib.loads((EXAMPLES / "baton-serve.plist").read_bytes())
     assert plist["ProgramArguments"][1] == "serve"
     assert plist["KeepAlive"] is True
+
+
+ROOT = EXAMPLES.parent
+
+
+def test_ci_installs_from_the_lock_file_and_is_ascii():
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "uv sync --locked" in workflow
+    assert workflow.isascii()
+
+
+def test_readme_states_what_state_dir_does_not_move_and_documents_jobs():
+    text = (ROOT / "README.md").read_text()
+    assert "`BATON_STATE_DIR` does not move the Claude ledger" in text
+    assert "`baton jobs`" in text
+    assert "`baton status` and reattaching still work" not in text

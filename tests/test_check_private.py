@@ -32,14 +32,34 @@ SAMPLES = {
     "openai-style token": "key " + "sk" + "-" + "A1b2C3d4E5f6G7h8",
     "github token": "tok " + "gh" + "p_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3",
     "google oauth token": "tok " + "4/" + "0A" + "bcdEFGhijKLMnopQRstuVWxyz01",
+    "tailscale ipv6": "host " + "fd7a" + ":115c:" + "a1e0::1",
+    "tailscale hostname (upper case)": "ssh BOX." + "TAIL1234" + "." + "TS" + "." + "NET",
+    "home path (windows)": "see C:" + "\\" + "Users" + "\\" + "jane" + "\\work",
+    "home path (windows, escaped)": "see C:" + "\\\\" + "Users" + "\\\\" + "jane",
     "aws token": "id " + "AK" + "IA" + "ABCDEFGHIJKLMNOP",
 }
 
 
 @pytest.mark.parametrize("kind", SAMPLES)
 def test_detects_each_class(kind):
-    expected = "token" if kind.endswith("token") else kind.split(" (")[0]
+    expected = {"tailscale ipv6": "tailscale ip"}.get(kind, kind.split(" (")[0])
+    expected = "token" if kind.endswith("token") else expected
     assert expected in classes(SAMPLES[kind])
+
+
+@pytest.mark.parametrize("name", ["runner", "username", "you", "example", "jane"])
+def test_only_user_is_a_home_placeholder(name):
+    for text in ("/" + "Users" + "/" + name, "/" + "home" + "/" + name):
+        assert classes(text) == {"home path"}, text
+    assert classes("C:" + "\\" + "Users" + "\\" + name) == {"home path"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/" + "Users" + "/user/x", "/" + "home" + "/user", "C:" + "\\" + "Users" + "\\<name>"],
+)
+def test_user_and_angle_brackets_stay_allowed(text):
+    assert classes(text) == set()
 
 
 def test_detects_each_class_by_name():
@@ -128,6 +148,15 @@ def test_scan_repo_reads_tracked_files_only(tmp_path):
     (repo / "untracked.txt").write_text(SAMPLES["email"] + "\n")
     git(repo, "add", "tracked.txt")
     assert {f.path for f in check_private.scan_repo(repo)} == {"tracked.txt"}
+
+
+def test_scan_repo_reads_files_that_are_not_utf8(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "latin1.txt").write_bytes(
+        "caf\xe9 ".encode("latin-1") + SAMPLES["email"].encode("latin-1") + b"\n"
+    )
+    git(repo, "add", "latin1.txt")
+    assert [(f.path, f.kind) for f in check_private.scan_repo(repo)] == [("latin1.txt", "email")]
 
 
 def test_scan_repo_skips_binary_files(tmp_path):

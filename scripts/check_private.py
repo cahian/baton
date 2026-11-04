@@ -26,7 +26,11 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")),
     (
         "home path",
-        re.compile(r"(?<![\w.~-])/(?:Users|home)/([^\s/\"'`<>$(){}\[\]*|\\]+)"),
+        re.compile(
+            r"(?<![\w.~-])/(?:Users|home)/([^\s/\"'`<>$(){}\[\]*|\\]+)"
+            r"|(?<![A-Za-z])[A-Za-z]:\\{1,2}Users\\{1,2}([^\s\\/\"'`<>$(){}\[\]*|]+)",
+            re.IGNORECASE,
+        ),
     ),
     (
         "private ip",
@@ -46,9 +50,15 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             BEFORE_ADDRESS
             + rf"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.{OCTET}\.{OCTET}"
             + NOT_PART_OF_A_NUMBER
+            # Tailscale's IPv6 range (a /48 under the fd7a prefix)
+            + r"|\bfd7a:115c:a1e0:[0-9a-f:]*",
+            re.IGNORECASE,
         ),
     ),
-    ("tailscale hostname", re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.ts\.net\b")),
+    (
+        "tailscale hostname",
+        re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.ts\.net\b", re.IGNORECASE),
+    ),
     (
         "uuid",
         re.compile(
@@ -74,7 +84,7 @@ ALLOWED_EMAIL_DOMAINS = {"example.com", "example.org", "example.net"}
 # Top-level domains reserved for documentation and tests (RFC 2606): no one can own them.
 RESERVED_TLDS = {"invalid", "test", "example", "localhost"}
 # Names after /Users/ or /home/ that stand for "whoever you are" and identify nobody.
-ALLOWED_HOME_NAMES = {"user", "username", "you", "example", "runner"}
+ALLOWED_HOME_NAMES = {"user"}
 
 
 @dataclass(frozen=True)
@@ -102,7 +112,8 @@ def _allowed(kind: str, match: re.Match[str]) -> bool:
             or domain.rsplit(".", 1)[1] in RESERVED_TLDS
         )
     if kind == "home path":
-        return match.group(1).lower() in ALLOWED_HOME_NAMES
+        name = match.group(1) or match.group(2)
+        return name.lower() in ALLOWED_HOME_NAMES
     return False
 
 
@@ -123,17 +134,19 @@ def _git(root: Path, *args: str) -> bytes:
 
 
 def scan_repo(root: Path) -> list[Finding]:
-    """Every tracked file that is text. Binary files and files gone from disk are skipped."""
+    """Every tracked file that has no NUL byte (a binary). Text in another encoding is still read,
+    with undecodable bytes replaced: an address in a Latin-1 file must not scan clean."""
     found: list[Finding] = []
     for name in _git(root, "ls-files", "-z").decode("utf-8").split("\0"):
         if not name:
             continue
         try:
             raw = (root / name).read_bytes()
-            text = raw.decode("utf-8")
-        except (OSError, UnicodeDecodeError):
+        except OSError:
+            continue  # tracked but gone from disk
+        if b"\0" in raw:
             continue
-        found.extend(scan_text(text, name))
+        found.extend(scan_text(raw.decode("utf-8", errors="replace"), name))
     return found
 
 

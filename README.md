@@ -86,7 +86,8 @@ budget is baton's own:
 - **Antigravity's output when its quota actually runs out has not been observed.** The limit reads
   are expected to stop it first.
 - **A response held open for days through OpenCode is untested** beyond seconds. The job does not
-  depend on it: `baton status` and reattaching still work.
+  depend on it: `baton jobs` and `baton status session-<id>` show where it is, and a new message
+  in the session reattaches the stream.
 
 ## Install
 
@@ -205,7 +206,8 @@ and context on its side.
 
 Each OpenCode session becomes a job that runs in its own thread inside `baton serve`, independent of
 the HTTP connection. A dropped connection never stops it, and a new message in the session becomes
-a note that interrupts the running round. The stream shows the agents' text, one line per rotation,
+a note that interrupts the running round. `baton jobs` lists every job, and `baton status`,
+`baton say` and `baton stop` accept its name (`session-<id>`) in place of a goal file. The stream shows the agents' text, one line per rotation,
 waits and gate results. Title requests are answered locally and spend nothing. The working
 directory is read from OpenCode's own database (`~/.local/share/opencode/opencode.db`, or the path
 in `BATON_OPENCODE_DB`); baton never guesses one.
@@ -228,14 +230,17 @@ launchd does not load your shell profile, so the plist sets `PATH` itself; it mu
 | `baton doctor [goal]` | Check binaries, logins, stray API keys, live limits and Claude spend. |
 | `baton run <goal.toml>` | Run one goal in the foreground, without OpenCode. |
 | `baton serve [--port 18777]` | Start the OpenCode gateway. |
-| `baton status <goal.toml>` | One-shot status: rounds, cooldowns, recent events. |
-| `baton say <goal.toml> [--now] "note"` | Leave a note for the next round. `--now` also interrupts the current one. |
-| `baton stop <goal.toml> [--now]` | Stop after the current round, or kill the round with `--now`. |
+| `baton jobs` | List every job and goal that has state: whether its runner is alive, round, current agent, last event. |
+| `baton status <goal.toml or job>` | One-shot status: rounds, cooldowns, recent events. |
+| `baton say <goal.toml or job> [--now] "note"` | Leave a note for the next round. `--now` also interrupts the current one. |
+| `baton stop <goal.toml or job> [--now]` | Stop after the current round, or kill the round with `--now`. |
 | `baton opencode-config [--port 18777]` | Print the provider JSON for `opencode.json`. |
 
 State lives in `~/.local/state/baton/<goal name>/` (events, state, raw round logs, inbox), one
-runner per goal. `BATON_STATE_DIR` and `BATON_CONFIG` move the state and defaults paths. On macOS
-the runner holds `caffeinate` so the machine does not sleep mid-goal.
+runner per goal. `BATON_STATE_DIR` and `BATON_CONFIG` move the goals' state and the defaults file.
+`BATON_STATE_DIR` does not move the Claude ledger: it stays at
+`~/.local/state/baton/claude-spend.json` under the real home directory, so that no goal can end up
+with a ledger, and a budget, of its own. On macOS the runner holds `caffeinate` so the machine does not sleep mid-goal.
 
 baton never exits because of a limit, a transient error, a crash in an agent or bad network. Only a
 passing gate, a stop request or a termination signal ends it.

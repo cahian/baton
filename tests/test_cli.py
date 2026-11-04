@@ -419,3 +419,88 @@ def test_build_adapters_reads_the_cost_report_when_an_admin_key_is_set(fakes):
 
     goal = load_goal(fakes.goal(claude='admin_key_file = "/some/admin.key"\n'))
     assert build_adapters(goal)["claude_api"]._cost_report is not None
+
+
+# jobs, and commands that take a job name
+
+
+def make_job(name="session-abc", **state):
+    store = Store(state_dir(name))
+    store.save_state({"round": 3, "current": "codex", **state})
+    return store
+
+
+def test_jobs_lists_every_job_with_its_status(fakes, capsys):
+    make_job("session-abc").emit("round_end", round=3, agent="codex", outcome="limit")
+    done = make_job("session-def", round=7, current="antigravity")
+    done.emit("finished", reason="gate passed", round=7)
+    (fakes.state / "claude-spend.json").write_text("{}")  # the shared ledger is not a job
+    (fakes.state / "stray").mkdir()  # nor is a directory with no state in it
+    assert main(["jobs"]) == 0
+    out = capsys.readouterr().out
+    lines = {line.split()[0]: line for line in out.splitlines() if line.startswith("session-")}
+    assert set(lines) == {"session-abc", "session-def"}
+    assert "not running" in lines["session-abc"] and "codex" in lines["session-abc"]
+    assert "finished" in lines["session-def"] and "antigravity" in lines["session-def"]
+    assert "stray" not in out and "claude-spend" not in out
+
+
+def test_jobs_says_when_there_are_none(fakes, capsys):
+    assert main(["jobs"]) == 0
+    assert "no jobs" in capsys.readouterr().out
+
+
+def test_jobs_shows_a_live_runner(fakes, capsys):
+    make_job("session-live")
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; from baton.store import Store; "
+            "s = Store(sys.argv[1]); l = s.lock(); l.__enter__(); print('held', flush=True); "
+            "time.sleep(60)  # a stand-in baton runner",
+            str(state_dir("session-live")),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert main(["jobs"]) == 0
+        out = capsys.readouterr().out
+        assert f"running (pid {holder.pid})" in out
+    finally:
+        holder.kill()
+        holder.wait()
+        holder.stdout.close()
+
+
+def test_status_takes_a_job_name(fakes, capsys):
+    make_job("session-abc").emit("round_end", round=3, agent="codex", outcome="limit")
+    assert main(["status", "session-abc"]) == 0
+    out = capsys.readouterr().out
+    assert "session-abc" in out and "round 3" in out and "limit" in out
+
+
+def test_say_and_stop_take_a_job_name(fakes):
+    store = make_job("session-abc")
+    assert main(["say", "--now", "session-abc", "use", "the", "new API"]) == 0
+    assert store.take_interrupt() is True
+    assert "use the new API" in store.take_inbox()
+    assert main(["stop", "session-abc", "--now"]) == 0
+    assert store.stop_request() == "now"
+
+
+@pytest.mark.parametrize("command", [["status"], ["say", "hi"], ["stop"]])
+def test_an_unknown_job_name_is_refused_and_creates_nothing(fakes, capsys, command):
+    argv = [command[0], "session-nope", *command[1:]]
+    assert main(argv) == 2
+    assert "baton jobs" in capsys.readouterr().err
+    assert not (fakes.state / "session-nope").exists()
+
+
+def test_a_goal_path_still_wins_over_a_job_name(fakes, capsys):
+    make_job("demo", round=99)
+    assert main(["status", str(fakes.goal())]) == 0  # a path to a goal file, not the job "demo"
+    assert "round 99" in capsys.readouterr().out  # same state dir, read through the goal
+    assert main(["status", "demo"]) == 0

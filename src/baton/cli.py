@@ -22,7 +22,7 @@ from baton.config import AgentConfig, Goal, GoalError, load_goal
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, opencode_config, serve
 from baton.runner import run_goal
-from baton.store import AlreadyRunning, StateError, Store, state_dir
+from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
 
 STATUS_EVENTS = 8
 
@@ -44,6 +44,27 @@ def build_adapters(goal: Goal) -> dict[str, Adapter]:
 
 def _err(message: str) -> None:
     print(f"baton: {message}", file=sys.stderr)
+
+
+def _resolve(target: str) -> tuple[str, Goal | None]:
+    """What `status`, `say` and `stop` were given: a goal file (its path), or the name of a job
+    that already has state, such as the `session-<id>` jobs `baton serve` creates for OpenCode.
+
+    Returns the state name and the goal (None for a job). A name never creates anything: an
+    unknown one is refused. Anything that is a file, has a directory part or ends in `.toml` is a
+    goal path.
+    """
+    looks_like_path = os.sep in target or target.endswith(".toml") or Path(target).is_file()
+    if looks_like_path:
+        goal = load_goal(Path(target))
+        return goal.name, goal
+    try:
+        root = state_dir(target)
+    except ValueError:
+        root = None
+    if root is None or not root.is_dir():
+        raise GoalError(f"no goal file or job named {target!r} (`baton jobs` lists the jobs)")
+    return target, None
 
 
 # run
@@ -213,15 +234,22 @@ def _event_line(event: dict) -> str:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    goal = load_goal(Path(args.goal))
-    root = state_dir(goal.name)
+    name, goal = _resolve(args.goal)
+    return _print_status(name, goal)
+
+
+def _print_status(name: str, goal: Goal | None) -> int:
+    root = state_dir(name)
     if not root.exists():
-        print(f"{goal.name}: no state yet (it has never run)")
+        print(f"{name}: no state yet (it has never run)")
         return 0
     store = Store(root)
     pid = _runner_pid(root)
-    print(f"goal {goal.name} ({goal.path})")
-    print(f"workdir: {goal.workdir}")
+    if goal is None:
+        print(f"job {name}")
+    else:
+        print(f"goal {goal.name} ({goal.path})")
+        print(f"workdir: {goal.workdir}")
     if pid is None:
         runner = "not running"
     else:
@@ -236,19 +264,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     current = state.get("current")
     print(f"round {state.get('round', 0)}, current agent: {current or 'none yet'}")
     agents = state.get("agents")
-    for name, info in (agents if isinstance(agents, dict) else {}).items():
+    for agent, info in (agents if isinstance(agents, dict) else {}).items():
         if not isinstance(info, dict):
             continue
         until = info.get("until")
         cooling = isinstance(until, int | float) and until > now
-        tag = " (current)" if name == current else ""
+        tag = " (current)" if agent == current else ""
         if cooling:
             left = int(until - now)
             line = f"cooldown until {_when(until)} ({left // 3600}h{left % 3600 // 60:02d}m left)"
         else:
             line = "ready"
         print(
-            f"  {name}{tag}: {line}, limit_n={info.get('limit_n', 0)}, "
+            f"  {agent}{tag}: {line}, limit_n={info.get('limit_n', 0)}, "
             f"transient_n={info.get('transient_n', 0)}"
         )
         if info.get("reason"):
@@ -270,13 +298,61 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _job_row(root: Path) -> tuple[str, ...]:
+    """name, state, round, agent, last event: one line of `baton jobs`."""
+    store = Store(root)
+    pid = _runner_pid(root)
+    try:
+        state = store.load_state()
+    except StateError:
+        state = {}
+    try:
+        events = store.events()
+    except Exception:
+        events = []
+    last = events[-1] if events else {}
+    kind = str(last.get("kind", "-"))
+    if pid is not None:
+        runner = f"running (pid {pid})" if pid else "running"
+    elif kind in ("finished", "stopped"):
+        runner = f"not running, {kind}"
+    else:
+        runner = "not running"
+    when = _when(float(last["ts"])) if isinstance(last.get("ts"), int | float) else "-"
+    return (
+        root.name,
+        runner,
+        f"round {state.get('round', 0)}",
+        str(state.get("current") or "-"),
+        f"{kind} {when}",
+    )
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    base = state_base()
+    roots = sorted(
+        d
+        for d in (base.iterdir() if base.is_dir() else ())
+        if d.is_dir() and ((d / "state.json").exists() or (d / "events.jsonl").exists())
+    )
+    if not roots:
+        print("no jobs")
+        return 0
+    rows = [_job_row(root) for root in roots]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]
+    for row in rows:
+        cells = [cell.ljust(width) for cell, width in zip(row, widths, strict=False)]
+        print("  ".join([*cells, row[-1]]))
+    return 0
+
+
 def cmd_say(args: argparse.Namespace) -> int:
-    goal = load_goal(Path(args.goal))
+    name, _ = _resolve(args.goal)
     text = " ".join(args.text).strip()
     if not text:
         _err("the note is empty")
         return 2
-    store = Store(state_dir(goal.name))
+    store = Store(state_dir(name))
     store.say(text)
     if args.now:
         store.request_interrupt()
@@ -287,8 +363,8 @@ def cmd_say(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    goal = load_goal(Path(args.goal))
-    store = Store(state_dir(goal.name))
+    name, _ = _resolve(args.goal)
+    store = Store(state_dir(name))
     store.request_stop(now=args.now)
     print("stop requested" + (" now" if args.now else " after the current round"))
     return 0
@@ -348,18 +424,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("status", help="one-shot status of a goal")
-    p.add_argument("goal", help="goal file")
+    p = sub.add_parser("jobs", help="list every job and goal that has state")
+    p.set_defaults(func=cmd_jobs)
+
+    p = sub.add_parser("status", help="one-shot status of a goal or job")
+    p.add_argument("goal", help="goal file, or a job name such as session-<id>")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("say", help="leave a note for the next round")
-    p.add_argument("goal", help="goal file")
+    p.add_argument("goal", help="goal file, or a job name such as session-<id>")
     p.add_argument("--now", action="store_true", help="also interrupt the current round")
     p.add_argument("text", nargs="+", help="the note")
     p.set_defaults(func=cmd_say)
 
     p = sub.add_parser("stop", help="request a stop")
-    p.add_argument("goal", help="goal file")
+    p.add_argument("goal", help="goal file, or a job name such as session-<id>")
     p.add_argument("--now", action="store_true", help="kill the current round")
     p.set_defaults(func=cmd_stop)
 

@@ -19,7 +19,7 @@ jobs:
       - name: Python 3.12
         run: uv python install 3.12
       - name: Install
-        run: uv sync --python 3.12
+        run: uv sync --locked --python 3.12
       - name: Lint
         run: uv run ruff check .
       - name: Format
