@@ -102,6 +102,15 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class GoalRef:
+    """What names a goal: enough to find its state, whatever is wrong with its settings."""
+
+    name: str
+    workdir: Path
+    path: Path
+
+
+@dataclass(frozen=True)
 class Goal:
     name: str
     workdir: Path
@@ -269,30 +278,42 @@ def default_agent(name: str) -> AgentConfig:
     return _load_agent(name, load_defaults().get(name, {}))
 
 
-def load_goal(path: Path) -> Goal:
-    path = Path(path)
+def _read_goal_table(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
     except OSError as exc:
         raise GoalError(f"cannot read goal file {path}: {exc.strerror or exc}") from exc
     try:
-        data = tomllib.loads(raw.decode("utf-8"), parse_float=Decimal)
+        return tomllib.loads(raw.decode("utf-8"), parse_float=Decimal)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise GoalError(f"invalid goal file {path}: {exc}") from exc
 
-    _check_keys(data, GOAL_KEYS, "goal file")
 
+def _goal_ref(data: dict[str, Any], path: Path) -> GoalRef:
     name = _required_str(data, "name")
     if not _NAME_RE.fullmatch(name):
         raise GoalError("name may contain only letters, digits, '.', '_' and '-'")
-
     workdir = Path(_required_str(data, "workdir")).expanduser()
     if not workdir.is_absolute():
         workdir = path.resolve().parent / workdir
-    objective = _required_str(data, "objective")
+    return GoalRef(name, workdir, path)
 
+
+def read_goal_ref(path: Path) -> GoalRef:
+    """A goal file's name and directory, without applying the defaults file or judging any
+    setting: what `baton status` and `baton stop` need, and all they may depend on."""
+    path = Path(path)
+    return _goal_ref(_read_goal_table(path), path)
+
+
+def load_goal(path: Path) -> Goal:
+    path = Path(path)
+    data = _read_goal_table(path)
+    _check_keys(data, GOAL_KEYS, "goal file")
+    ref = _goal_ref(data, path)
+    objective = _required_str(data, "objective")
     rest = {k: v for k, v in data.items() if k not in ("name", "workdir", "objective")}
-    return goal_from_table(rest, name=name, workdir=workdir, objective=objective, path=path)
+    return goal_from_table(rest, name=ref.name, workdir=ref.workdir, objective=objective, path=path)
 
 
 def check_repo_table(data: dict[str, Any]) -> None:

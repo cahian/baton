@@ -23,9 +23,9 @@ from baton.adapters.base import (
     RoundResult,
 )
 from baton.config import Goal
-from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group, process_start
+from baton.proc import DEAD, OURS, UNKNOWN, check_group, clean_env, kill_group, process_start
 from baton.scheduler import Scheduler
-from baton.store import Store
+from baton.store import Store, workdir_lock
 
 GATE_TAIL_CHARS = 4000
 ROUND_TAIL_CHARS = 8000
@@ -119,6 +119,7 @@ def run_gate(goal: Goal, should_kill: Callable[[], bool] | None = None) -> tuple
                 command,
                 shell=True,
                 cwd=goal.workdir,
+                env=clean_env(),
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=subprocess.STDOUT,
@@ -298,10 +299,11 @@ def run_goal(
     of its own even if the gate already passes; like the notes, that is remembered in state.json
     until a round has taken it.
 
-    Holds the goal's lock for the duration; raises AlreadyRunning when another runner has it.
-    Everything else that goes wrong is logged as an `error` event, followed by a 60 s sleep.
+    Holds the goal's lock and a claim on its directory for the duration; raises AlreadyRunning
+    when another runner has the goal, or the directory or one inside or around it. Everything else
+    that goes wrong is logged as an `error` event, followed by a 60 s sleep.
     """
-    with store.lock():
+    with store.lock(), workdir_lock(goal.workdir, goal.name):
         return _Run(goal, adapters, store, clock, sleep, objective, owes_round).run()
 
 

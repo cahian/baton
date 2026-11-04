@@ -54,6 +54,7 @@ def isolated_baton_files(tmp_path, monkeypatch):
     """No test reads the real defaults file or touches the real spend ledger."""
     monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "config" / "defaults.toml"))
     monkeypatch.setenv("BATON_LEDGER", str(tmp_path / "ledger" / "claude-spend.json"))
+    monkeypatch.setenv("BATON_STATE_DIR", str(tmp_path / "state-base"))
 
 
 class Fakes:

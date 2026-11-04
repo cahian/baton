@@ -19,7 +19,14 @@ from baton.adapters.base import (
 from baton.config import load_goal
 from baton.proc import process_start
 from baton.runner import build_prompt, run_gate, run_goal, snapshot_work
-from baton.store import AlreadyRunning, StateError, Store
+from baton.store import (
+    AlreadyRunning,
+    StateError,
+    Store,
+    WorkdirBusy,
+    workdir_conflict,
+    workdir_lock,
+)
 
 OBJECTIVE = "Make the widget frobnicate."
 
@@ -520,6 +527,52 @@ def test_workdir_change_clears_ids(tmp_path, work, go, agents, store):
 def test_a_second_runner_is_refused(go, store):
     with store.lock(), pytest.raises(AlreadyRunning):
         go()
+
+
+def test_two_goals_in_one_directory_are_refused(tmp_path, work, agents, world):
+    goal = make_goal(tmp_path, work)
+    with workdir_lock(work, "a-session"), pytest.raises(WorkdirBusy, match="a-session"):
+        run_goal(goal, agents, Store(tmp_path / "other"), world.clock, world.sleep)
+    assert agents["codex"].prompts == []
+
+
+def test_a_goal_inside_the_directory_of_a_running_one_is_refused(tmp_path, work, agents, world):
+    inner = work / "pkg"
+    inner.mkdir()
+    goal = make_goal(tmp_path, inner)
+    with workdir_lock(work, "a-session"), pytest.raises(WorkdirBusy):
+        run_goal(goal, agents, Store(tmp_path / "other"), world.clock, world.sleep)
+
+
+def test_a_goal_around_the_directory_of_a_running_one_is_refused(tmp_path, work, agents, world):
+    goal = make_goal(tmp_path, work)
+    with workdir_lock(work / "pkg", "a-session"), pytest.raises(WorkdirBusy):
+        run_goal(goal, agents, Store(tmp_path / "other"), world.clock, world.sleep)
+
+
+def test_the_directory_is_claimed_for_the_whole_run(go, agents, work):
+    seen = []
+
+    def peek(agent, prompt, ctx):
+        seen.append(workdir_conflict(work))
+        (work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [peek]
+    assert go() == 0
+    assert "demo" in seen[0]
+    assert workdir_conflict(work) is None
+
+
+def test_the_gate_gets_no_api_keys(tmp_path, work, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-the-gate")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-the-gate")
+    monkeypatch.setenv("KEPT_VARIABLE", "kept")
+    goal = make_goal(tmp_path, work, verify="env")
+    passed, tail = run_gate(goal)
+    assert passed
+    assert "must-not-reach-the-gate" not in tail
+    assert "KEPT_VARIABLE=kept" in tail
 
 
 def test_stray_process_group_is_killed_on_start(go, agents, work, store):

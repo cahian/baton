@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,10 @@ class AlreadyRunning(Exception):
     """Another runner holds the lock for this goal."""
 
 
+class WorkdirBusy(AlreadyRunning):
+    """Another runner works in this directory, or in one inside it or around it."""
+
+
 class StateError(Exception):
     """state.json exists but cannot be read. The file is left untouched."""
 
@@ -39,6 +44,93 @@ def state_dir(name: str) -> Path:
     if not _SAFE_RE.fullmatch(name):
         raise ValueError(f"unsafe goal name: {name!r}")
     return state_base() / name
+
+
+# Directories in use, across every process: one claim file per running goal, flocked by its
+# runner for as long as it runs, so a claim ends with the process however that dies.
+WORKDIRS_DIR = ".workdirs"
+
+
+def overlapping(one: Path, other: Path) -> bool:
+    """True for the same directory, or one inside the other. Both already resolved."""
+    return one == other or one in other.parents or other in one.parents
+
+
+@contextmanager
+def _workdir_registry() -> Iterator[Path]:
+    """Hold the one lock under which claims are read and made, so that looking at a claim can
+    never collide with a runner taking it. Held for moments only."""
+    base = state_base() / WORKDIRS_DIR
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(base / "registry.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield base
+    finally:
+        os.close(fd)
+
+
+def _read_claim(path: Path) -> tuple[Path, str]:
+    try:
+        claim = json.loads(path.read_text(encoding="utf-8"))
+        return Path(claim["workdir"]), str(claim["owner"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return Path("/"), "a runner whose claim cannot be read"  # unknown means busy
+
+
+def _live_claims(base: Path) -> list[tuple[Path, str]]:
+    """The directory and owner of every claim still held. Abandoned ones are removed."""
+    live: list[tuple[Path, str]] = []
+    for path in base.glob("*.claim"):
+        fd = os.open(path, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                live.append(_read_claim(path))
+            else:
+                path.unlink(missing_ok=True)
+        finally:
+            os.close(fd)
+    return live
+
+
+def _conflict(base: Path, resolved: Path) -> str | None:
+    for other, owner in _live_claims(base):
+        if overlapping(resolved, other):
+            return f"baton is already working in {other} ({owner})"
+    return None
+
+
+def workdir_conflict(workdir: Path) -> str | None:
+    """What keeps a goal from running in `workdir` now, in words, or None."""
+    with _workdir_registry() as base:
+        return _conflict(base, Path(workdir).resolve())
+
+
+@contextmanager
+def workdir_lock(workdir: Path, owner: str) -> Iterator[None]:
+    """Claim `workdir` for one runner, across processes. Raises WorkdirBusy when it, a directory
+    inside it or one around it is claimed: two runners there would commit each other's work."""
+    resolved = Path(workdir).resolve()
+    with _workdir_registry() as base:
+        conflict = _conflict(base, resolved)
+        if conflict:
+            raise WorkdirBusy(conflict)
+        name = hashlib.sha256(str(resolved).encode("utf-8", errors="surrogateescape")).hexdigest()
+        fd = os.open(base / f"{name}.claim", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(fd, 0)
+            claim = {"workdir": str(resolved), "owner": owner}
+            os.write(fd, json.dumps(claim, ensure_ascii=False).encode("utf-8"))
+        except BaseException:
+            os.close(fd)
+            raise
+    try:
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock; the next look removes the file
 
 
 def _atomic_write(path: Path, text: str) -> None:

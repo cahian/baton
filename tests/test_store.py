@@ -1,10 +1,20 @@
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 
 from baton import store as store_mod
-from baton.store import AlreadyRunning, StateError, Store, state_dir
+from baton.store import (
+    AlreadyRunning,
+    StateError,
+    Store,
+    WorkdirBusy,
+    state_dir,
+    workdir_conflict,
+    workdir_lock,
+)
 
 
 @pytest.fixture
@@ -191,3 +201,84 @@ def test_lock_file_is_emptied_on_release(tmp_path):
     with store.lock():
         assert (store.root / "lock").read_text().strip() == str(os.getpid())
     assert (store.root / "lock").read_text() == ""
+
+
+# the claim on a working directory
+
+
+def test_a_directory_claim_is_refused_twice(tmp_path):
+    with workdir_lock(tmp_path, "one"):
+        with pytest.raises(WorkdirBusy, match="one"):
+            with workdir_lock(tmp_path, "two"):
+                pass
+
+
+def test_a_claim_is_free_again_after_it_is_released(tmp_path):
+    with workdir_lock(tmp_path, "one"):
+        pass
+    with workdir_lock(tmp_path, "two"):
+        assert "two" in workdir_conflict(tmp_path)
+
+
+@pytest.mark.parametrize(("held", "wanted"), [("a", "a/b"), ("a/b", "a"), ("a", "a/b/c/d")])
+def test_a_directory_inside_or_around_a_claim_is_busy(tmp_path, held, wanted):
+    with workdir_lock(tmp_path / held, "one"):
+        with pytest.raises(WorkdirBusy):
+            with workdir_lock(tmp_path / wanted, "two"):
+                pass
+
+
+@pytest.mark.parametrize(("held", "wanted"), [("a", "ab"), ("a/x", "a/y"), ("ab", "a")])
+def test_neighbouring_directories_do_not_conflict(tmp_path, held, wanted):
+    with workdir_lock(tmp_path / held, "one"), workdir_lock(tmp_path / wanted, "two"):
+        pass
+
+
+def test_a_claim_is_by_resolved_path(tmp_path):
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    with workdir_lock(tmp_path / "real", "one"):
+        with pytest.raises(WorkdirBusy):
+            with workdir_lock(tmp_path / "link", "two"):
+                pass
+
+
+def test_a_claim_is_seen_from_another_process(tmp_path):
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from baton.store import workdir_lock\n"
+        "with workdir_lock(Path(sys.argv[1]), 'other-process'):\n"
+        "    print('held', flush=True)\n"
+        "    sys.stdin.read()\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "held"
+        assert "other-process" in workdir_conflict(tmp_path)
+    finally:
+        child.kill()
+        child.wait()
+        child.stdin.close()
+        child.stdout.close()
+    assert workdir_conflict(tmp_path) is None  # it died without any cleanup: the claim ended too
+
+
+def test_abandoned_claims_are_removed(tmp_path):
+    with workdir_lock(tmp_path, "one"):
+        pass
+    workdir_conflict(tmp_path)
+    base = store_mod.state_base() / store_mod.WORKDIRS_DIR
+    assert list(base.glob("*.claim")) == []
+
+
+def test_a_claim_that_cannot_be_read_counts_as_busy(tmp_path):
+    with workdir_lock(tmp_path, "one"):
+        base = store_mod.state_base() / store_mod.WORKDIRS_DIR
+        next(base.glob("*.claim")).write_text("{ not json")
+        assert workdir_conflict(tmp_path / "anything") is not None

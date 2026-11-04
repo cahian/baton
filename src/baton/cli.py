@@ -18,7 +18,7 @@ from baton.adapters.antigravity import AntigravityAdapter
 from baton.adapters.base import Adapter
 from baton.adapters.claude_api import ClaudeApiAdapter, ledger_for, make_cost_report
 from baton.adapters.codex import CodexAdapter
-from baton.config import AgentConfig, Goal, GoalError, load_goal
+from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_goal_ref
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, opencode_config, serve
 from baton.runner import run_goal
@@ -46,17 +46,18 @@ def _err(message: str) -> None:
     print(f"baton: {message}", file=sys.stderr)
 
 
-def _resolve(target: str) -> tuple[str, Goal | None]:
+def _resolve(target: str) -> tuple[str, GoalRef | None]:
     """What `status`, `say` and `stop` were given: a goal file (its path), or the name of a job
     that already has state, such as the `session-<id>` jobs `baton serve` creates for OpenCode.
 
     Returns the state name and the goal (None for a job). A name never creates anything: an
     unknown one is refused. Anything that is a file, has a directory part or ends in `.toml` is a
-    goal path.
+    goal path. Only its name and directory are read: a settings problem, in it or in the defaults
+    file, must not stand between a person and stopping a goal.
     """
     looks_like_path = os.sep in target or target.endswith(".toml") or Path(target).is_file()
     if looks_like_path:
-        goal = load_goal(Path(target))
+        goal = read_goal_ref(Path(target))
         return goal.name, goal
     try:
         root = state_dir(target)
@@ -238,7 +239,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     return _print_status(name, goal)
 
 
-def _print_status(name: str, goal: Goal | None) -> int:
+def _print_status(name: str, goal: GoalRef | None) -> int:
     root = state_dir(name)
     if not root.exists():
         print(f"{name}: no state yet (it has never run)")

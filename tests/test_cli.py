@@ -13,7 +13,7 @@ from baton.adapters.codex import CodexAdapter
 from baton.cli import build_adapters, main
 from baton.config import load_goal
 from baton.proc import process_start
-from baton.store import AlreadyRunning, Store, state_dir
+from baton.store import AlreadyRunning, Store, state_dir, workdir_lock
 
 
 def store_for(fakes, name="demo") -> Store:
@@ -56,6 +56,60 @@ def test_say_now_requests_interrupt(fakes):
 def test_say_without_text_is_refused(fakes, capsys):
     assert main(["say", str(fakes.goal()), "   "]) == 2
     assert "empty" in capsys.readouterr().err
+
+
+BROKEN_DEFAULTS = "[agents.codex]\nthreshold_pct = 'high'\n"
+
+
+def test_a_broken_defaults_file_does_not_block_stop(fakes, capsys):
+    goal = fakes.goal()
+    fakes.defaults(BROKEN_DEFAULTS)
+    assert main(["stop", str(goal), "--now"]) == 0
+    assert Store(state_dir("demo")).stop_request() == "now"
+
+
+def test_a_broken_defaults_file_does_not_block_status(fakes, capsys):
+    goal = fakes.goal()
+    Store(state_dir("demo")).save_state({"round": 3})
+    fakes.defaults(BROKEN_DEFAULTS)
+    assert main(["status", str(goal)]) == 0
+    out = capsys.readouterr().out
+    assert "goal demo" in out and "round 3" in out and str(fakes.work) in out
+
+
+def test_a_broken_defaults_file_does_not_block_say(fakes):
+    goal = fakes.goal()
+    fakes.defaults(BROKEN_DEFAULTS)
+    assert main(["say", str(goal), "still", "here"]) == 0
+    assert "still here" in Store(state_dir("demo")).take_inbox()
+
+
+def test_a_broken_defaults_file_still_blocks_run(fakes, capsys):
+    goal = fakes.goal()
+    fakes.defaults(BROKEN_DEFAULTS)
+    assert main(["run", str(goal)]) == 2
+
+
+def test_stop_still_needs_a_goal_file_it_can_name(fakes, capsys):
+    bad = fakes.root / "bad.toml"
+    bad.write_text('workdir = "/tmp"\n')
+    assert main(["stop", str(bad)]) == 2
+    assert "name" in capsys.readouterr().err
+
+
+def test_run_is_refused_in_the_directory_of_a_session(fakes, capsys):
+    goal = fakes.goal()
+    with workdir_lock(fakes.work, "session-abc"):
+        assert main(["run", str(goal)]) == 1
+    assert "session-abc" in capsys.readouterr().err
+    assert fakes.codex_calls() == []
+
+
+def test_run_is_refused_in_a_subdirectory_of_a_session(fakes, capsys):
+    goal = fakes.goal()
+    with workdir_lock(fakes.work.parent, "session-abc"):
+        assert main(["run", str(goal)]) == 1
+    assert "session-abc" in capsys.readouterr().err
 
 
 def test_say_and_stop_commands(fakes):

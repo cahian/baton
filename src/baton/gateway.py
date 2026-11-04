@@ -30,7 +30,15 @@ from baton.adapters.base import Adapter
 from baton.config import Goal, GoalError, check_repo_table, goal_from_table
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group
 from baton.runner import run_goal
-from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
+from baton.store import (
+    AlreadyRunning,
+    StateError,
+    Store,
+    overlapping,
+    state_base,
+    state_dir,
+    workdir_conflict,
+)
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 18777
@@ -648,14 +656,24 @@ class JobManager:
     def _refuse_if_busy(self, session: str, workdir: Path) -> None:
         resolved = workdir.resolve()
         for other in self._jobs.values():
-            if other.session != session and other.resolved == resolved and other.is_running():
+            if (
+                other.session != session
+                and overlapping(other.resolved, resolved)
+                and other.is_running()
+            ):
                 raise GatewayError(
-                    f"a baton job is already running in {workdir} (OpenCode session "
+                    f"a baton job is already running in {other.workdir} (OpenCode session "
                     f"{other.session}), and two jobs in one directory would commit each "
                     "other's work. Nothing was started for this message. Follow that job in its "
                     f"OpenCode session or in {state_dir(other.name) / 'events.jsonl'}, and send "
                     "this again when it is done."
                 )
+        conflict = workdir_conflict(workdir)
+        if conflict:
+            raise GatewayError(
+                f"{conflict}. Nothing was started for this message: send it again when that is "
+                "done."
+            )
 
     def _briefing(self, name: str, workdir: Path, before: list, text: str) -> tuple[Goal, bool]:
         """The goal for `text` as the newest message, and whether an agent has a session of its

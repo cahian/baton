@@ -18,7 +18,7 @@ from baton.adapters.base import COMPLETED, LIMIT, Availability, RoundResult
 from baton.cli import main
 from baton.gateway import content_text, make_server
 from baton.proc import process_start
-from baton.store import Store, state_dir
+from baton.store import Store, state_dir, workdir_lock
 
 SESSION = "ses_abc123"
 TOOLS = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
@@ -733,6 +733,37 @@ def test_a_crashing_job_is_reported_and_the_server_keeps_serving(gw):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_a_parent_or_child_directory_of_a_running_job_is_busy(gw, tmp_path, monkeypatch):
+    child = gw.work / "pkg"
+    child.mkdir()
+    db = tmp_path / "opencode.db"
+    db.unlink()
+    make_db(db, [(SESSION, str(gw.work)), ("ses_child", str(child))])
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    gw.stream("go").read_until("busy")
+    text = gw.stream("elsewhere", session="ses_child").read_all()
+    assert "already running in" in text and "Nothing was started" in text
+    assert gw.job("ses_child") is None
+    gw.job().halt()
+
+
+def test_a_directory_claimed_by_a_baton_run_is_refused_at_once(gw):
+    with workdir_lock(gw.work / "pkg", "a-goal"):
+        text = gw.stream("go").read_all()
+    assert "a-goal" in text and "Nothing was started" in text
+    assert gw.job() is None and gw.agents["claude_api"].prompts == []
+
+
+def test_a_directory_claimed_as_the_job_starts_is_refused_by_the_job(gw, monkeypatch):
+    """The look before starting can be overtaken: the lock itself still holds."""
+    monkeypatch.setattr(gateway, "workdir_conflict", lambda _: None)
+    with workdir_lock(gw.work, "a-goal"):
+        text = gw.stream("go").read_all()
+    assert "cannot start" in text and "a-goal" in text
+    assert gw.agents["claude_api"].prompts == []
+    assert json.loads((gw.job().store.root / "job.json").read_text())["status"] == "refused"
 
 
 def test_a_session_whose_goal_is_locked_elsewhere_says_so(gw):
