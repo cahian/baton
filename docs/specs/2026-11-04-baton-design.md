@@ -129,13 +129,29 @@ There is no read-only limit query, so availability before a round is only the lo
 ### Antigravity adapter
 
 ```
-agy -p <prompt> --output-format stream-json --model <model> --effort <effort> \
-  --dangerously-skip-permissions
+agy -p <prompt> --output-format stream-json --model <model> --dangerously-skip-permissions
 ```
 
-Run with the working directory set and stdin closed. The final line is `{"event":"result","result":{"status":"...","error":"...","response":"..."}}`. The output when quota runs out has not been observed yet, so classification is by pattern on error text and output: `RESOURCE_EXHAUSTED|quota|rate.?limit|429` is `limit`; `authentication|sign in|log in` is `auth`.
+Run with the working directory set and stdin closed. The effort is part of the model id, for example `gemini-4-argon-medium`.
 
-Disabled by default in the goal, because AI Credit Overages must be set to Never in the Antigravity settings first and that cannot be verified from the CLI. With `enabled = false` the agent is skipped and the panel shows why. A reset time is used when present in the text, otherwise the no-known-reset backoff applies.
+Limits come from two slash commands that make no model call. Run each with `agy -p <command> --output-format text`, stdin closed, 30 s timeout.
+
+`/usage` prints tab-separated rows of group or model, label, percent remaining, and ISO 8601 reset:
+
+```
+Gemini Models<TAB>Weekly Limit Remaining<TAB>100%<TAB>2026-11-11T17:56:19Z
+Gemini Models<TAB>Five Hour Limit Remaining<TAB>100%<TAB>2026-11-04T22:56:19Z
+Claude and GPT models<TAB>Weekly Limit Remaining<TAB>100%<TAB>2026-11-11T17:56:19Z
+Gemini 4 Argon<TAB>Gemini 4 Argon Weekly Limit<TAB>99%<TAB>2026-11-11T17:56:01Z
+```
+
+`/credits` prints `Remaining credits<TAB>0`.
+
+Relevant rows are those whose first column is `Gemini Models` or starts with `Gemini`. Rows for `Claude and GPT models` are ignored. Used percent is `100 - remaining`. At least one `Gemini Models` row and a parseable credit balance are required, otherwise the agent is unavailable and retried after 5 min.
+
+Start a round only if every relevant row has used percent below `threshold_pct` (default 90). While a round runs, read both every `poll_s` (default 30) and apply the same rules as Codex: threshold reached is `limit`, credits below the balance read just before the round is `credit_guard`, two consecutive failed reads is `credit_guard`. A saturated row's reset sets the cooldown, the latest when several saturate.
+
+The final stream line is `{"event":"result","result":{"status":"SUCCESS","response":"...","error":"..."}}`. Text deltas appear in `step_update.text_delta`. A status other than `SUCCESS` is classified by pattern on error text and output: `RESOURCE_EXHAUSTED|quota|rate.?limit|429` is `limit`; `authentication|sign in|log in` is `auth`; otherwise `transient`.
 
 ### Environment
 
@@ -197,9 +213,10 @@ threshold_pct = 90
 poll_s = 15
 
 [agents.antigravity]
-enabled = false
-model = "gemini-4-argon"
-effort = "medium"
+enabled = true
+model = "gemini-4-argon-medium"
+threshold_pct = 90
+poll_s = 30
 
 [agents.claude]
 enabled = true
@@ -239,4 +256,4 @@ A Textual app that only reads state and events and writes to the inbox and stop 
 
 - A round can cross from threshold to 100% between polls. The 10% margin exists for this, and it cannot be mathematically zero. If the account's own setting for credits is available, it remains the only hard stop.
 - A long continuous loop may fall outside Anthropic's "ordinary, individual usage". The page does not define the limit.
-- Antigravity's quota output is unverified until someone logs in and hits it.
+- Antigravity's output when quota actually runs out has not been observed; the limit reads above are expected to stop it first.
