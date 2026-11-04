@@ -381,3 +381,23 @@ def test_forget_group_does_not_write_while_another_runner_holds_the_lock(fakes):
     with Store(store.root).lock():
         cli._forget_group(store)
     assert store.load_state()["group"] == child.pid  # not our file to write any more
+
+
+def test_an_ignored_sighup_stays_ignored(fakes, monkeypatch):
+    # `nohup baton run` must survive the terminal closing.
+    before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    seen = {}
+
+    def fake_run_goal(goal, adapters, store):
+        seen["handler"] = signal.getsignal(signal.SIGHUP)
+        os.kill(os.getpid(), signal.SIGHUP)
+        time.sleep(0.2)
+        return 0
+
+    try:
+        monkeypatch.setattr(cli, "run_goal", fake_run_goal)
+        assert main(["run", str(fakes.goal())]) == 0
+        assert seen["handler"] == signal.SIG_IGN
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, before)

@@ -792,3 +792,24 @@ def test_check_group_classifies_a_group():
         child.kill()
         child.wait()
     assert check_group(child.pid, started) == DEAD
+
+
+def test_process_start_treats_a_ps_error_as_unknown(monkeypatch):
+    from baton.proc import UNKNOWN, check_group, process_start
+
+    def fake_run(rc, err):
+        return lambda *a, **k: subprocess.CompletedProcess(a, rc, stdout="", stderr=err)
+
+    monkeypatch.setattr(subprocess, "run", fake_run(1, "ps: some failure\n"))
+    assert process_start(123) is None
+    monkeypatch.setattr(subprocess, "run", fake_run(1, ""))
+    assert process_start(123) == ""  # a silent 1 is "no such process"
+
+    # A live group whose ps call errored must be unknown, never ours.
+    child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        monkeypatch.setattr(subprocess, "run", fake_run(1, "ps: some failure\n"))
+        assert check_group(child.pid, "Mon Jan  1 00:00:00 2001") == UNKNOWN
+    finally:
+        child.kill()
+        child.wait()

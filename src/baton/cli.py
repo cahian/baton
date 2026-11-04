@@ -60,6 +60,9 @@ class _Signals:
 
     def __enter__(self) -> _Signals:
         for sig in self.SIGNALS:
+            # `nohup baton run` starts with SIGHUP ignored on purpose: keep it that way.
+            if sig == signal.SIGHUP and signal.getsignal(sig) == signal.SIG_IGN:
+                continue
             self._previous[sig] = signal.signal(sig, self._handle)
         self.armed = True
         return self

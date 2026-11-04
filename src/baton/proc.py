@@ -119,7 +119,7 @@ PS_TIMEOUT_S = 5
 
 
 def process_start(pid: int) -> str | None:
-    """When process `pid` started, as `ps` prints it ("" when no such process).
+    """When process `pid` started, as `ps` prints it ("" when `ps` says there is no such process).
 
     None when `ps` itself could not be run or answered nonsense. Two processes that ever held the
     same pid have different start times, which is what tells a recycled number from ours.
@@ -137,6 +137,8 @@ def process_start(pid: int) -> str | None:
         return None
     if out.returncode not in (0, 1):
         return None
+    if out.returncode == 1 and out.stderr.strip():
+        return None  # exit 1 with a message is an error; only a silent 1 means "no such process"
     return " ".join(out.stdout.split())
 
 
