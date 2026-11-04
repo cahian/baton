@@ -242,7 +242,7 @@ The server binds `127.0.0.1` only and uses the standard library's threading HTTP
 Request handling:
 
 - **Title requests** have no `tools` key. Answer at once with up to 6 words of the first user message, without calling an agent, so they spend nothing.
-- **No job for the session:** create one. The job's name is `session-<id>`, its state lives in the usual state directory, and the workdir comes from the `x-opencode-directory` header, or failing that the `Working directory:` line of the system message. If neither exists, respond with a clear error message. Do not guess a directory.
+- **No job for the session:** create one. The job's name is `session-<id>`, its state lives in the usual state directory, and the workdir comes from `select directory from session_v2 where id = ?`, read-only, on OpenCode's `opencode.db` (`~/.local/share/opencode/opencode.db`, path overridable with `BATON_OPENCODE_DB`). If that yields nothing, respond with a clear error message. Do not guess a directory.
 - **Goal:** if the workdir holds `baton.toml`, its `[verify]` and agent settings apply and the objective is the user's message. Otherwise there is no gate, and the job finishes when a round completes.
 - **Job already running for the session:** the new message becomes a note with interrupt, and the stream attaches to the job.
 - **Job finished for the session:** a new one starts, reusing the stored vendor session ids.
