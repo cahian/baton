@@ -933,10 +933,10 @@ def stop_at_first_line(line):
     return RoundResult(LIMIT, reason="stop") if line == "go" else None
 
 
-def edge_run(tmp_path, monkeypatch, code, cap=None):
+def edge_run(tmp_path, monkeypatch, code, cap=None, grace=0.2):
     if cap is not None:
         monkeypatch.setattr(proc, "STOP_LOG_BYTES", cap)
-    monkeypatch.setattr(proc, "KILL_GRACE_S", 0.2)
+    monkeypatch.setattr(proc, "KILL_GRACE_S", grace)
     ctx = make_ctx(tmp_path)
     run_streaming(
         py(code),
@@ -968,14 +968,16 @@ def test_a_key_split_at_the_log_cap_of_a_stopped_round_is_not_written(tmp_path, 
 
 
 def test_the_held_tail_is_dropped_when_the_log_is_full(tmp_path, monkeypatch):
+    """The `B` chunk is what shows the log is full, so the child must outlive the stop until it
+    has written it: it ignores SIGTERM, ends by itself, and the grace period never runs out."""
     code = (
-        "import sys, time\n"
+        "import signal, sys\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "sys.stdout.write('go\\n'); sys.stdout.flush()\n"
         f"sys.stdout.write('A' * (65536 - {KEEP}) + 'Z' * {KEEP}); sys.stdout.flush()\n"
         "sys.stdout.write('B' * 70000 + '\\n'); sys.stdout.flush()\n"
-        "time.sleep(30)\n"
     )
-    log = edge_run(tmp_path, monkeypatch, code, cap=65536)
+    log = edge_run(tmp_path, monkeypatch, code, cap=65536, grace=30)
     assert "Z" not in log  # nothing more is written once the cap is reached
 
 
@@ -996,6 +998,68 @@ def test_a_held_tail_that_cannot_start_the_secret_is_still_flushed_at_the_end(
 ):
     code = f"import sys; sys.stdout.write('A' * (65536 - {KEEP}) + 'Z' * {KEEP})"
     assert edge_run(tmp_path, monkeypatch, code) == "A" * (65536 - KEEP) + "Z" * KEEP
+
+
+# --- the killer thread cannot start -----------------------------------------------------------
+
+
+def test_a_killer_thread_that_cannot_start_still_kills_the_group(tmp_path, monkeypatch):
+    """Thread exhaustion at the worst moment: without the synchronous fallback the sweep is
+    skipped and `killer.join()` raises, so the agent goes on running with nobody watching."""
+    real_start = threading.Thread.start
+
+    def start(thread):
+        if thread._target is proc._kill_group:
+            raise RuntimeError("can't start new thread")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(proc, "KILL_GRACE_S", 0.2)
+    ctx = make_ctx(tmp_path)
+    groups = []
+    ctx.on_spawn = groups.append
+    started = time.monotonic()
+    ex = run_streaming(
+        py("import sys, time\nprint('go', flush=True)\ntime.sleep(25)\n"),
+        tmp_path,
+        None,
+        ctx,
+        stop_at_first_line,
+        lambda: None,
+    )
+    assert time.monotonic() - started < 15  # killed, rather than waited for
+    assert ex.stopped is not None and ex.stopped.reason == "stop"
+    with pytest.raises(ProcessLookupError):
+        os.killpg(groups[0], 0)
+
+
+def test_a_failed_killer_start_does_not_hide_the_round_result(tmp_path, monkeypatch):
+    """The fallback runs even when the round already raised, and that error is the one seen."""
+    real_start = threading.Thread.start
+
+    def start(thread):
+        if thread._target is proc._kill_group:
+            raise MemoryError
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(proc, "KILL_GRACE_S", 0.2)
+    ctx = make_ctx(tmp_path)
+    groups = []
+
+    def boom(pgid):
+        groups.append(pgid)
+        raise ValueError("on_spawn failed")
+
+    ctx.on_spawn = boom
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="on_spawn failed"):
+        run_streaming(
+            py("import time\ntime.sleep(25)\n"), tmp_path, None, ctx, lambda _: None, lambda: None
+        )
+    assert time.monotonic() - started < 15
+    with pytest.raises(ProcessLookupError):
+        os.killpg(groups[0], 0)
 
 
 # --- the last piece of output, when it has no newline -----------------------------------------

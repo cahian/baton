@@ -309,6 +309,7 @@ def run_streaming(
     killer = threading.Thread(
         target=_kill_group, args=(pgid, KILL_GRACE_S, child.poll), daemon=True
     )
+    killer_running = False
     delivering = True  # false once a stop is decided or on_line raised
     eof = False
     last_output = time.monotonic()
@@ -367,6 +368,16 @@ def run_streaming(
             _log_quietly(log.flush)  # buffered while a backlog is being worked off
         return item is not None
 
+    def sweep() -> None:
+        """End the group from the killer thread or, when no thread can be had, from this one:
+        the delivery of the queued lines waits then, but the agent dies regardless."""
+        nonlocal killer_running
+        try:
+            killer.start()
+            killer_running = True
+        except Exception:
+            _kill_group(pgid, KILL_GRACE_S, child.poll)
+
     def finish() -> None:
         """Work off the queue while the group dies, then stop reading and empty it."""
         ending_at = None
@@ -423,13 +434,14 @@ def run_streaming(
                             timed_out = True
         finally:
             # Always sweep the group, also after a normal exit, so nothing outlives the round.
-            killer.start()
+            sweep()
             finish()
         if stopped is None:
             stopped = deferred
     finally:
         abandon.set()
-        killer.join()
+        if killer_running:
+            killer.join()
         returncode = child.wait()
         reader.join(timeout=0.05)
         # Closing the pipe would block on the reader's buffer lock if a process outside the
