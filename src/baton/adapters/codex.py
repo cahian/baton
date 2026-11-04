@@ -15,7 +15,9 @@ import signal
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
 from baton.adapters.base import (
@@ -35,6 +37,10 @@ from baton.proc import clean_env, run_streaming
 # How long an agent rests after a failed or unreadable limits read.
 RETRY_S = 300
 READ_TIMEOUT_S = 15
+# Longest chunk taken from the server in one piece; a server cannot grow a line without bound.
+MAX_LINE_BYTES = 64 * 1024
+# How many error lines of a round are kept to classify its failure.
+MAX_PROBLEMS = 20
 
 _AUTH_RE = re.compile(
     r"not logged in|log ?in again|please log ?in|unauthori[sz]ed|\b401\b"
@@ -65,7 +71,7 @@ def _loads(raw: bytes | str) -> object:
 
 def _pump(stream, out: queue.Queue) -> None:
     try:
-        for line in iter(stream.readline, b""):
+        for line in iter(lambda: stream.readline(MAX_LINE_BYTES), b""):
             out.put(line)
     except (OSError, ValueError):
         pass
@@ -90,6 +96,7 @@ def read_limits(bin_path: str, timeout_s: float = READ_TIMEOUT_S) -> dict:
         )
     except OSError as exc:
         raise LimitsError(f"cannot start {bin_path}: {exc.strerror or exc}") from exc
+    deadline = time.monotonic() + timeout_s
     lines: queue.Queue = queue.Queue()
     reader = threading.Thread(target=_pump, args=(child.stdout, lines), daemon=True)
     reader.start()
@@ -109,10 +116,14 @@ def read_limits(bin_path: str, timeout_s: float = READ_TIMEOUT_S) -> dict:
             child.stdin.flush()
         except (OSError, ValueError) as exc:
             raise LimitsError(f"cannot talk to app-server: {exc}") from exc
-        deadline = time.monotonic() + timeout_s
         while True:
+            # Checked on every pass, not only when the queue is empty: a server that floods
+            # output must not keep the deadline from firing.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LimitsError(f"app-server did not answer within {timeout_s:g}s")
             try:
-                raw = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+                raw = lines.get(timeout=remaining)
             except queue.Empty:
                 raise LimitsError(f"app-server did not answer within {timeout_s:g}s") from None
             if raw is None:
@@ -141,12 +152,11 @@ def read_limits(bin_path: str, timeout_s: float = READ_TIMEOUT_S) -> dict:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-        for stream in (child.stdin,):
-            try:
-                if stream is not None:
-                    stream.close()
-            except (OSError, ValueError):
-                pass
+        try:
+            if child.stdin is not None:
+                child.stdin.close()
+        except (OSError, ValueError):
+            pass
         reader.join(timeout=1)
         if not reader.is_alive() and child.stdout is not None:
             try:
@@ -194,72 +204,96 @@ def parse_balance(result: dict) -> Decimal:
     return balance
 
 
-def _evaluate(result: object, threshold_pct: int, now: float) -> tuple[Availability, bool]:
-    """Availability plus whether the data was unreadable ("blind") rather than a clear no."""
-    usage: dict = {"primary_pct": None, "secondary_pct": None, "balance": None, "plan": None}
+@dataclass(frozen=True)
+class _Eval:
+    """One limits read, judged. Everything readable is used even when something else is not."""
 
-    def blind(reason: str) -> tuple[Availability, bool]:
-        return Availability(False, until=now + RETRY_S, reason=reason, usage=usage), True
+    avail: Availability
+    refused: bool  # a clear "no": flag false, reached type set, or a window at the threshold
+    blind: bool  # some field the decision needs was missing or unreadable
+    balance: Decimal | None  # the credit balance whenever it could be parsed
+
+
+def _evaluate(result: object, threshold_pct: int, now: float) -> _Eval:
+    """Judge a read without letting one unreadable field hide the rest.
+
+    A parseable balance is always reported, so a drop is seen even if other fields are broken,
+    and a clear refusal is honoured even when something else is unreadable.
+    """
+    usage: dict = {"primary_pct": None, "secondary_pct": None, "balance": None, "plan": None}
+    blind: list[str] = []
+    reasons: list[str] = []
+    windows: dict[str, dict] = {}
+    balance: Decimal | None = None
+    limits: dict | None = None
 
     if not isinstance(result, dict):
-        return blind("limits result is not an object")
-    limits = result.get("rateLimits")
-    if not isinstance(limits, dict):
-        return blind("rateLimits is missing")
-    plan = limits.get("planType")
-    usage["plan"] = plan if isinstance(plan, str) else None
+        blind.append("limits result is not an object")
+    else:
+        raw_limits = result.get("rateLimits")
+        if not isinstance(raw_limits, dict):
+            blind.append("rateLimits is missing")
+        else:
+            limits = raw_limits
+        try:
+            balance = parse_balance(result)
+            usage["balance"] = str(balance)
+        except LimitsError as exc:
+            blind.append(str(exc))
 
-    primary = limits.get("primary")
-    if not isinstance(primary, dict) or not _is_number(primary.get("usedPercent")):
-        return blind("primary window is missing or unreadable")
-    windows = {"primary": primary}
-    secondary = limits.get("secondary")
-    if secondary is not None:
-        if not isinstance(secondary, dict) or not _is_number(secondary.get("usedPercent")):
-            return blind("secondary window is unreadable")
-        windows["secondary"] = secondary
-    usage["primary_pct"] = _plain(primary["usedPercent"])
-    if secondary is not None:
-        usage["secondary_pct"] = _plain(secondary["usedPercent"])
+    if limits is not None and isinstance(result, dict):
+        plan = limits.get("planType")
+        usage["plan"] = plan if isinstance(plan, str) else None
+        for name, required in (("primary", True), ("secondary", False)):
+            window = limits.get(name)
+            if window is None and not required:
+                continue
+            if isinstance(window, dict) and _is_number(window.get("usedPercent")):
+                windows[name] = window
+                usage[f"{name}_pct"] = _plain(window["usedPercent"])
+            else:
+                blind.append(f"{name} window is missing or unreadable")
+        if "rateLimitReachedType" not in limits:
+            blind.append("rateLimitReachedType is missing")
+        elif limits["rateLimitReachedType"] is not None:
+            reasons.append(f"rate limit reached ({limits['rateLimitReachedType']})")
+        allowed = result.get("ordinaryUsageAllowed")
+        if not isinstance(allowed, bool):
+            blind.append("ordinaryUsageAllowed is missing or not a boolean")
+        elif allowed is False:
+            reasons.append("ordinary usage is not allowed")
 
-    try:
-        balance = parse_balance(result)
-    except LimitsError as exc:
-        return blind(str(exc))
-    usage["balance"] = str(balance)
-
-    if "rateLimitReachedType" not in limits:
-        return blind("rateLimitReachedType is missing")
-    allowed = result.get("ordinaryUsageAllowed")
-    if not isinstance(allowed, bool):
-        return blind("ordinaryUsageAllowed is missing or not a boolean")
-
-    reasons: list[str] = []
-    saturated: list[dict] = []
-    if allowed is False:
-        reasons.append("ordinary usage is not allowed")
-    if limits["rateLimitReachedType"] is not None:
-        reasons.append(f"rate limit reached ({limits['rateLimitReachedType']})")
+    saturated = []
     for name, window in windows.items():
         if window["usedPercent"] >= threshold_pct:
             reasons.append(f"{name} window at {_plain(window['usedPercent'])}%")
             saturated.append(window)
-    if not reasons:
-        return Availability(True, usage=usage), False
+
+    if not reasons and not blind:
+        return _Eval(Availability(True, usage=usage), False, False, balance)
 
     def resets(group: list[dict]) -> list[float]:
         return [float(w["resetsAt"]) for w in group if _is_number(w.get("resetsAt"))]
 
-    known = resets(saturated) or resets(list(windows.values()))
-    until = max(known) if known else None
-    if until is not None and until <= now:
-        until = now + RETRY_S  # a stale reset is no reset
-    return Availability(False, until=until, reason="; ".join(reasons), usage=usage), False
+    if reasons:
+        known = resets(saturated) or resets(list(windows.values()))
+        until = max(known) if known else None
+        if until is not None and until <= now:
+            until = now + RETRY_S  # a stale reset is no reset
+    else:
+        until = now + RETRY_S
+    text = "; ".join(reasons + [f"unreadable: {b}" for b in blind] if reasons else blind)
+    return _Eval(
+        Availability(False, until=until, reason=text, usage=usage),
+        refused=bool(reasons),
+        blind=bool(blind),
+        balance=balance,
+    )
 
 
 def check_limits(result: dict, threshold_pct: int, now: float) -> Availability:
     """Whether a round may start (or go on) given one limits read."""
-    return _evaluate(result, threshold_pct, now)[0]
+    return _evaluate(result, threshold_pct, now).avail
 
 
 # --- the credit guard ------------------------------------------------------------------------
@@ -291,10 +325,10 @@ class _Guard:
             return RoundResult(
                 LIMIT, until=self.wall_clock() + RETRY_S, reason=f"cannot read limits: {exc}"
             )
-        avail, _ = _evaluate(result, self.cfg.threshold_pct, self.wall_clock())
-        if not avail.ok:
-            return RoundResult(LIMIT, until=avail.until, reason=avail.reason)
-        self.baseline = parse_balance(result)
+        ev = _evaluate(result, self.cfg.threshold_pct, self.wall_clock())
+        if not ev.avail.ok or ev.balance is None:
+            return RoundResult(LIMIT, until=ev.avail.until, reason=ev.avail.reason)
+        self.baseline = ev.balance
         self.last_poll = self.poll_clock()
         return None
 
@@ -303,36 +337,63 @@ class _Guard:
         if now - self.last_poll < self.cfg.poll_s:
             return None
         self.last_poll = now
-        return self.check()
+        verdict, unreadable = self._observe()
+        if verdict is not None:
+            return verdict
+        if unreadable is None:
+            self.failures = 0
+            return None
+        self.failures += 1
+        if self.failures >= 2:
+            return RoundResult(
+                CREDIT_GUARD,
+                reason=f"limits unreadable {self.failures} times in a row: {unreadable}",
+            )
+        return None
 
-    def check(self) -> RoundResult | None:
+    def _observe(self) -> tuple[RoundResult | None, str | None]:
+        """One read: (a verdict that stops the round, why the read was not fully readable).
+
+        Order matters: any parseable balance is compared first, then clear refusals are honoured,
+        and only then is being blind counted by the caller.
+        """
         assert self.baseline is not None
         try:
             result = self.read()
         except Exception as exc:
-            return self._blind(f"limits read failed: {exc}")
-        avail, blind = _evaluate(result, self.cfg.threshold_pct, self.wall_clock())
-        if blind:
-            return self._blind(avail.reason)
-        self.failures = 0
-        balance = parse_balance(result)
-        if balance < self.baseline:
-            return RoundResult(
-                CREDIT_GUARD,
-                until=None if avail.ok else avail.until,
-                reason=f"credit balance dropped from {self.baseline} to {balance}",
+            return None, f"limits read failed: {exc}"
+        ev = _evaluate(result, self.cfg.threshold_pct, self.wall_clock())
+        unreadable = ev.avail.reason if ev.blind else None
+        if ev.balance is not None and ev.balance < self.baseline:
+            return (
+                RoundResult(
+                    CREDIT_GUARD,
+                    until=None if ev.avail.ok else ev.avail.until,
+                    reason=f"credit balance dropped from {self.baseline} to {ev.balance}",
+                ),
+                unreadable,
             )
-        if not avail.ok:
-            return RoundResult(LIMIT, until=avail.until, reason=avail.reason)
-        return None
+        if ev.refused:
+            return RoundResult(LIMIT, until=ev.avail.until, reason=ev.avail.reason), unreadable
+        return None, unreadable
 
-    def _blind(self, why: str) -> RoundResult | None:
-        self.failures += 1
-        if self.failures >= 2:
-            return RoundResult(
-                CREDIT_GUARD, reason=f"limits unreadable {self.failures} times in a row: {why}"
-            )
-        return None
+    def close(self) -> RoundResult | None:
+        """The read after the process is gone: it must see the balance, or the round is suspect.
+
+        A debit made since the last poll is only visible here, and the next round's baseline
+        would absorb it. One failed read is retried once; a second failure is credit_guard.
+        """
+        why = ""
+        for _ in range(2):
+            verdict, unreadable = self._observe()
+            if verdict is not None and verdict.outcome == CREDIT_GUARD:
+                return verdict
+            if unreadable is None:
+                return None
+            why = unreadable
+        return RoundResult(
+            CREDIT_GUARD, reason=f"cannot confirm the balance after the round: {why}"
+        )
 
 
 # --- the adapter -----------------------------------------------------------------------------
@@ -410,7 +471,7 @@ class CodexAdapter:
         if refused is not None:
             return refused
 
-        problems: list[str] = []
+        problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
         reported = False
 
         def on_line(line: str) -> RoundResult | None:
@@ -433,31 +494,48 @@ class CodexAdapter:
             return None
 
         argv = self.argv(ctx.session_id, str(ctx.workdir))
+        spawned = False
+
+        def on_spawn(pid: int) -> None:
+            nonlocal spawned
+            spawned = True
+            ctx.on_spawn(pid)
+
+        result: RoundResult | None = None
         try:
             exit_ = run_streaming(
-                argv, ctx.workdir, prompt, ctx, on_line, guard.tick, tick_s=self.tick_s
+                argv,
+                ctx.workdir,
+                prompt,
+                replace(ctx, on_spawn=on_spawn),
+                on_line,
+                guard.tick,
+                tick_s=self.tick_s,
             )
         except OSError as exc:
-            return RoundResult(TRANSIENT, reason=f"cannot start {self.cfg.bin}: {exc}")
-
-        result = exit_.stopped
-        if result is None:
-            result = self._classify(exit_.returncode, exit_.timed_out, problems, ctx)
-        # The process is gone; one last read catches a debit made since the previous poll.
+            if not spawned:
+                return RoundResult(TRANSIENT, reason=f"cannot start {self.cfg.bin}: {exc}")
+            # The agent ran (and may have spent something) before the runner failed.
+            result = RoundResult(TRANSIENT, reason=f"runner failed after the agent started: {exc}")
+        else:
+            result = exit_.stopped
+            if result is None:
+                result = self._classify(exit_.returncode, exit_.timed_out, problems, ctx)
+        # The process is gone; the closing read catches a debit made since the previous poll.
         if result.outcome != CREDIT_GUARD:
-            late = guard.check()
-            if late is not None and late.outcome == CREDIT_GUARD:
+            late = guard.close()
+            if late is not None:
                 return late
         return result
 
     def _classify(
-        self, returncode: int | None, timed_out: bool, problems: list[str], ctx: RoundContext
+        self, returncode: int | None, timed_out: bool, problems: deque[str], ctx: RoundContext
     ) -> RoundResult:
         if timed_out:
             return RoundResult(TIMEOUT, reason="round exceeded its time limit")
         if returncode == 0:
             return RoundResult(COMPLETED)
-        text = "\n".join(problems[-20:])
+        text = "\n".join(problems)
         summary = (problems[-1] if problems else f"exit code {returncode}")[:300]
         if _AUTH_RE.search(text):
             return RoundResult(AUTH, reason=summary)

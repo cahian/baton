@@ -4,8 +4,8 @@ Subcommands:
   app-server  JSON-RPC over stdio. `FAKE_CODEX_SCENARIO` names a JSON file holding a list; each
               spawn consumes the next entry (the last one repeats). An entry is a limit result
               object, `{"__raw_result__": "<json text>"}` (sent verbatim), or one of the
-              strings "hang", "garbage", "rpc_error". The cursor is kept in `<scenario>.cursor`,
-              as every read is a fresh process.
+              strings "hang", "flood", "garbage", "rpc_error". The cursor is kept in
+              `<scenario>.cursor`, as every read is a fresh process.
               `FAKE_CODEX_RPC` collects every line received, `FAKE_CODEX_PIDFILE` gets the pid.
   exec        Prints JSONL. Every call is appended to `FAKE_CODEX_CALLS` (one JSON object per line,
               with the argv and the stdin text). `FAKE_CODEX_THREAD_ID` is the thread id to
@@ -43,6 +43,12 @@ def app_server() -> None:
     if entry == "hang":
         time.sleep(600)
         return
+    if entry == "flood":
+        # Never answers, never pauses: only a deadline checked on every read can end this.
+        burst = '{"method": "noise", "params": {}}\n' * 500
+        while True:
+            sys.stdout.write(burst)
+            sys.stdout.flush()
     if entry == "garbage":
         sys.stdout.write("this is not json\n{broken\n")
         sys.stdout.flush()

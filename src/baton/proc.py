@@ -14,12 +14,23 @@ from pathlib import Path
 
 from baton.adapters.base import COMPLETED, RoundContext, RoundResult
 
+# Variables that make a vendor CLI authenticate with something other than the subscription login.
+# The Codex entries come from the strings of its binary: it reads CODEX_API_KEY and
+# CODEX_ACCESS_TOKEN ahead of the stored login, and workload-identity federation from OPENAI_*.
+# Cloud credentials (AWS_*, AZURE_*, GOOGLE_APPLICATION_CREDENTIALS) are left alone on purpose: the
+# agent's own work may need them, and nothing selects a cloud provider unless its config says so.
 SCRUBBED_ENV = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_GUARDIAN_DECISIONS_API_KEY",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
 )
 
 # Seconds between SIGTERM and SIGKILL. A module constant so tests can shorten it.

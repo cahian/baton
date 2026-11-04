@@ -204,6 +204,26 @@ def test_read_limits_hang_times_out_and_kills_server(fake):
     assert wait_dead(int(fake.pidfile.read_text()))
 
 
+def test_read_limits_flooding_server_still_times_out(fake, monkeypatch):
+    from baton.adapters import codex
+
+    # A consumer slower than the flood keeps the queue non-empty, which is when a deadline that
+    # is only checked on an empty queue never fires.
+    real_loads = codex._loads
+
+    def slow_loads(raw):
+        time.sleep(0.01)
+        return real_loads(raw)
+
+    monkeypatch.setattr(codex, "_loads", slow_loads)
+    fake.scenario("flood")
+    t0 = time.monotonic()
+    with pytest.raises(LimitsError, match="did not answer"):
+        read_limits(fake.bin, timeout_s=1)
+    assert time.monotonic() - t0 < 5
+    assert wait_dead(int(fake.pidfile.read_text()))
+
+
 def test_read_limits_missing_binary_raises(tmp_path):
     with pytest.raises(LimitsError):
         read_limits(str(tmp_path / "nope"))
@@ -602,3 +622,182 @@ def test_missing_binary_is_transient(tmp_path):
     a = adapter(str(tmp_path / "nope"), Reads(limits()))
     res = a.run_round("go", make_ctx(tmp_path))
     assert res.outcome == TRANSIENT
+
+
+# --- the order of the guard's checks ---------------------------------------------------------
+
+
+def without(result, *path):
+    """A copy of a limits result with one nested key removed (makes a field unreadable)."""
+    out = json.loads(json.dumps(result))
+    node = out
+    for key in path[:-1]:
+        node = node[key]
+    del node[path[-1]]
+    return out
+
+
+@pytest.mark.parametrize(
+    "blind_read",
+    [
+        without(limits(balance="9"), "rateLimits", "rateLimitReachedType"),
+        without(limits(balance="9"), "ordinaryUsageAllowed"),
+        limits(balance="9", primary=None),
+        limits(balance="9", secondary="oops"),
+    ],
+    ids=["no-reached-type", "no-allowed-flag", "no-primary", "bad-secondary"],
+)
+def test_balance_drop_is_seen_even_when_another_field_is_blind(
+    fake, tmp_path, monkeypatch, blind_read
+):
+    monkeypatch.setenv("FAKE_CODEX_EXEC_SLEEP", "30")
+    # Only one blind read ever happens before the round must end: it is not counted as the
+    # "second consecutive failure" that would have stopped it anyway.
+    reads = Reads(limits(balance="10"), blind_read, limits(balance="9"))
+    pids = []
+    res = adapter(fake.bin, reads).run_round("go", make_ctx(tmp_path, on_spawn=pids.append))
+    assert res.outcome == CREDIT_GUARD and "dropped" in res.reason
+    assert reads.calls == 2
+    assert wait_dead(pids[0])
+
+
+def test_clear_refusal_is_honoured_when_another_field_is_blind(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_EXEC_SLEEP", "30")
+    reset = time.time() + 3600
+    saturated_and_blind = without(
+        limits(balance="10", primary=100, primary_reset=reset), "rateLimits", "rateLimitReachedType"
+    )
+    # The third read is the closing one; it must be readable or the round turns credit_guard.
+    reads = Reads(limits(balance="10"), saturated_and_blind, limits(balance="10"))
+    res = adapter(fake.bin, reads).run_round("go", make_ctx(tmp_path))
+    assert res.outcome == LIMIT and res.until == reset
+    assert reads.calls == 3
+
+
+def test_flag_refusal_without_a_balance_is_honoured(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_EXEC_SLEEP", "30")
+    refused = limits(allowed=False)
+    refused["rateLimits"]["credits"] = None
+    reads = Reads(limits(), refused, limits())
+    res = adapter(fake.bin, reads).run_round("go", make_ctx(tmp_path))
+    assert res.outcome == LIMIT
+    assert reads.calls == 3
+
+
+def test_check_limits_reports_refusal_even_with_blind_fields():
+    r = without(limits(primary=95, primary_reset=NOW + 500), "rateLimits", "rateLimitReachedType")
+    a = check_limits(r, 90, NOW)
+    assert not a.ok and a.until == NOW + 500 and "primary window at 95%" in a.reason
+    assert "rateLimitReachedType" in a.reason  # the blind field is still reported
+
+
+# --- the closing read ------------------------------------------------------------------------
+
+
+def closing_adapter(fake, *reads) -> tuple[CodexAdapter, Reads]:
+    r = Reads(*reads)
+    # poll clock frozen: no tick ever polls, so the closing read is the only read after the baseline
+    return CodexAdapter(make_cfg(fake.bin), read=r, poll_clock=lambda: 0.0), r
+
+
+def test_closing_read_is_retried_and_still_sees_the_debit(fake, tmp_path):
+    a, reads = closing_adapter(fake, limits(balance="10"), LimitsError("blip"), limits(balance="9"))
+    res = a.run_round("go", make_ctx(tmp_path))
+    assert res.outcome == CREDIT_GUARD and "dropped" in res.reason
+    assert reads.calls == 3
+
+
+def test_closing_read_failing_twice_is_credit_guard(fake, tmp_path):
+    a, reads = closing_adapter(fake, limits(), LimitsError("down"))
+    res = a.run_round("go", make_ctx(tmp_path))
+    assert res.outcome == CREDIT_GUARD and "cannot confirm" in res.reason
+    assert reads.calls == 3
+
+
+def test_closing_read_unparseable_twice_is_credit_guard(fake, tmp_path):
+    a, _ = closing_adapter(fake, limits(), limits(balance=None))
+    assert a.run_round("go", make_ctx(tmp_path)).outcome == CREDIT_GUARD
+
+
+def test_closing_read_failing_once_then_healthy_keeps_the_outcome(fake, tmp_path):
+    a, reads = closing_adapter(fake, limits(), LimitsError("blip"), limits())
+    assert a.run_round("go", make_ctx(tmp_path)).outcome == COMPLETED
+    assert reads.calls == 3
+
+
+def test_closing_read_also_guards_a_stopped_round(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_EXEC_SLEEP", "30")
+    reads = Reads(limits(), LimitsError("x"))
+    a = CodexAdapter(make_cfg(fake.bin), read=reads, poll_clock=lambda: 0.0)
+    a.tick_s = 0.05
+    # The stop request ends the round as COMPLETED; the closing reads then fail twice.
+    res = a.run_round("go", make_ctx(tmp_path, should_kill=lambda: True))
+    assert res.outcome == CREDIT_GUARD
+
+
+# --- runner failures and wiring --------------------------------------------------------------
+
+
+def test_oserror_after_spawn_is_reported_as_such_and_still_gets_a_closing_read(
+    tmp_path, monkeypatch
+):
+    from baton.adapters import codex
+
+    def broken(argv, cwd, stdin_text, ctx, on_line, tick, tick_s):
+        ctx.on_spawn(4242)
+        raise OSError("log disk full")
+
+    monkeypatch.setattr(codex, "run_streaming", broken)
+    reads = Reads(limits(balance="10"), limits(balance="9"))
+    spawned = []
+    a = CodexAdapter(make_cfg(), read=reads, poll_clock=lambda: 0.0)
+    res = a.run_round("go", make_ctx(tmp_path, on_spawn=spawned.append))
+    assert spawned == [4242]
+    assert res.outcome == CREDIT_GUARD  # the closing read saw the debit
+
+    ok = CodexAdapter(make_cfg(), read=Reads(limits()), poll_clock=lambda: 0.0)
+    res = ok.run_round("go", make_ctx(tmp_path))
+    assert res.outcome == TRANSIENT
+    assert "after the agent started" in res.reason and "log disk full" in res.reason
+
+
+def test_oserror_before_spawn_says_cannot_start(tmp_path, monkeypatch):
+    from baton.adapters import codex
+
+    def broken(argv, cwd, stdin_text, ctx, on_line, tick, tick_s):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(codex, "run_streaming", broken)
+    reads = Reads(limits())
+    res = CodexAdapter(make_cfg(), read=reads).run_round("go", make_ctx(tmp_path))
+    assert res.outcome == TRANSIENT and "cannot start" in res.reason
+    assert reads.calls == 1  # nothing ran, so no closing read
+
+
+def test_default_read_wiring_uses_cfg_bin_for_baseline_and_closing_read(fake, tmp_path):
+    # No injected `read`: the adapter must reach the (fake) app-server through cfg.bin.
+    fake.scenario(limits(balance="10"), limits(balance="9"))
+    a = CodexAdapter(make_cfg(fake.bin), poll_clock=lambda: 0.0)
+    res = a.run_round("go", make_ctx(tmp_path))
+    assert res.outcome == CREDIT_GUARD and "10" in res.reason and "9" in res.reason
+    initializes = [x for x in fake.rpc.read_text().splitlines() if '"initialize"' in x]
+    assert len(initializes) == 2  # baseline and closing read, one fresh server each
+
+
+def test_default_read_wiring_availability(fake):
+    fake.scenario(limits(primary=95))
+    assert not CodexAdapter(make_cfg(fake.bin)).availability().ok
+    fake.scenario(limits())
+    (Path(os.environ["FAKE_CODEX_SCENARIO"] + ".cursor")).unlink()
+    assert CodexAdapter(make_cfg(fake.bin)).availability().ok
+
+
+def test_only_the_last_error_lines_are_kept(fake, tmp_path, monkeypatch):
+    from baton.adapters import codex
+
+    monkeypatch.setattr(codex, "MAX_PROBLEMS", 3)
+    noise = "\n".join(f"noise {i}" for i in range(50))
+    monkeypatch.setenv("FAKE_CODEX_EXEC_FAIL", "usage limit hit\n" + noise)
+    monkeypatch.setenv("FAKE_CODEX_EXEC_EXIT", "1")
+    res = adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path))
+    assert res.outcome == TRANSIENT  # the limit line was pushed out of the bounded window

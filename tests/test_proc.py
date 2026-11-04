@@ -59,6 +59,22 @@ def test_clean_env_removes_every_key():
     assert base["OPENAI_API_KEY"] == "secret"  # input not mutated
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_GUARDIAN_DECISIONS_API_KEY",
+        "OPENAI_IDENTITY_TOKEN_FILE",
+        "OPENAI_FEDERATION_RULE_ID",
+        "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    ],
+)
+def test_codex_credential_variables_are_scrubbed(key):
+    assert key in SCRUBBED_ENV
+    assert key not in clean_env({key: "secret", "PATH": "/bin"})
+
+
 def test_clean_env_defaults_to_process_environment(monkeypatch):
     for k in SCRUBBED_ENV:
         monkeypatch.setenv(k, "secret")
