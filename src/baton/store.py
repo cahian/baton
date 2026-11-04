@@ -347,6 +347,10 @@ class Store:
     def clear_stop(self) -> None:
         self._stop.unlink(missing_ok=True)
 
+    def consume_stop(self) -> None:
+        """The runner has honoured the stop."""
+        self.clear_stop()
+
     # interrupt
 
     def request_interrupt(self) -> None:

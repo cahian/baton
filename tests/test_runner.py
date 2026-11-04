@@ -1349,6 +1349,12 @@ def test_a_stop_wins_over_an_unread_note(go, agents, work, store):
     assert note_is_kept(store, "never read")
 
 
+def test_a_goal_file_run_consumes_its_stop(go, store):
+    store.request_stop()
+    go()
+    assert store.stop_request() == ""
+
+
 def test_the_objective_callable_briefs_each_fresh_round(tmp_path, work, store, agents, world):
     goal = make_goal(tmp_path, work)
     texts = iter(["first briefing", "second briefing"])

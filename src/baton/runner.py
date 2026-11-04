@@ -373,7 +373,7 @@ class _Run:
         if not self.stop_requested():
             return False
         try:
-            self.store.clear_stop()
+            self.store.consume_stop()
         except Exception:
             pass
         self.emit("stopped", round=self.round_no)

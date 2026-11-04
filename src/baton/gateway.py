@@ -331,6 +331,10 @@ class _JobStore(Store):
         if not self.halted:  # a person's own stop waits for the next start
             super().clear_stop()
 
+    def consume_stop(self) -> None:
+        """Nothing yet: until job.json says `stopped`, the file is all that keeps a restart from
+        resuming this job. The job clears it after saving that status."""
+
     def emit(self, kind: str, **fields: object) -> None:
         try:
             self._listener(kind, fields)
@@ -421,9 +425,17 @@ class Job:
             self._push(f"\n[baton] the job crashed: {type(exc).__name__}: {exc}\n")
         finally:
             with self._cond:
-                self.save(self._final_status())
+                status = self._final_status()
+                if self.save(status) and status == STOPPED:
+                    self._clear_stop()  # before _done, so it cannot remove a newer job's stop
                 self._done = True
                 self._cond.notify_all()
+
+    def _clear_stop(self) -> None:
+        try:
+            self.store.clear_stop()
+        except OSError as exc:
+            self._push(f"\n[baton] alert: could not clear the stop request: {exc}\n\n")
 
     def _forget_last_message(self) -> None:
         """Nothing was done with it, so sending it again is not a retry of something accepted."""
@@ -462,8 +474,9 @@ class Job:
 
     # what survives a restart
 
-    def save(self, status: str = RUNNING) -> None:
-        """Write job.json. Failing to is no reason to stop working, only to say so."""
+    def save(self, status: str = RUNNING) -> bool:
+        """Write job.json, True when it was. Failing to is no reason to stop working, only to say
+        so."""
         with self._cond:
             record = {
                 "session": self.session,
@@ -477,6 +490,8 @@ class Job:
                 self.store.save_job(record)
             except (OSError, ValueError) as exc:
                 self._push(f"\n[baton] alert: could not save this job: {exc}\n\n")
+                return False
+            return True
 
     def knows(self, mark: tuple[int, str]) -> bool:
         with self._cond:

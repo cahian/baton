@@ -1064,6 +1064,79 @@ def test_a_message_held_through_a_wait_survives_a_service_restart(gw):
     assert any("also do the docs" in p for p in agent.prompts)
 
 
+def test_a_stop_file_outlives_the_save_of_the_stopped_status(gw, monkeypatch):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    job = gw.job()
+    real = job.store.save_job
+    seen = []
+
+    def save_job(record):
+        if record["status"] == gateway.STOPPED:
+            seen.append(job.store.stop_request())
+        real(record)
+
+    monkeypatch.setattr(job.store, "save_job", save_job)
+    job.store.request_stop(now=True)
+    assert wait_for(lambda: not job.is_running())
+    assert seen == ["now"]
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    assert job.store.stop_request() == ""
+
+
+def test_a_stop_is_honoured_again_when_its_status_never_reached_disk(gw, monkeypatch):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    job = gw.job()
+    real = job.store.save_job
+
+    def save_job(record):
+        if record["status"] == gateway.STOPPED:
+            raise OSError("no space left on device")
+        real(record)
+
+    monkeypatch.setattr(job.store, "save_job", save_job)
+    job.store.request_stop(now=True)
+    assert wait_for(lambda: not job.is_running())
+    assert job.store.stop_request() == "now"
+
+    manager = restart(gw)
+    assert manager.recover() == 1
+    assert wait_for(lambda: not manager.get(SESSION).is_running())
+    assert len(gw.agents["claude_api"].prompts) == 1
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    assert job.store.stop_request() == ""
+
+
+def test_a_stop_file_that_cannot_be_cleared_still_ends_the_job(gw, monkeypatch):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    job = gw.job()
+
+    def clear_stop():
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(job.store, "clear_stop", clear_stop)
+    job.store.request_stop(now=True)
+    assert wait_for(lambda: not job.is_running())
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+
+
+def test_a_restart_during_a_person_s_stop_keeps_the_stop_file(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    job = gw.job()
+    job.store.request_stop()
+    gw.manager.shutdown(timeout=10)
+    assert job.store.stop_request() == "now"  # halted, with the person's file underneath
+    assert Store(job.store.root).stop_request() == "soon"
+    assert job_json(job.store.root)["status"] == gateway.RUNNING
+
+
 def job_json(root):
     return json.loads((root / "job.json").read_text())
 
