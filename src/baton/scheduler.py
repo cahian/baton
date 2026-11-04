@@ -27,7 +27,8 @@ AUTH_S = 30 * 60
 # An agent that could not be checked is asked again after this long.
 UNAVAILABLE_RETRY_S = 5 * 60
 MIN_WAIT_S = 30
-# A reset further out than this is a bad reading (milliseconds for seconds, say), not a reset.
+# A reset further out than this is a bad reading (milliseconds for seconds, say), not a reset,
+# and counts as unknown.
 MAX_COOLDOWN_S = 8 * 24 * 3600
 
 
@@ -91,9 +92,9 @@ class Scheduler:
     def _known(self, until: Any, now: float) -> float | None:
         """`until` as a usable reset time, or None when it is missing, past or nonsense."""
         value = _num(until)
-        if value is None or value <= now:
+        if value is None or value <= now or value > now + MAX_COOLDOWN_S:
             return None
-        return min(value, now + MAX_COOLDOWN_S)
+        return value
 
     # choosing
 

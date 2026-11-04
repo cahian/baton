@@ -155,11 +155,16 @@ def test_past_or_null_until_treated_as_unknown(env, until):
     assert s.snapshot()["agents"]["codex"]["until"] == clock.now + 1800
 
 
-def test_absurd_reset_is_capped(env):
+def test_absurd_reset_counts_as_unknown(env):
     clock, _, _, make = env
     s = make()
     s.record("codex", RoundResult(LIMIT, until=clock.now * 1000))  # milliseconds by mistake
-    assert s.snapshot()["agents"]["codex"]["until"] <= clock.now + 8 * 86400
+    assert s.snapshot()["agents"]["codex"]["until"] == clock.now + 900  # backoff, not 8 days
+    s.record("antigravity", RoundResult(CREDIT_GUARD, until=clock.now + 9 * 86400))
+    assert s.snapshot()["agents"]["antigravity"]["until"] == clock.now + 1800
+    s.record("codex", RoundResult(COMPLETED))
+    s.record("codex", RoundResult(LIMIT, until=clock.now + 7 * 86400))  # a weekly reset is real
+    assert s.snapshot()["agents"]["codex"]["until"] == clock.now + 7 * 86400
 
 
 @pytest.mark.parametrize("outcome", [COMPLETED, TIMEOUT])

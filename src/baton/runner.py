@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -31,6 +32,11 @@ HANDOFF_MAX_CHARS = 16000
 STEP_S = 5
 ERROR_SLEEP_S = 60
 GIT_TIMEOUT_S = 120
+COMMITS_MAX_CHARS = 2000
+# A round that completes sooner than this, without the goal being met, is followed by a pause of
+# this length, so an agent that exits at once cannot burn quota in a tight loop.
+MIN_ROUND_S = 30
+GATE_POLL_S = 0.5
 
 RULES = """\
 Rules:
@@ -47,11 +53,13 @@ def build_prompt(
     handoff: str,
     round_tail: str,
     resumed: bool,
+    since_commits: str = "",
 ) -> str:
     """The prompt for one round.
 
     A fresh round gets the whole briefing. A resumed one already has it in its own history, so
-    it only gets what changed: the gate output, the previous round's tail, notes and handoff.
+    it only gets what changed: the commits others made since, the gate output, the previous
+    round's tail, notes and handoff.
     """
     parts: list[str] = []
     if resumed:
@@ -65,6 +73,9 @@ def build_prompt(
             )
         else:
             parts.append("There is no verify command: the goal ends when a round completes.")
+    since_commits = since_commits.strip()
+    if since_commits:
+        parts.append(f"Commits made since your last round (newest first):\n{since_commits}")
     gate_tail = gate_tail.strip()
     if gate_tail:
         parts.append(f"Output of the last verify run (tail):\n{gate_tail[-GATE_TAIL_CHARS:]}")
@@ -91,12 +102,15 @@ def _tail_of(fh, chars: int) -> str:
     return fh.read().decode("utf-8", errors="replace")[-chars:]
 
 
-def run_gate(goal: Goal) -> tuple[bool, str]:
-    """Run the verify command. Passed only on exit 0; anything else, even a timeout or a command
-    that cannot start, is not passed. Never raises."""
+def run_gate(goal: Goal, should_kill: Callable[[], bool] | None = None) -> tuple[bool, str]:
+    """Run the verify command. Passed only on exit 0; anything else, even a timeout, a stop or a
+    command that cannot start, is not passed. `should_kill` is polled while it runs and ends it.
+    Raises nothing but KeyboardInterrupt and SystemExit, and the command's whole process group
+    is gone by then."""
     command = goal.verify_command
     if not command:
         return False, "no verify command is configured"
+    proc: subprocess.Popen | None = None
     try:
         with tempfile.TemporaryFile() as out:
             proc = subprocess.Popen(
@@ -108,23 +122,48 @@ def run_gate(goal: Goal) -> tuple[bool, str]:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            try:
-                code: int | None = proc.wait(timeout=goal.verify_timeout_s)
-                note = f"[exit code {code}]"
-            except subprocess.TimeoutExpired:
-                code = None
-                note = f"[verify timed out after {goal.verify_timeout_s} s]"
-                _signal_group(proc.pid, signal.SIGTERM)
+            deadline = time.monotonic() + goal.verify_timeout_s
+            code: int | None = None
+            note = ""
+            while True:
                 try:
-                    proc.wait(timeout=3)
+                    code = proc.wait(timeout=GATE_POLL_S)
+                    note = f"[exit code {code}]"
+                    break
                 except subprocess.TimeoutExpired:
                     pass
-                _signal_group(proc.pid, signal.SIGKILL)
-                proc.wait()
+                if should_kill is not None and should_kill():
+                    note = "[verify stopped]"
+                elif time.monotonic() >= deadline:
+                    note = f"[verify timed out after {goal.verify_timeout_s} s]"
+                else:
+                    continue
+                _end_gate(proc)
+                break
             tail = _tail_of(out, GATE_TAIL_CHARS)
     except Exception as exc:  # the gate failing to run is never a pass
+        if proc is not None:
+            _end_gate(proc)
         return False, f"verify could not run: {exc}"
+    except BaseException:
+        if proc is not None:
+            _end_gate(proc)
+        raise
     return code == 0, f"{tail.rstrip()}\n{note}".strip()
+
+
+def _end_gate(proc: subprocess.Popen) -> None:
+    """SIGTERM the gate's group, SIGKILL it after 3 s (or at once once the leader is gone)."""
+    _signal_group(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(proc.pid, signal.SIGKILL)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -177,23 +216,60 @@ def _exclude_baton(workdir: Path) -> None:
 
 
 def snapshot_work(goal: Goal, n: int, agent: str) -> bool:
-    """Commit uncommitted work locally; True only when a commit was made. Never raises or pushes."""
+    """Commit uncommitted work locally; True only when a commit was made. Never raises or pushes.
+
+    A workdir inside a larger repository is fine: only changes under the workdir are committed.
+    """
     if not goal.snapshot:
         return False
     try:
+        inside = _git(goal.workdir, "rev-parse", "--is-inside-work-tree")
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return False
         top = _git(goal.workdir, "rev-parse", "--show-toplevel")
-        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != goal.workdir.resolve():
-            return False  # not a repository of its own: leave other people's history alone
+        own_repo = top.returncode == 0 and Path(top.stdout.strip()).resolve() == (
+            goal.workdir.resolve()
+        )
+        scope = [] if own_repo else ["--", "."]
         _exclude_baton(goal.workdir)
-        status = _git(goal.workdir, "status", "--porcelain")
+        status = _git(goal.workdir, "status", "--porcelain", *scope)
         if status.returncode != 0 or not status.stdout.strip():
             return False
-        if _git(goal.workdir, "add", "-A").returncode != 0:
+        if _git(goal.workdir, "add", "-A", *scope).returncode != 0:
             return False
         message = f"baton: snapshot round {n} ({agent})"
-        return _git(goal.workdir, "commit", "--no-verify", "-m", message).returncode == 0
-    except (OSError, subprocess.SubprocessError):
+        return _git(goal.workdir, "commit", "--no-verify", "-m", message, *scope).returncode == 0
+    except Exception:
         return False
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+
+
+def _head(workdir: Path) -> str:
+    """The checked-out commit, or "" when the workdir is not in a repository with commits."""
+    try:
+        found = _git(workdir, "rev-parse", "--verify", "-q", "HEAD")
+    except Exception:
+        return ""
+    return found.stdout.strip() if found.returncode == 0 else ""
+
+
+def commits_since(workdir: Path, sha: str) -> str:
+    """One line per commit under `workdir` made after `sha`, newest first, capped. "" if none
+    or if the history cannot be read (not a repository, `sha` unknown or rewritten away)."""
+    if not _SHA_RE.fullmatch(sha or ""):
+        return ""
+    try:
+        found = _git(workdir, "log", "--oneline", f"{sha}..HEAD", "--", ".")
+    except Exception:
+        return ""
+    if found.returncode != 0:
+        return ""
+    text = found.stdout.strip()
+    if len(text) > COMMITS_MAX_CHARS:
+        text = text[:COMMITS_MAX_CHARS].rsplit("\n", 1)[0] + "\n..."
+    return text
 
 
 # the loop
@@ -239,6 +315,8 @@ class _Run:
         self.need_gate = True
         self.prev_agent: str | None = None
         self.carried_notes = ""
+        self.heads: dict[str, str] = {}
+        self.pause_until = 0.0
 
     # plumbing
 
@@ -254,15 +332,39 @@ class _Run:
         except Exception:
             return ""
 
-    def nap_until(self, until: float) -> None:
-        """Sleep in steps of at most STEP_S, returning early once a stop is requested."""
-        remaining = until - self.clock()
-        while remaining > 0 and self.clock() < until:
+    def nap(self, seconds: float, until: float | None = None) -> None:
+        """Sleep `seconds` in steps of at most STEP_S, returning early once a stop is requested
+        (or, with `until`, once the clock gets there). The step count does not depend on the
+        clock, so this always sleeps."""
+        remaining = seconds
+        while remaining > 0 and (until is None or self.clock() < until):
             if self.stop_requested():
                 return
             step = min(STEP_S, remaining)
             self.sleep(step)
             remaining -= step
+
+    def nap_until(self, until: float) -> None:
+        self.nap(until - self.clock(), until)
+
+    def honour_stop(self) -> bool:
+        """True, after consuming the request, when a stop was asked for."""
+        if not self.stop_requested():
+            return False
+        try:
+            self.store.clear_stop()
+        except Exception:
+            pass
+        self.emit("stopped", round=self.round_no)
+        return True
+
+    def finish(self, reason: str) -> int:
+        try:
+            self.store.clear_stop()  # a stop asked for during the last round has nothing left to do
+        except Exception:
+            pass
+        self.emit("finished", reason=reason, round=self.round_no)
+        return 0
 
     def runner_state(self) -> dict:
         return {
@@ -270,6 +372,7 @@ class _Run:
             "workdir": str(self.goal.workdir),
             "sessions": dict(self.sessions),
             "round_tail": self.round_tail,
+            "heads": dict(self.heads),
             "group": self.group,
         }
 
@@ -295,7 +398,9 @@ class _Run:
                     return code
             except Exception as exc:
                 self.emit("error", error=f"{type(exc).__name__}: {exc}")
-                self.nap_until(self.clock() + ERROR_SLEEP_S)
+                if self.honour_stop():
+                    return 0
+                self.nap(ERROR_SLEEP_S)
 
     def start(self) -> None:
         goal = self.goal
@@ -309,6 +414,7 @@ class _Run:
         self.group = None
         same_dir = state.get("workdir") == str(goal.workdir)
         saved = state.get("sessions")
+        heads = state.get("heads")
         if same_dir and isinstance(saved, dict):
             self.sessions = {
                 a: s for a, s in saved.items() if isinstance(s, str) and s and a in goal.agents
@@ -317,6 +423,11 @@ class _Run:
             self.sessions = {}
             if saved:
                 self.emit("alert", message="working directory changed: session ids cleared")
+        self.heads = (
+            {a: h for a, h in heads.items() if isinstance(h, str) and a in goal.agents}
+            if same_dir and isinstance(heads, dict)
+            else {}
+        )
         rounds = state.get("round")
         self.round_no = rounds if isinstance(rounds, int) and rounds > 0 else 0
         tail = state.get("round_tail")
@@ -331,16 +442,17 @@ class _Run:
             self.start()
         goal = self.goal
         if self.need_gate and goal.verify_command:
-            passed, self.gate_tail = run_gate(goal)
+            passed, self.gate_tail = run_gate(goal, should_kill=self.stop_now)
             self.need_gate = False
             self.emit("gate", passed=passed, tail=self.gate_tail)
             if passed:
-                self.emit("finished", reason="verify passed", round=self.round_no)
-                return 0
+                return self.finish("verify passed")
         self.need_gate = False
-        if self.stop_requested():
-            self.store.clear_stop()
-            self.emit("stopped", round=self.round_no)
+        if self.pause_until:
+            until, self.pause_until = self.pause_until, 0.0
+            self.emit("wait", reason="the last round ended at once", until=until)
+            self.nap_until(until)
+        if self.honour_stop():
             return 0
         assert self.sched is not None
         adapter = self.sched.pick()
@@ -355,11 +467,12 @@ class _Run:
             )
             self.nap_until(until)
             return None
-        finishing = self.run_round(adapter)
-        if finishing:
-            self.emit("finished", reason="round completed", round=self.round_no)
-            return 0
+        if self.run_round(adapter):
+            return self.finish("round completed")
         return None
+
+    def stop_now(self) -> bool:
+        return self.stop_requested() == "now"
 
     # one round
 
@@ -384,6 +497,7 @@ class _Run:
         notes = self.carried_notes
         handoff = self.read_handoff()
         sid = self.sessions.get(agent)
+        since = commits_since(goal.workdir, self.heads.get(agent, ""))
 
         buf = ""
         killed = False
@@ -412,7 +526,13 @@ class _Run:
                 pass
             return killed
 
+        spawned = False
+
         def on_spawn(pgid: int) -> None:
+            # The process exists, so the prompt was delivered: notes are spent from here on.
+            nonlocal spawned
+            spawned = True
+            self.carried_notes = ""
             self.group = pgid
             self.persist_softly()
 
@@ -422,7 +542,13 @@ class _Run:
 
         def attempt(session: str | None) -> RoundResult:
             prompt = build_prompt(
-                goal, self.gate_tail, notes, handoff, self.round_tail, resumed=session is not None
+                goal,
+                self.gate_tail,
+                notes,
+                handoff,
+                self.round_tail,
+                resumed=session is not None,
+                since_commits=since,
             )
             ctx = RoundContext(
                 workdir=goal.workdir,
@@ -442,7 +568,6 @@ class _Run:
                 resumed=session is not None,
                 previous=self.prev_agent,
             )
-            self.carried_notes = ""  # delivered; from here the inbox holds only newer notes
             try:
                 return adapter.run_round(prompt, ctx)
             except Exception as exc:
@@ -457,12 +582,23 @@ class _Run:
             result = attempt(None)
 
         self.group = None
-        self.round_tail = buf
-        snapshotted = snapshot_work(goal, n, agent)
+        ended = self.clock()
+        # Record first: nothing after this can lose a credit_guard or limit outcome.
         self.sched.record(agent, result)
         if result.outcome in (CREDIT_GUARD, AUTH):
             self.emit("alert", agent=agent, outcome=result.outcome, reason=result.reason)
-        self.prev_agent = agent
+        snapshotted = snapshot_work(goal, n, agent)
+        if spawned:  # a start that was refused leaves the context for the next round
+            self.round_tail = buf
+            self.prev_agent = agent
+            head = _head(goal.workdir)
+            if head:
+                self.heads[agent] = head
+        self.pause_until = (
+            ended + MIN_ROUND_S
+            if result.outcome == COMPLETED and not killed and ended - started < MIN_ROUND_S
+            else 0.0
+        )
         self.emit(
             "round_end",
             round=n,
@@ -470,7 +606,7 @@ class _Run:
             outcome=result.outcome,
             reason=result.reason,
             until=result.until,
-            seconds=round(self.clock() - started, 1),
+            seconds=round(ended - started, 1),
             interrupted=interrupted,
             snapshot=snapshotted,
         )

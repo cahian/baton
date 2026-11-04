@@ -1,3 +1,4 @@
+import os
 import subprocess
 import threading
 import time
@@ -54,6 +55,8 @@ class Fake:
         self.prompts.append(prompt)
         self.sessions.append(ctx.session_id)
         step = self.script.pop(0) if self.script else (lambda a, p, c: RoundResult(COMPLETED))
+        if not getattr(step, "refuses", False):
+            ctx.on_spawn(1)  # the process started (group 1 is never killed by a later run)
         return step(self, prompt, ctx)
 
     def render(self, line):
@@ -72,6 +75,16 @@ def done(workdir):
 
 def result(outcome, **kw):
     return lambda agent, prompt, ctx: RoundResult(outcome, **kw)
+
+
+def refused(outcome=TRANSIENT, **kw):
+    """Step for a start that was refused or failed to spawn: nothing ran."""
+
+    def step(agent, prompt, ctx):
+        return RoundResult(outcome, **kw)
+
+    step.refuses = True
+    return step
 
 
 def say(text, then=None):
@@ -192,11 +205,11 @@ def test_loop_exception_is_survived(go, agents, work, store, world, monkeypatch)
     real = runner.run_gate
     calls = []
 
-    def flaky(goal):
+    def flaky(goal, **kw):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("boom")
-        return real(goal)
+        return real(goal, **kw)
 
     monkeypatch.setattr(runner, "run_gate", flaky)
     agents["codex"].script = [done(work)]
@@ -683,13 +696,32 @@ def test_non_git_workdir_snapshot_is_fine(tmp_path, work):
     assert snapshot_work(goal, 1, "codex") is False
 
 
-def test_snapshot_ignores_a_repo_above_the_workdir(tmp_path, repo):
+def test_snapshot_in_a_subdirectory_commits_only_that_directory(tmp_path, repo):
     inner = repo / "sub"
     inner.mkdir()
+    (inner / "kept.txt").write_text("1")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "sub"], check=True)
     goal = make_goal(tmp_path, inner, snapshot=True)
-    (repo / "a.txt").write_text("changed")
+    (inner / "kept.txt").write_text("changed inside")
+    (repo / "a.txt").write_text("changed outside")
+    assert snapshot_work(goal, 3, "codex") is True
+    assert git_log(repo)[0] == "baton: snapshot round 3 (codex)"
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True
+    ).stdout
+    assert status.strip() == "M a.txt"  # the file outside the workdir is left alone
+
+
+def test_snapshot_never_raises(tmp_path, repo, monkeypatch):
+    goal = make_goal(tmp_path, repo, snapshot=True)
+    (repo / "a.txt").write_text("2")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(runner, "_git", boom)
     assert snapshot_work(goal, 1, "codex") is False
-    assert git_log(repo) == ["init"]
 
 
 def test_baton_dir_excluded(tmp_path, repo):
@@ -718,3 +750,234 @@ def test_loop_snapshots_after_each_round(tmp_path, repo, agents, store, world):
     assert "baton: snapshot round 1 (codex)" in log and "baton: snapshot round 2 (codex)" in log
     ends = [e for e in store.events() if e["kind"] == "round_end"]
     assert [e["snapshot"] for e in ends] == [True, True]
+
+
+# fix round 1
+
+
+@pytest.mark.timeout(15)
+def test_stop_with_a_failing_start_exits_instead_of_spinning(go, store, monkeypatch):
+    def unreadable(*args):
+        raise StateError("unreadable")
+
+    monkeypatch.setattr(store, "load_state", unreadable)
+    store.request_stop()
+    assert go() == 0
+    assert kinds(store).count("error") <= 2
+    assert kinds(store)[-1] == "stopped"
+
+
+@pytest.mark.timeout(15)
+@pytest.mark.parametrize("clock_moves", [True, False])
+def test_failing_start_sleeps_before_every_retry(go, store, world, monkeypatch, clock_moves):
+    def unreadable(*args):
+        raise StateError("unreadable")
+
+    monkeypatch.setattr(store, "load_state", unreadable)
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        if clock_moves:
+            world.sleep(seconds)
+        if sum(slept) >= 300:
+            store.request_stop()
+
+    assert go(sleep=sleep) == 0
+    errors = kinds(store).count("error")
+    assert errors >= 4 and sum(slept) >= 60 * (errors - 1)
+
+
+def test_refused_start_keeps_notes_and_the_previous_tail(go, agents, work, store):
+    def first(agent, prompt, ctx):
+        ctx.on_output("tail from the last real round")
+        store.say("keep me")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, refused(TRANSIENT, reason="start refused")]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert "keep me" in agents["codex"].prompts[1]
+    delivered = agents["antigravity"].prompts[0]
+    assert "keep me" in delivered  # the refused start did not swallow it
+    assert "tail from the last real round" in delivered
+    assert store.take_inbox() == ""
+
+
+def test_delivered_notes_are_consumed_once_started(go, agents, work, store):
+    store.say("once")
+    agents["codex"].script = [result(COMPLETED), done(work)]
+    assert go() == 0
+    assert "once" in agents["codex"].prompts[0] and "once" not in agents["codex"].prompts[1]
+
+
+# commits since the agent's last round
+
+
+@pytest.fixture
+def commit(repo):
+    def make(name, message):
+        (repo / name).write_text(message)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", message], check=True)
+
+    return make
+
+
+def test_build_prompt_lists_commits_since(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    prompt = build_prompt(goal, "", "", "", "", True, since_commits="abc123 other agent's fix")
+    assert "other agent's fix" in prompt and OBJECTIVE not in prompt
+    assert "Commits" not in build_prompt(goal, "", "", "", "", True, since_commits="")
+
+
+def test_resumed_prompt_includes_other_agents_commits(tmp_path, repo, commit, agents, store, world):
+    goal = make_goal(tmp_path, repo)
+
+    def codex_first(agent, prompt, ctx):
+        ctx.on_session("s1")
+        commit("c.txt", "codex own work")
+        return RoundResult(LIMIT, until=world.now + 10)
+
+    def agy(agent, prompt, ctx):
+        commit("g.txt", "antigravity change")
+        return RoundResult(LIMIT, until=world.now + 3600)
+
+    agents["codex"].script = [codex_first, done(repo)]
+    agents["antigravity"].script = [agy]
+    assert run_goal(goal, agents, store, world.clock, world.sleep) == 0
+    resumed = agents["codex"].prompts[1]
+    assert agents["codex"].sessions == [None, "s1"]
+    assert "antigravity change" in resumed
+    assert "codex own work" not in resumed
+    assert set(store.load_state()["heads"]) == {"codex", "antigravity"}
+
+
+def test_non_git_workdir_has_no_commit_section(go, agents, work):
+    agents["codex"].script = [
+        say(["x"], lambda a, p, c: (c.on_session("s"), RoundResult(COMPLETED))[1])
+    ]
+    agents["codex"].script.append(done(work))
+    assert go() == 0
+    assert "Commits" not in agents["codex"].prompts[1]
+
+
+def test_commits_since_is_capped(repo, commit, monkeypatch):
+    base = runner._head(repo)
+    for i in range(6):
+        commit(f"f{i}.txt", f"commit number {i}")
+    monkeypatch.setattr(runner, "COMMITS_MAX_CHARS", 60)
+    text = runner.commits_since(repo, base)
+    assert len(text) <= 60 + 10 and "commit number 5" in text and "commit number 0" not in text
+    assert runner.commits_since(repo, "not-a-sha") == ""
+    assert runner.commits_since(repo, "--output=x") == ""
+
+
+# a round that exits at once
+
+
+def test_instant_completed_round_waits_before_the_next(go, agents, work, world):
+    agents["codex"].script = [result(COMPLETED), result(COMPLETED), done(work)]
+    assert go() == 0
+    assert sum(world.sleeps) == 60 and max(world.sleeps) <= 5  # 30 s after each
+
+
+def test_slow_completed_round_does_not_wait(go, agents, work, world):
+    def slow(agent, prompt, ctx):
+        world.now += 31
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [slow, done(work)]
+    assert go() == 0
+    assert world.sleeps == []
+
+
+def test_pause_after_instant_round_honours_stop(go, agents, store, world):
+    agents["codex"].script = [result(COMPLETED)]
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        store.request_stop()
+
+    assert go(sleep=sleep) == 0
+    assert len(agents["codex"].prompts) == 1 and sum(world.sleeps) <= 5
+
+
+def test_interrupted_instant_round_does_not_pause(go, agents, work, store, world):
+    agents["codex"].script = [interrupting(store, "now please"), done(work)]
+    assert go() == 0
+    assert world.sleeps == []
+
+
+# minors
+
+
+def test_snapshot_failure_cannot_lose_a_credit_guard_outcome(
+    tmp_path, repo, agents, store, world, monkeypatch
+):
+    goal = make_goal(tmp_path, repo, snapshot=True)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("snapshot exploded")
+
+    monkeypatch.setattr(runner, "snapshot_work", boom)
+    agents["codex"].script = [result(CREDIT_GUARD, reason="balance moved")]
+    agents["antigravity"].script = [done(repo)]
+    assert run_goal(goal, agents, store, world.clock, world.sleep) == 0
+    assert len(agents["codex"].prompts) == 1  # its cooldown was recorded before the failure
+    assert any(e["kind"] == "alert" for e in store.events())
+
+
+def test_stop_file_is_cleared_when_the_goal_finishes(go, agents, work, store, tmp_path):
+    (work / "DONE").write_text("x")
+    store.request_stop()
+    assert go() == 0
+    assert store.stop_request() == ""
+    assert kinds(store)[-1] == "finished"
+
+
+def test_stop_file_is_cleared_when_a_goal_without_verify_finishes(
+    tmp_path, work, go, agents, store
+):
+    agents["codex"].script = [lambda a, p, c: (store.request_stop(), RoundResult(COMPLETED))[1]]
+    assert go(make_goal(tmp_path, work, verify=None)) == 0
+    assert kinds(store)[-1] == "finished" and store.stop_request() == ""
+
+
+@pytest.mark.timeout(20)
+def test_stop_now_kills_a_running_gate(tmp_path, work, go, agents, store):
+    store.request_stop(now=True)
+    began = time.monotonic()
+    assert go(make_goal(tmp_path, work, verify="sleep 30")) == 0
+    assert time.monotonic() - began < 10
+    assert agents["codex"].prompts == [] and kinds(store)[-1] == "stopped"
+
+
+@pytest.mark.timeout(20)
+def test_run_gate_should_kill_stops_it(tmp_path, work):
+    goal = make_goal(tmp_path, work, verify="echo started; sleep 30")
+    ok, tail = run_gate(goal, should_kill=lambda: True)
+    assert ok is False and "stopped" in tail
+
+
+@pytest.mark.timeout(20)
+def test_run_gate_kills_its_session_on_ctrl_c(tmp_path, work):
+    pidfile = work / "pid"
+    goal = make_goal(tmp_path, work, verify="echo $$ > pid; sleep 30")
+
+    def interrupt():
+        if pidfile.exists() and pidfile.read_text().strip():
+            raise KeyboardInterrupt
+        return False
+
+    with pytest.raises(KeyboardInterrupt):
+        run_gate(goal, should_kill=interrupt)
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise AssertionError("the gate's process group survived")
