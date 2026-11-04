@@ -151,11 +151,13 @@ Prompt on stdin. The key is read from `key_file` at spawn and passed only in tha
 
 **There is no API that returns the credit balance.** The budget is therefore baton's own: `monthly_budget_usd` (default 200) minus `reserve_pct` (default 10) gives a spend ceiling of 180.
 
+`monthly_budget_usd`, `reserve_pct` and `budget_reset_day` are global: they live only in `~/.config/baton/defaults.toml`, which also holds `[agents.*]` overrides applied under every goal, and are stored in the ledger. A mismatch makes the agent unavailable.
+
 Spend tracking is a ledger shared across all goals at `~/.local/state/baton/claude-spend.json`, updated under a lock:
 
 - Spend comes from `total_cost_usd` in the `result` event. It is a local estimate, so `reserve_pct` also absorbs its error.
 - A period starts on `budget_reset_day` (default 1) at 00:00 UTC.
-- Before a round, atomically reserve `round_budget_usd` (default 10). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 1 USD the agent is unavailable until the next period.
+- Before a round, atomically reserve `round_budget_usd` (default 10). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 5 USD the agent is unavailable until the next period.
 - After a round, replace the reservation with the actual cost. If a round ends with no `result` event, the full reservation stays counted. Crashes therefore overcount and never undercount.
 - An unreadable or corrupt ledger means unavailable. Never recreate it silently.
 
