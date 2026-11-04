@@ -57,6 +57,8 @@ class Fakes:
         self.codex_calls_file = root / "codex-calls.jsonl"
         self.codex_pidfile = root / "codex-exec.pid"
         self.agy_calls_file = root / "agy-calls.jsonl"
+        self.claude_calls_file = root / "claude-calls.jsonl"
+        self.claude_key_file = root / "anthropic.key"
         self.agy_read_log = root / "agy-reads.log"
         self.agy_usage_file = root / "agy-usage.txt"
         self.agy_credits_file = root / "agy-credits.txt"
@@ -83,13 +85,34 @@ class Fakes:
     def agy_calls(self) -> list:
         return self._lines(self.agy_calls_file)
 
-    def goal(self, name="demo", verify=None, extra="", poll_s=1, codex="", agy="") -> Path:
-        """Write a goal file for the work directory and return its path."""
+    def claude_calls(self) -> list:
+        return self._lines(self.claude_calls_file)
+
+    def claude_key(self, key: str, mode: int = 0o600) -> None:
+        self.claude_key_file.write_text(key + "\n")
+        self.claude_key_file.chmod(mode)
+
+    def goal(
+        self,
+        name="demo",
+        verify=None,
+        extra="",
+        poll_s=1,
+        codex="",
+        agy="",
+        claude=None,
+        order=("codex", "antigravity"),
+    ) -> Path:
+        """Write a goal file for the work directory and return its path.
+
+        Claude is off unless `claude` gives its settings: a test must opt in to it, and then it
+        uses the fake key file of this fixture."""
         lines = [
             f'name = "{name}"',
             f'workdir = "{self.work}"',
             'objective = "Make the widget frobnicate."',
             "snapshot = false",
+            f"order = {json.dumps(list(order))}",
             extra,
         ]
         if verify:
@@ -97,6 +120,12 @@ class Fakes:
         lines += [
             f"[agents.codex]\npoll_s = {poll_s}\n{codex}",
             f"[agents.antigravity]\npoll_s = {poll_s}\n{agy}",
+            "[agents.claude_api]\n"
+            + (
+                f'key_file = "{self.claude_key_file}"\n{claude}'
+                if claude is not None
+                else "enabled = false"
+            ),
         ]
         path = self.root / "goal.toml"
         path.write_text("\n".join(lines) + "\n")
@@ -109,7 +138,11 @@ def fakes(tmp_path, monkeypatch) -> Fakes:
     f = Fakes(tmp_path)
     f.bindir.mkdir()
     f.work.mkdir()
-    for name, script in (("codex", "fake_codex.py"), ("agy", "fake_agy.py")):
+    for name, script in (
+        ("codex", "fake_codex.py"),
+        ("agy", "fake_agy.py"),
+        ("claude", "fake_claude.py"),
+    ):
         wrapper = f.bindir / name
         wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKES / script}" "$@"\n')
         wrapper.chmod(0o755)
@@ -121,6 +154,8 @@ def fakes(tmp_path, monkeypatch) -> Fakes:
     setenv("FAKE_CODEX_SCENARIO", str(f.codex_scenario_file))
     setenv("FAKE_CODEX_CALLS", str(f.codex_calls_file))
     setenv("FAKE_CODEX_EXEC_PIDFILE", str(f.codex_pidfile))
+    setenv("HOME", str(tmp_path / "home"))  # no test reads the real home, or a real key file
+    setenv("FAKE_CLAUDE_CALLS", str(f.claude_calls_file))
     setenv("FAKE_AGY_CALLS", str(f.agy_calls_file))
     setenv("FAKE_AGY_READ_LOG", str(f.agy_read_log))
     setenv("FAKE_AGY_USAGE", str(f.agy_usage_file))

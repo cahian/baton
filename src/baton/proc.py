@@ -20,6 +20,9 @@ from baton.adapters.base import COMPLETED, RoundContext, RoundResult
 # Cloud credentials (AWS_*, AZURE_*, GOOGLE_APPLICATION_CREDENTIALS) are left alone on purpose: the
 # agent's own work may need them, and nothing selects a cloud provider unless its config says so.
 SCRUBBED_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
@@ -52,6 +55,9 @@ PUT_TIMEOUT_S = 0.05
 STOP_LOG_BYTES = 16 * 1024 * 1024
 # How long reading continues once the group is dead, to reach EOF.
 JOIN_S = 0.5
+# What replaces a credential that a child printed, and the shortest value worth hiding.
+REDACTED = b"[redacted]"
+MIN_SECRET_CHARS = 8
 
 
 def clean_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -237,6 +243,7 @@ def run_streaming(
     on_line: Callable[[str], RoundResult | None],
     tick: Callable[[], RoundResult | None],
     tick_s: float = 1.0,
+    extra_env: Mapping[str, str] | None = None,
 ) -> Exit:
     """Run `argv` in its own session and stream merged stdout/stderr line by line.
 
@@ -247,18 +254,30 @@ def run_streaming(
     `timed_out=True`. Raw bytes are appended to `ctx.log_path`; failing to write them never
     affects the run.
 
+    `extra_env` is added to the scrubbed environment of this child only: the way an adapter passes
+    its own credential. Its values are replaced by `[redacted]` in everything that leaves this
+    function (the log, `on_output`, `on_line`, the tail), in case the child prints them.
+
     Time limits only stop reading. Every queued line reaches `on_line` unless a stop was already
     decided, and the queue is bounded, so that is finite. The group is killed from its own
     thread, so a slow `on_line` or a broken log cannot delay it.
     """
     ctx.log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = clean_env()
+    secrets = []
+    for value in (extra_env or {}).values():
+        env_value = str(value)
+        if len(env_value) >= MIN_SECRET_CHARS:
+            secrets.append(env_value.encode("utf-8", errors="replace"))
+    if extra_env:
+        env.update(extra_env)
     # Open the log before spawning: a failure here must not leave a running, unwatched child.
     log = ctx.log_path.open("ab")
     try:
         child = subprocess.Popen(
             list(argv),
             cwd=cwd,
-            env=clean_env(),
+            env=env,
             stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -288,6 +307,8 @@ def run_streaming(
 
     def record(chunk: bytes) -> str:
         nonlocal tail
+        for secret in secrets:
+            chunk = chunk.replace(secret, REDACTED)
         _log_quietly(log.write, chunk)
         line = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
         tail = (tail + line + "\n")[-TAIL_CHARS:]

@@ -401,3 +401,27 @@ def test_an_ignored_sighup_stays_ignored(fakes, monkeypatch):
         assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
     finally:
         signal.signal(signal.SIGHUP, before)
+
+
+def test_build_adapters_adds_claude_api_only_when_enabled(fakes):
+    from baton.adapters.claude_api import ClaudeApiAdapter
+    from baton.cli import build_adapters
+    from baton.config import load_goal
+
+    off = build_adapters(load_goal(fakes.goal()))
+    assert set(off) == {"codex", "antigravity"}
+    on = build_adapters(load_goal(fakes.goal(claude="")))
+    assert set(on) == {"codex", "antigravity", "claude_api"}
+    adapter = on["claude_api"]
+    assert isinstance(adapter, ClaudeApiAdapter)
+    assert adapter._cost_report is None  # no admin key file
+    assert adapter.ledger.path == fakes.state / "claude-spend.json"  # shared by every goal
+    assert adapter.ceiling == 180
+
+
+def test_build_adapters_reads_the_cost_report_when_an_admin_key_is_set(fakes):
+    from baton.cli import build_adapters
+    from baton.config import load_goal
+
+    goal = load_goal(fakes.goal(claude='admin_key_file = "/some/admin.key"\n'))
+    assert build_adapters(goal)["claude_api"]._cost_report is not None

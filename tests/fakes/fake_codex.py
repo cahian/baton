@@ -87,7 +87,15 @@ def exec_cmd() -> None:
     if calls:
         with open(calls, "a") as fh:
             fh.write(
-                json.dumps({"argv": sys.argv[1:], "stdin": stdin_text, "cwd": os.getcwd()}) + "\n"
+                json.dumps(
+                    {
+                        "argv": sys.argv[1:],
+                        "stdin": stdin_text,
+                        "cwd": os.getcwd(),
+                        "anthropic_env": sorted(k for k in os.environ if k.startswith("ANTHROPIC")),
+                    }
+                )
+                + "\n"
             )
     thread_id = os.environ.get("FAKE_CODEX_THREAD_ID", "thread-1")
     emit({"type": "thread.started", "thread_id": thread_id})

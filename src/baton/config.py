@@ -5,11 +5,12 @@ from __future__ import annotations
 import re
 import tomllib
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-AGENT_NAMES = ("codex", "antigravity")
-DEFAULT_ORDER = ("codex", "antigravity")
+AGENT_NAMES = ("claude_api", "antigravity", "codex")
+DEFAULT_ORDER = ("claude_api", "antigravity", "codex")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -33,7 +34,23 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "bin": "agy",
         "full_access": True,
     },
+    # Claude through a Console API key. Its limits are baton's own spend ledger, so it has no
+    # threshold or poll interval, and it always runs with permissions skipped (the spec's command).
+    "claude_api": {
+        "enabled": True,
+        "model": "claude-opus-5-5",
+        "effort": "medium",
+        "bin": "claude",
+        "monthly_budget_usd": Decimal("200"),
+        "reserve_pct": 10,
+        "round_budget_usd": Decimal("10"),
+        "budget_reset_day": 1,
+        "key_file": "~/.config/baton/anthropic.key",
+        "admin_key_file": "",
+    },
 }
+# What claude_api carries in AgentConfig without the goal file being able to set it.
+_CLAUDE_FIXED = {"threshold_pct": 95, "poll_s": 15, "full_access": True}
 
 
 class GoalError(Exception):
@@ -50,6 +67,13 @@ class AgentConfig:
     poll_s: int
     bin: str
     full_access: bool
+    # Only claude_api reads these; the goal file accepts them for no other agent.
+    monthly_budget_usd: Decimal = Decimal("200")
+    reserve_pct: int = 10
+    round_budget_usd: Decimal = Decimal("10")
+    budget_reset_day: int = 1
+    key_file: str = "~/.config/baton/anthropic.key"
+    admin_key_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,7 +137,48 @@ def _int(table: dict[str, Any], key: str, default: int, where: str, lo: int, hi:
     return value
 
 
+def _usd(table: dict[str, Any], key: str, default: Decimal, where: str) -> Decimal:
+    """A positive amount of money as an exact Decimal. TOML floats arrive as Decimal already."""
+    value = table.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int | Decimal):
+        raise GoalError(f"{where}{key} must be a number")
+    number = Decimal(value)
+    if not number.is_finite() or number <= 0:
+        raise GoalError(f"{where}{key} must be greater than zero")
+    return number
+
+
+def _optional_str(table: dict[str, Any], key: str, default: str, where: str) -> str:
+    value = table.get(key, default)
+    if not isinstance(value, str):
+        raise GoalError(f"{where}{key} must be a string")
+    return value
+
+
+def _load_claude_api(table: dict[str, Any]) -> AgentConfig:
+    name = "claude_api"
+    where = f"agents.{name}."
+    d = _AGENT_DEFAULTS[name]
+    _check_keys(table, set(d), f"[agents.{name}]")
+    return AgentConfig(
+        name=name,
+        enabled=_bool(table, "enabled", d["enabled"], where),
+        model=_str(table, "model", d["model"], where),
+        effort=_str(table, "effort", d["effort"], where),
+        bin=_str(table, "bin", d["bin"], where),
+        monthly_budget_usd=_usd(table, "monthly_budget_usd", d["monthly_budget_usd"], where),
+        reserve_pct=_int(table, "reserve_pct", d["reserve_pct"], where, 1, 99),
+        round_budget_usd=_usd(table, "round_budget_usd", d["round_budget_usd"], where),
+        budget_reset_day=_int(table, "budget_reset_day", d["budget_reset_day"], where, 1, 31),
+        key_file=_str(table, "key_file", d["key_file"], where),
+        admin_key_file=_optional_str(table, "admin_key_file", d["admin_key_file"], where),
+        **_CLAUDE_FIXED,
+    )
+
+
 def _load_agent(name: str, table: dict[str, Any]) -> AgentConfig:
+    if name == "claude_api":
+        return _load_claude_api(table)
     where = f"agents.{name}."
     _check_keys(table, set(_AGENT_DEFAULTS[name]), f"[agents.{name}]")
     d = _AGENT_DEFAULTS[name]
@@ -141,7 +206,7 @@ def load_goal(path: Path) -> Goal:
     except OSError as exc:
         raise GoalError(f"cannot read goal file {path}: {exc.strerror or exc}") from exc
     try:
-        data = tomllib.loads(raw.decode("utf-8"))
+        data = tomllib.loads(raw.decode("utf-8"), parse_float=Decimal)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise GoalError(f"invalid goal file {path}: {exc}") from exc
 

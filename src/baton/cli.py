@@ -16,8 +16,9 @@ from pathlib import Path
 
 from baton.adapters.antigravity import AntigravityAdapter
 from baton.adapters.base import Adapter
+from baton.adapters.claude_api import ClaudeApiAdapter, ledger_for, make_cost_report
 from baton.adapters.codex import CodexAdapter
-from baton.config import Goal, GoalError, load_goal
+from baton.config import AgentConfig, Goal, GoalError, load_goal
 from baton.doctor import run_checks
 from baton.runner import run_goal
 from baton.store import AlreadyRunning, StateError, Store, state_dir
@@ -28,7 +29,16 @@ STATUS_EVENTS = 8
 
 def build_adapters(goal: Goal) -> dict[str, Adapter]:
     """One adapter per enabled agent of the goal."""
-    makers: dict[str, Callable] = {"codex": CodexAdapter, "antigravity": AntigravityAdapter}
+
+    def claude_api(cfg: AgentConfig) -> ClaudeApiAdapter:
+        ledger = ledger_for(cfg)
+        return ClaudeApiAdapter(cfg, ledger, make_cost_report(cfg, ledger))
+
+    makers: dict[str, Callable] = {
+        "codex": CodexAdapter,
+        "antigravity": AntigravityAdapter,
+        "claude_api": claude_api,
+    }
     return {name: makers[name](cfg) for name, cfg in goal.agents.items() if cfg.enabled}
 
 
@@ -313,7 +323,7 @@ def _not_yet(name: str) -> Callable[[argparse.Namespace], int]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="baton", description="Relay one coding goal between Codex and Antigravity."
+        prog="baton", description="Relay one coding goal between Claude, Antigravity and Codex."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

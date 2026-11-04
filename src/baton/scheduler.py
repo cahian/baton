@@ -1,4 +1,4 @@
-"""Sticky two-agent rotation with cooldowns and exponential backoff."""
+"""Sticky cyclic rotation with cooldowns and exponential backoff."""
 
 from __future__ import annotations
 
@@ -99,7 +99,9 @@ class Scheduler:
     # choosing
 
     def _candidates(self) -> list[str]:
-        return [self.current] + [n for n in self.order if n != self.current]
+        """The current agent first, then the others in `order`, wrapping around from it."""
+        at = self.order.index(self.current)
+        return self.order[at:] + self.order[:at]
 
     def pick(self) -> Adapter | None:
         """The adapter to run now, or None when every agent is cooling down or unavailable."""

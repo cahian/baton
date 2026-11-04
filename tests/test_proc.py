@@ -79,10 +79,10 @@ def test_codex_credential_variables_are_scrubbed(key):
     assert key not in clean_env({key: "secret", "PATH": "/bin"})
 
 
-def test_anthropic_variables_are_no_longer_scrubbed():
-    # Claude left the rotation; nothing here launches it, so its variables are the user's own.
-    assert "ANTHROPIC_API_KEY" not in SCRUBBED_ENV
-    assert "ANTHROPIC_AUTH_TOKEN" not in SCRUBBED_ENV
+@pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"])
+def test_anthropic_variables_are_scrubbed(key):
+    assert key in SCRUBBED_ENV
+    assert key not in clean_env({key: "secret", "PATH": "/bin"})
 
 
 def test_clean_env_defaults_to_process_environment(monkeypatch):
@@ -813,3 +813,52 @@ def test_process_start_treats_a_ps_error_as_unknown(monkeypatch):
     finally:
         child.kill()
         child.wait()
+
+
+def test_extra_env_reaches_only_that_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-the-shell")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://evil.example")
+    code = (
+        "import os; k = os.environ.get('ANTHROPIC_API_KEY');"
+        "print(k[::-1] if k else k, os.environ.get('ANTHROPIC_BASE_URL'))"  # reversed: not redacted
+    )
+    mine, other = [], []
+    run_streaming(
+        py(code),
+        tmp_path,
+        None,
+        make_ctx(tmp_path),
+        lambda line: mine.append(line) and None,
+        lambda: None,
+        extra_env={"ANTHROPIC_API_KEY": "its-own-key-12345"},
+    )
+    run_streaming(
+        py(code),
+        tmp_path,
+        None,
+        make_ctx(tmp_path),
+        lambda line: other.append(line) and None,
+        lambda: None,
+    )
+    assert mine == ["54321-yek-nwo-sti None"]  # applied after scrubbing, and only what was asked
+    assert other == ["None None"]
+    assert "its-own-key-12345" not in os.environ.values()
+
+
+def test_extra_env_values_are_redacted_from_log_and_lines(tmp_path):
+    secret = "sk-ant-api03-SECRETSECRET"
+    ctx = make_ctx(tmp_path)
+    shown, parsed = [], []
+    ctx.on_output = shown.append
+    ex = run_streaming(
+        py("import os; print('key=' + os.environ['K']); print('again ' + os.environ['K'])"),
+        tmp_path,
+        None,
+        ctx,
+        lambda line: parsed.append(line) and None,
+        lambda: None,
+        extra_env={"K": secret},
+    )
+    assert secret not in ctx.log_path.read_text()
+    assert secret not in "".join(shown + parsed) and secret not in ex.tail
+    assert "key=[redacted]" in shown and "again [redacted]" in shown

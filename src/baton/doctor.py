@@ -17,8 +17,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import NamedTuple
 
-from baton.adapters import antigravity, codex
+from baton.adapters import antigravity, claude_api, codex
 from baton.config import AGENT_NAMES, AgentConfig, Goal, default_agent
+from baton.ledger import MIN_GRANT_USD, LedgerError
 from baton.proc import SCRUBBED_ENV
 
 PS_TIMEOUT_S = 10
@@ -193,6 +194,72 @@ def _antigravity_limits(cfg: AgentConfig, now: float) -> Check:
     return Check(name, False, verdict.blind, f"{detail}; not usable now: {avail.reason}")
 
 
+def _usd(value: Decimal) -> str:
+    return format(value.normalize() if value == value.to_integral_value() else value, "f")
+
+
+def _claude_checks(cfg: AgentConfig, env: Mapping[str, str], blocking: bool) -> list[Check]:
+    """Everything about the Claude API agent that can be read without spending: its binary, its
+    key file (never its content), the spend ledger against the ceiling, the optional cost report,
+    and the Console settings that only the account owner can verify.
+
+    `blocking` is true only when no other agent in the order could run instead: Claude is an
+    optional agent, and a missing key must not stop the others.
+    """
+    binary, usable = _binary(cfg, env, blocking)
+    checks = [binary]
+    if not cfg.enabled:
+        return checks
+    try:
+        claude_api.read_key(Path(cfg.key_file))
+        checks.append(Check("claude_api key", True, blocking, f"{cfg.key_file} (mode 600)"))
+    except claude_api.KeyFileError as exc:
+        checks.append(Check("claude_api key", False, blocking, str(exc)))
+    ledger = claude_api.ledger_for(cfg)
+    ceiling = ledger.ceiling
+    floor = None
+    if cfg.admin_key_file:
+        try:
+            report = claude_api.make_cost_report(cfg, ledger)
+            assert report is not None
+            floor = report()
+            checks.append(
+                Check("claude_api cost report", True, blocking, f"organization spent {_usd(floor)}")
+            )
+        except Exception as exc:
+            checks.append(Check("claude_api cost report", False, blocking, str(exc)))
+            floor = None
+    name = "claude_api spend"
+    try:
+        spent = ledger.spent(floor)
+        exhausted = ledger.exhausted()
+    except LedgerError as exc:
+        checks.append(Check(name, False, blocking, f"ledger unreadable: {exc}"))
+    else:
+        left = ceiling - spent
+        detail = (
+            f"spent {_usd(spent)} of the {_usd(ceiling)} USD ceiling, {_usd(left)} left "
+            f"(budget {_usd(cfg.monthly_budget_usd)} minus {cfg.reserve_pct}% reserve); "
+            f"period resets {_when(ledger.next_period())}"
+        )
+        if exhausted:
+            detail += "; the Console reported no credit left"
+        ok = left >= MIN_GRANT_USD and not exhausted
+        checks.append(Check(name, ok, False, detail if ok else f"{detail}; not usable now"))
+    checks.append(
+        Check(
+            "claude_api console",
+            True,
+            False,
+            "reminder, since neither can be checked with the key: in the Console turn "
+            "auto-reload off and hold no purchased credits (spending would continue after the "
+            "promotional credit ends), and put the key in a dedicated workspace with a monthly "
+            f"spend limit of {_usd(ceiling)} USD",
+        )
+    )
+    return checks
+
+
 def _interactive() -> Check:
     name = "interactive codex"
     try:
@@ -234,6 +301,10 @@ def run_checks(goal: Goal | None, env: Mapping[str, str]) -> list[Check]:
     for name in AGENT_NAMES:
         cfg = agents[name]
         blocking = name in wanted
+        if name == "claude_api":
+            others = any(agents[a].enabled for a in wanted if a != name)
+            checks += _claude_checks(cfg, env, blocking and not others)
+            continue
         binary, usable = _binary(cfg, env, blocking)
         checks.append(binary)
         if not cfg.enabled:

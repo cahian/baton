@@ -1,4 +1,5 @@
 import os
+from decimal import Decimal
 
 import pytest
 from conftest import agy_credits, agy_usage, codex_limits, iso
@@ -208,3 +209,159 @@ def test_antigravity_unreadable_balance_blocks(fakes, credits):
     fakes.agy_files(credits=credits)
     c = check(run(fakes), "antigravity limits")
     assert not c.ok and c.blocking
+
+
+# --- Claude API -------------------------------------------------------------------------------
+
+CLAUDE_KEY = "sk-ant-api03-DOCTORKEY0123456789abcdef"
+
+
+def claude_ledger(fakes, spent="0", reserved=None):
+    """The ledger the goal's defaults point at, with some spend in it."""
+    from baton.adapters.claude_api import ledger_for
+    from baton.config import default_agent
+
+    ledger = ledger_for(default_agent("claude_api"))
+    if Decimal(spent):
+        ledger.settle("x", Decimal(spent))
+    if reserved:
+        ledger.reserve(Decimal(reserved))
+    return ledger
+
+
+def claude(fakes, claude_extra="", **kw):
+    fakes.claude_key(CLAUDE_KEY)
+    return run(fakes, claude=claude_extra, **kw)
+
+
+def test_reports_claude_spend_and_console_reminder(fakes):
+    claude_ledger(fakes, spent="12.5", reserved="10")
+    checks = claude(fakes)
+    spend = check(checks, "claude_api spend")
+    assert spend.ok and not spend.blocking
+    assert "22.5" in spend.detail and "180" in spend.detail  # spent plus the live reservation
+    assert "157.5" in spend.detail  # what is left
+    assert "10%" in spend.detail and "200" in spend.detail  # budget and reserve
+    assert "2026-" in spend.detail or "20" in spend.detail  # when the period resets
+    reminder = check(checks, "claude_api console")
+    assert reminder.ok and not reminder.blocking
+    for word in ("auto-reload", "purchased credits", "workspace", "monthly spend limit", "180"):
+        assert word in reminder.detail
+    assert check(checks, "claude_api binary").ok
+    assert check(checks, "claude_api key").ok
+
+
+def test_claude_doctor_never_prints_the_key(fakes, capsys):
+    from baton.cli import main
+
+    checks = claude(fakes)
+    for c in checks:
+        assert CLAUDE_KEY not in c.name and CLAUDE_KEY not in c.detail
+    fakes.claude_key(CLAUDE_KEY)
+    assert main(["doctor", str(fakes.goal(claude=""))]) == 0
+    out = capsys.readouterr()
+    assert CLAUDE_KEY not in out.out + out.err
+
+
+def test_claude_doctor_never_runs_a_round_or_creates_the_ledger(fakes):
+    claude(fakes)
+    assert fakes.claude_calls() == []
+    assert not (fakes.state / "claude-spend.json").exists()
+    assert not (fakes.state / "claude-spend.json.lock").exists()
+
+
+def test_stray_anthropic_variables_are_flagged(fakes, monkeypatch):
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        monkeypatch.setenv(var, SECRET)
+    checks = run(fakes)
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        flagged = check(checks, var)
+        assert not flagged.ok and not flagged.blocking
+    for c in checks:
+        assert SECRET not in c.name and SECRET not in c.detail
+
+
+def test_claude_without_a_key_is_a_warning_when_others_can_run(fakes):
+    checks = run(fakes, claude="")  # no key file written
+    key = check(checks, "claude_api key")
+    assert not key.ok and not key.blocking and "not found" in key.detail
+    assert not blocking_failures(checks)
+
+
+def test_claude_without_a_key_blocks_when_it_is_the_only_agent(fakes):
+    checks = run(fakes, claude="", order=("claude_api",))
+    assert check(checks, "claude_api key").blocking
+    assert blocking_failures(checks)
+
+
+def test_claude_key_with_wrong_mode_is_flagged(fakes):
+    fakes.claude_key(CLAUDE_KEY, mode=0o644)
+    key = check(run(fakes, claude=""), "claude_api key")
+    assert not key.ok and "600" in key.detail and CLAUDE_KEY not in key.detail
+
+
+def test_claude_missing_binary(fakes):
+    fakes.claude_key(CLAUDE_KEY)
+    checks = run(fakes, claude='bin = "/nonexistent/claude"\n')
+    binary = check(checks, "claude_api binary")
+    assert not binary.ok and not binary.blocking and "/nonexistent/claude" in binary.detail
+
+
+def test_claude_outside_the_order_never_blocks(fakes):
+    checks = run(fakes, claude='bin = "/nonexistent/claude"\n')  # default order has no claude_api
+    assert not blocking_failures(checks)
+
+
+def test_claude_at_the_ceiling_is_a_warning(fakes):
+    claude_ledger(fakes, spent="179.5")
+    spend = check(claude(fakes), "claude_api spend")
+    assert not spend.ok and not spend.blocking
+    assert "179.5" in spend.detail and "ceiling" in spend.detail
+
+
+def test_claude_corrupt_ledger_is_flagged_and_kept(fakes):
+    fakes.state.mkdir(parents=True)
+    ledger = fakes.state / "claude-spend.json"
+    ledger.write_text("{garbage")
+    spend = check(claude(fakes), "claude_api spend")
+    assert not spend.ok and "claude-spend.json" in spend.detail
+    assert ledger.read_text() == "{garbage"
+    blocked = check(claude(fakes, order=("claude_api",)), "claude_api spend")
+    assert blocked.blocking
+
+
+def test_claude_uses_the_cost_report_when_an_admin_key_is_set(fakes, monkeypatch):
+    from baton.adapters import claude_api
+
+    admin = fakes.root / "admin.key"
+    admin.write_text("sk-ant-admin01-ADMINKEY\n")
+    admin.chmod(0o600)
+    monkeypatch.setattr(claude_api, "fetch_cost_report", lambda path, since, **kw: Decimal("170"))
+    claude_ledger(fakes, spent="20")
+    checks = claude(fakes, claude_extra=f'admin_key_file = "{admin}"\n')
+    spend = check(checks, "claude_api spend")
+    assert "170" in spend.detail and "10" in spend.detail  # the larger figure wins
+    assert check(checks, "claude_api cost report").ok
+
+
+def test_claude_cost_report_failure_is_flagged(fakes, monkeypatch):
+    from baton.adapters import claude_api
+
+    admin = fakes.root / "admin.key"
+    admin.write_text("sk-ant-admin01-ADMINKEY\n")
+    admin.chmod(0o600)
+
+    def broken(path, since, **kw):
+        raise claude_api.CostReportError("the Admin API answered HTTP 500")
+
+    monkeypatch.setattr(claude_api, "fetch_cost_report", broken)
+    checks = claude(fakes, claude_extra=f'admin_key_file = "{admin}"\n')
+    report = check(checks, "claude_api cost report")
+    assert not report.ok and "HTTP 500" in report.detail
+    assert "ADMINKEY" not in report.detail
+
+
+def test_claude_disabled_is_not_checked(fakes):
+    checks = run(fakes, claude="enabled = false\n")
+    assert "disabled" in check(checks, "claude_api binary").detail
+    assert not [c for c in checks if c.name.startswith("claude_api") and "binary" not in c.name]

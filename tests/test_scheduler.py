@@ -268,3 +268,59 @@ def test_unknown_names_in_state_or_order_are_ignored(env):
     store.save_state({"current": "claude", "agents": {"claude": {"until": 9e12}, "codex": 7}})
     s = Scheduler(("codex", "antigravity", "claude"), agents, store, clock)
     assert s.pick().name == "codex"
+
+
+def test_three_agents_cycle_in_order(tmp_path):
+    clock = Clock()
+    names = ("claude_api", "antigravity", "codex")
+    agents = {n: Agent(n) for n in names}
+    s = Scheduler(names, agents, Store(tmp_path / "goal"), clock)
+    assert s.pick().name == "claude_api"  # the first in order starts
+    agents["claude_api"].avail = Availability(False, until=clock.now + 10_000, reason="ceiling")
+    assert s.pick().name == "antigravity"
+    agents["antigravity"].avail = Availability(False, until=clock.now + 10_000, reason="used up")
+    assert s.pick().name == "codex"
+    # The last agent runs out: the rotation wraps to the first one that is available again.
+    agents["codex"].avail = Availability(False, until=clock.now + 10_000, reason="used up")
+    agents["claude_api"].avail = Availability(True)
+    clock.now += 10_001
+    assert s.pick().name == "claude_api"
+    # Wrapping skips an agent that is still resting: claude_api is out, antigravity is back.
+    agents["claude_api"].avail = Availability(False, until=clock.now + 10_000, reason="ceiling")
+    agents["antigravity"].avail = Availability(True)
+    agents["codex"].avail = Availability(False, until=clock.now + 10_000, reason="used up")
+    assert s.pick().name == "antigravity"
+    # And it keeps going forward from the current one: antigravity -> codex -> claude_api.
+    agents["antigravity"].avail = Availability(False, until=clock.now + 10_000, reason="used up")
+    agents["codex"].avail = Availability(True)
+    clock.now += 301
+    assert s.pick().name == "codex"
+    agents["codex"].avail = Availability(False, until=clock.now + 10_000, reason="used up")
+    agents["claude_api"].avail = Availability(True)
+    clock.now += 10_001
+    assert s.pick().name == "claude_api"
+
+
+def test_wrap_around_takes_the_first_available_not_the_first_in_order(tmp_path):
+    clock = Clock()
+    names = ("claude_api", "antigravity", "codex")
+    agents = {n: Agent(n) for n in names}
+    store = Store(tmp_path / "goal")
+    store.save_state({"current": "codex"})
+    s = Scheduler(names, agents, store, clock)
+    assert s.pick().name == "codex"
+    agents["codex"].avail = Availability(False, until=clock.now + 500, reason="used up")
+    agents["claude_api"].avail = Availability(False, until=clock.now + 500, reason="ceiling")
+    assert s.pick().name == "antigravity"  # wraps past the resting claude_api
+
+
+def test_rotation_from_the_middle_goes_forward_before_wrapping(tmp_path):
+    clock = Clock()
+    names = ("claude_api", "antigravity", "codex")
+    agents = {n: Agent(n) for n in names}
+    store = Store(tmp_path / "goal")
+    store.save_state({"current": "antigravity"})
+    s = Scheduler(names, agents, store, clock)
+    assert s.pick().name == "antigravity"
+    agents["antigravity"].avail = Availability(False, until=clock.now + 500, reason="used up")
+    assert s.pick().name == "codex"  # not claude_api, which comes first in the list

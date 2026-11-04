@@ -120,6 +120,7 @@ def make_goal(tmp_path, work, verify="test -f DONE", snapshot=False, verify_extr
         f'workdir = "{work}"',
         f'objective = "{OBJECTIVE}"',
         f"snapshot = {str(snapshot).lower()}",
+        'order = ["codex", "antigravity"]',
     ]
     if verify:
         lines += ["[verify]", f'command = "{verify}"', verify_extra]

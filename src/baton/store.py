@@ -27,13 +27,18 @@ class StateError(Exception):
     """state.json exists but cannot be read. The file is left untouched."""
 
 
+def state_base() -> Path:
+    """Where baton keeps state shared by every goal. `BATON_STATE_DIR` overrides
+    `~/.local/state/baton`."""
+    override = os.environ.get("BATON_STATE_DIR")
+    return Path(override).expanduser() if override else Path.home() / ".local/state/baton"
+
+
 def state_dir(name: str) -> Path:
-    """State directory for a goal. `BATON_STATE_DIR` overrides `~/.local/state/baton`."""
+    """State directory for a goal."""
     if not _SAFE_RE.fullmatch(name):
         raise ValueError(f"unsafe goal name: {name!r}")
-    override = os.environ.get("BATON_STATE_DIR")
-    base = Path(override).expanduser() if override else Path.home() / ".local/state/baton"
-    return base / name
+    return state_base() / name
 
 
 def _atomic_write(path: Path, text: str) -> None:
