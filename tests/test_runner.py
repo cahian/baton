@@ -1502,13 +1502,94 @@ def test_a_failed_save_before_a_round_keeps_the_note_for_a_later_one(
     assert any("could not save state" in str(e.get("error")) for e in store.events())
 
 
-def test_a_kill_after_the_save_does_not_repeat_the_note(go, agents, work, store):
+def dies_deleting_the_inbox(go, store, monkeypatch):
+    """Run until a kill lands between the save and the delete."""
+
+    def died(read):
+        raise Died()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "clear_inbox", died)
+        with pytest.raises(Died):
+            go()
+
+
+def test_a_kill_after_the_save_does_not_repeat_the_note(go, agents, work, store, monkeypatch):
     (work / "DONE").write_text("x")
     store.say("said once")
-    store.save_state({"notes": "said once\n\n"})  # saved, and the inbox was never deleted
+    dies_deleting_the_inbox(go, store, monkeypatch)
+    state = store.load_state()
+    assert state["collected_inbox"] == "said once\n\n" and state["notes"] == "said once\n\n"
+    assert "said once" in (store.root / "inbox.md").read_text()
     go()
     assert not (store.root / "inbox.md").exists()
     assert sum(p.count("said once") for p in sent(agents)) == 1
+    assert store.load_state()["collected_inbox"] == ""
+
+
+def test_a_note_newer_than_the_kill_is_still_added(go, agents, work, store, monkeypatch):
+    (work / "DONE").write_text("x")
+    store.say("said once")
+    dies_deleting_the_inbox(go, store, monkeypatch)
+    store.say("said later")
+    go()
+    assert not (store.root / "inbox.md").exists()
+    prompts = sent(agents)
+    assert sum(p.count("said once") for p in prompts) == 1
+    assert sum(p.count("said later") for p in prompts) == 1
+
+
+def test_a_note_that_ends_like_a_carried_one_is_kept(go, agents, work, store):
+    store.save_state({"workdir": str(work), "notes": "do not push to main\n\n"})
+    store.say("push to main")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert agents["codex"].prompts[0].count("push to main") == 2
+    assert not (store.root / "inbox.md").exists()
+
+
+def test_the_same_text_sent_again_after_a_clear_is_carried_again(go, agents, work, store, world):
+    def repeated(agent, prompt, ctx):
+        store.say("same words")
+        return dies_at_once(until=world.now + 3600)(agent, prompt, ctx)
+
+    store.say("same words")
+    agents["codex"].script = [repeated]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert agents["antigravity"].prompts[0].count("same words") == 2
+
+
+def test_the_same_text_after_a_kill_past_the_delete_is_carried(go, agents, work, store):
+    """The kill left the mark in state.json with nothing in the inbox to match it."""
+
+    def repeated(agent, prompt, ctx):
+        store.say("same words")
+        return dies_at_once()(agent, prompt, ctx)
+
+    store.save_state({"workdir": str(work), "collected_inbox": "same words\n\n"})
+    agents["codex"].script = [repeated]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert agents["antigravity"].prompts[0].count("same words") == 1
+
+
+def test_a_completed_collect_leaves_no_mark_in_state_json(tmp_path, work, store, agents, world):
+    run = runner._Run(
+        make_goal(tmp_path, work), agents, store, world.clock, world.sleep, None, False
+    )
+    store.say("moved")
+    assert run.collect_notes() is False
+    state = store.load_state()
+    assert state["notes"] == "moved\n\n" and state["collected_inbox"] == ""
+
+
+def test_a_mark_that_is_not_text_counts_as_none(go, agents, work, store):
+    store.save_state({"workdir": str(work), "collected_inbox": 7})
+    store.say("still read")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "still read" in agents["codex"].prompts[0]
 
 
 def test_a_note_that_lands_during_the_save_stays_in_the_inbox(go, agents, work, store, monkeypatch):

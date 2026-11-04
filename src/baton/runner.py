@@ -349,6 +349,7 @@ class _Run:
         self.objective = objective
         self.prev_agent: str | None = None
         self.carried_notes = ""
+        self.collected_inbox = ""
         self.owes_round = owes_round
         self.heads: dict[str, str] = {}
         self.pause_until = 0.0
@@ -412,6 +413,7 @@ class _Run:
             "group": self.group,
             "group_start": self.group_start if self.group is not None else None,
             "notes": self.carried_notes,
+            "collected_inbox": self.collected_inbox,
             "owes_round": self.owes_round,
             "verify_warning": self.verify_warning,
         }
@@ -506,6 +508,8 @@ class _Run:
         self.round_tail = tail if isinstance(tail, str) else ""
         notes = state.get("notes")
         self.carried_notes = notes if isinstance(notes, str) else ""
+        collected = state.get("collected_inbox")
+        self.collected_inbox = collected if isinstance(collected, str) else ""
         self.owes_round = self.owes_round or state.get("owes_round") is True
         warning = state.get("verify_warning")
         self.verify_warning = warning if isinstance(warning, str) else ""
@@ -580,18 +584,25 @@ class _Run:
     def collect_notes(self) -> bool:
         """Move the inbox into the carried notes: read, save, then delete, so a note is always in
         a file. True when the state could not be saved, which leaves the note in the inbox. Raises
-        OSError when the inbox cannot be read or deleted."""
+        OSError when the inbox cannot be read or deleted.
+
+        `collected_inbox` is the inbox text the save covers, kept until the delete is done: a kill
+        between the two leaves it in state.json, so the next run adds only what came after it."""
         text = self.store.read_inbox()
         if not text:
+            if self.collected_inbox:  # a kill between the delete and the save that follows it
+                self.collected_inbox = ""
+                self.persist_softly()
             return False
-        # Already carried when a kill came between the save and the delete.
-        if not self.carried_notes.endswith(text):
-            carried = self.carried_notes
-            self.carried_notes += text
-            if not self.persist_softly():
-                self.carried_notes = carried
-                return True
+        carried, collected = self.carried_notes, self.collected_inbox
+        self.carried_notes += text.removeprefix(collected)
+        self.collected_inbox = text
+        if not self.persist_softly():
+            self.carried_notes, self.collected_inbox = carried, collected
+            return True
         self.store.clear_inbox(text)
+        self.collected_inbox = ""
+        self.persist_softly()
         return False
 
     def stop_now(self) -> bool:
