@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from baton import proc
-from baton.adapters.base import COMPLETED, LIMIT, RoundContext, RoundResult
+from baton.adapters.base import COMPLETED, LIMIT, TRANSIENT, RoundContext, RoundResult
 from baton.proc import SCRUBBED_ENV, clean_env, run_streaming
 
 
@@ -475,3 +475,102 @@ def test_round_context_and_result_defaults(tmp_path):
     ctx = make_ctx(tmp_path)
     assert ctx.session_id is None
     ctx.on_session("abc")  # default callback accepts a session id and does nothing
+
+
+def test_sigterm_handler_farewell_is_drained_not_blocked(tmp_path):
+    code = (
+        "import signal, sys, time\n"
+        "def bye(*_):\n"
+        "    time.sleep(0.5)\n"
+        "    sys.stdout.write(('x' * 99 + '\\n') * 12000)\n"
+        "    sys.stdout.write('BYE\\n')\n"
+        "    sys.stdout.flush()\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, bye)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    stop = RoundResult(LIMIT, reason="guard")
+    t0 = time.monotonic()
+    ex = run_streaming(
+        py(code),
+        tmp_path,
+        None,
+        make_ctx(tmp_path),
+        lambda line: stop if line == "ready" else None,
+        lambda: None,
+    )
+    assert ex.stopped is stop
+    assert time.monotonic() - t0 < 4
+    assert ex.returncode == 0  # exited by itself, was not SIGKILLed
+    assert ex.tail.rstrip().endswith("BYE")
+
+
+def test_slow_on_line_with_setsid_infinite_producer_still_returns(tmp_path):
+    flood = "import os; b = b'y\\n' * 4096\nwhile True:\n    os.write(1, b)"
+    code = (
+        "import subprocess, sys\n"
+        f"g = subprocess.Popen([sys.executable, '-c', {flood!r}], start_new_session=True)\n"
+        "print('GC', g.pid, flush=True)\n"
+    )
+    seen = {}
+    delivered = []
+
+    def on_line(line):
+        if line.startswith("GC "):
+            seen["gc"] = int(line.split()[1])
+        delivered.append(line)
+        time.sleep(0.0002)
+
+    t0 = time.monotonic()
+    try:
+        ex = run_streaming(
+            py(code), tmp_path, None, make_ctx(tmp_path), on_line, lambda: None, tick_s=0.1
+        )
+        elapsed = time.monotonic() - t0
+    finally:
+        if "gc" in seen:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(seen["gc"], signal.SIGKILL)
+    assert ex.returncode == 0 and not ex.timed_out
+    assert elapsed < 8
+    assert delivered[0].startswith("GC ")
+
+
+def _burst_then_guard(n: int) -> list[str]:
+    return py(f"for i in range({n}): print('L', i)\nprint('GUARD')")
+
+
+def test_guard_stop_during_drain_wins_over_a_tick_stop(tmp_path):
+    guard = RoundResult(LIMIT, reason="guard")
+    tick_stop = RoundResult(TRANSIENT, reason="tick")
+    start = time.monotonic()
+
+    def on_line(line):
+        time.sleep(0.0003)
+        return guard if line == "GUARD" else None
+
+    def tick():
+        # fires only once the leader is long gone and lines are still being worked off
+        return tick_stop if time.monotonic() - start > 0.6 else None
+
+    ex = run_streaming(
+        _burst_then_guard(4000), tmp_path, None, make_ctx(tmp_path), on_line, tick, tick_s=0.1
+    )
+    assert ex.stopped is guard
+
+
+def test_tick_stop_during_drain_is_kept_when_no_guard_follows(tmp_path):
+    tick_stop = RoundResult(TRANSIENT, reason="tick")
+    start = time.monotonic()
+
+    def on_line(line):
+        time.sleep(0.0003)
+
+    def tick():
+        return tick_stop if time.monotonic() - start > 0.6 else None
+
+    ex = run_streaming(
+        _burst_then_guard(4000), tmp_path, None, make_ctx(tmp_path), on_line, tick, tick_s=0.1
+    )
+    assert ex.stopped is tick_stop

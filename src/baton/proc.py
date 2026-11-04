@@ -40,10 +40,19 @@ MAX_LINE_BYTES = 64 * 1024
 TAIL_CHARS = 4000
 # How often the loop looks for the leader's exit while the child is silent.
 POLL_S = 0.1
-# After the leader exits, how long to keep reading what is still in the pipe.
+# After the leader exits, the drain ends once nothing new arrived for this long.
 DRAIN_S = 0.25
+# Hard cap on the drain: a setsid survivor can keep the pipe full forever.
+HARD_DRAIN_S = 3.0
+# Chunks held between the reader thread and the loop. The reader blocks when it is full, so
+# a slow on_line slows the reader down instead of growing memory.
+QUEUE_MAX = 4096
+PUT_TIMEOUT_S = 0.05
+# While a group is being killed the loop keeps the pipe flowing so a SIGTERM handler that
+# writes a farewell does not block; this much of it is kept in the log.
+PUMP_LOG_BYTES = 16 * 1024 * 1024
 # How long to wait for the reader thread once the group is dead.
-JOIN_S = 1.0
+JOIN_S = 0.5
 
 
 def clean_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -79,15 +88,23 @@ def _signal_group(pgid: int, sig: int) -> None:
         pass
 
 
-def _kill_group(pgid: int, grace_s: float, reap: Callable[[], object] | None) -> None:
+def _kill_group(
+    pgid: int,
+    grace_s: float,
+    reap: Callable[[], object] | None,
+    pump: Callable[[], object] | None = None,
+) -> None:
     """SIGTERM the group, then SIGKILL whatever survives `grace_s`.
 
     `reap` collects the group leader when it is our own child: an unreaped zombie leader keeps
-    the group looking alive and would always burn the whole grace period.
+    the group looking alive and would always burn the whole grace period. `pump` is called on
+    every poll so the caller can keep reading the dying group's output.
     """
     _signal_group(pgid, signal.SIGTERM)
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
+        if pump is not None:
+            pump()
         if reap is not None:
             reap()
         if not _group_alive(pgid):
@@ -96,6 +113,8 @@ def _kill_group(pgid: int, grace_s: float, reap: Callable[[], object] | None) ->
     _signal_group(pgid, signal.SIGKILL)
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
+        if pump is not None:
+            pump()
         if reap is not None:
             reap()
         if not _group_alive(pgid):
@@ -119,22 +138,26 @@ class Exit:
 _EOF = object()
 
 
-def _reader(stream, out: queue.Queue, limit: list[float]) -> None:
-    """Feed `out` with raw chunks until EOF or until a chunk is read after `limit[0]`.
+def _put(out: queue.Queue, item: object, halt: threading.Event) -> bool:
+    """Block until `item` is queued; False if the runner halted first."""
+    while not halt.is_set():
+        try:
+            out.put(item, timeout=PUT_TIMEOUT_S)
+            return True
+        except queue.Full:
+            continue
+    return False
 
-    The limit is what makes the queue finite once the leader is gone: a process outside the
-    group (setsid survivor) can hold the pipe open and write forever, and nothing it writes
-    after the deadline is wanted.
-    """
+
+def _reader(stream, out: queue.Queue, halt: threading.Event) -> None:
+    """Feed `out` with raw chunks until EOF or until `halt` is set."""
     try:
         for chunk in iter(lambda: stream.readline(MAX_LINE_BYTES), b""):
-            if time.monotonic() > limit[0]:
-                break
-            out.put(chunk)
+            if not _put(out, chunk, halt):
+                return
     except (OSError, ValueError):
         pass
-    finally:
-        out.put(_EOF)
+    _put(out, _EOF, halt)
 
 
 def _feed_stdin(stream, text: str) -> None:
@@ -188,10 +211,9 @@ def run_streaming(
     stopped: RoundResult | None = None
     timed_out = False
     reader: threading.Thread | None = None
-    lines: queue.Queue = queue.Queue()
-    # Chunks read after this monotonic time are dropped by the reader. Infinite until the
-    # leader exits or the round is being stopped.
-    limit = [float("inf")]
+    lines: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
+    halt = threading.Event()  # set when the runner is done; releases a blocked reader
+    pumped = 0
 
     def record(chunk: bytes) -> str:
         nonlocal tail
@@ -200,8 +222,20 @@ def run_streaming(
         tail = (tail + line + "\n")[-TAIL_CHARS:]
         return line
 
+    def pump() -> None:
+        """Keep reading while the group is being killed (log only, no on_line)."""
+        nonlocal pumped
+        while True:
+            try:
+                item = lines.get_nowait()
+            except queue.Empty:
+                return
+            if item is not _EOF and pumped < PUMP_LOG_BYTES:
+                pumped += len(item)
+                record(item)
+
     try:
-        reader = threading.Thread(target=_reader, args=(child.stdout, lines, limit), daemon=True)
+        reader = threading.Thread(target=_reader, args=(child.stdout, lines, halt), daemon=True)
         reader.start()
         if stdin_text is not None and child.stdin is not None:
             feeder = threading.Thread(target=_feed_stdin, args=(child.stdin, stdin_text))
@@ -211,6 +245,7 @@ def run_streaming(
         started = last_output = last_check = time.monotonic()
         eof = False
         exited_at: float | None = None
+        deferred: RoundResult | None = None
         while stopped is None and not timed_out:
             try:
                 item = lines.get(timeout=min(tick_s, POLL_S))
@@ -229,42 +264,51 @@ def run_streaming(
                 if stopped is not None:
                     break
             # The leader's exit ends the round even if a grandchild still holds the pipe.
-            # Everything the reader got before exit + DRAIN_S still reaches on_line, however
-            # slow on_line is; the reader refuses later data, so that backlog is finite.
+            # Whatever is queued keeps flowing to on_line, however slow it is, until the pipe
+            # goes quiet, EOF, or the hard cap.
             if exited_at is None and _leader_exited(child):
                 exited_at = now
-                limit[0] = min(limit[0], now + DRAIN_S)
-            if exited_at is not None and (eof or (lines.empty() and now >= limit[0])):
-                break
+            if exited_at is not None:
+                if eof or now - exited_at >= HARD_DRAIN_S:
+                    break
+                if lines.empty() and now - max(exited_at, last_output) >= DRAIN_S:
+                    break
             if now - last_check >= tick_s:
                 last_check = now
-                if ctx.should_kill():
-                    stopped = RoundResult(COMPLETED, reason="stop requested")
-                else:
-                    stopped = tick()
-                if stopped is None and exited_at is None:
+                result = (
+                    RoundResult(COMPLETED, reason="stop requested") if ctx.should_kill() else tick()
+                )
+                if result is not None:
+                    if exited_at is None:
+                        stopped = result
+                    elif deferred is None:
+                        # Mid-drain: lines still queued may carry a guard result, which wins.
+                        deferred = result
+                elif exited_at is None:
                     if now - started >= ctx.round_max_s or now - last_output >= ctx.idle_s:
                         timed_out = True
+        if stopped is None:
+            stopped = deferred
     finally:
         try:
-            # A stop or timeout also gets a bounded window to collect what is already in flight.
-            limit[0] = min(limit[0], time.monotonic() + DRAIN_S)
             # Always sweep the group, also after a normal exit, so nothing outlives the round.
-            _kill_group(pgid, KILL_GRACE_S, child.poll)
+            # The reader keeps running meanwhile: a SIGTERM handler's last words must not
+            # block on a full pipe.
+            _kill_group(pgid, KILL_GRACE_S, child.poll, pump)
             returncode = child.wait()
             reader_alive = False
             if reader is not None:
-                reader.join(timeout=JOIN_S)
+                end = time.monotonic() + JOIN_S  # EOF arrives once the group is dead
+                while reader.is_alive() and time.monotonic() < end:
+                    pump()
+                    reader.join(timeout=0.02)
+                pump()
+                halt.set()
+                reader.join(timeout=0.05)
                 reader_alive = reader.is_alive()
-            # Whatever the child wrote before dying still belongs in the log and the tail.
-            # Finite: the reader stopped at `limit`, which has passed by now.
-            while True:
-                try:
-                    item = lines.get_nowait()
-                except queue.Empty:
-                    break
-                if item is not _EOF:
-                    record(item)
+            else:
+                halt.set()
+            pump()  # whatever the child wrote before dying still belongs in the log and tail
             # Closing the pipe would block on the reader's buffer lock if a process outside the
             # group (setsid survivor) still holds it; leave it to the daemon thread then.
             if not reader_alive and child.stdout is not None:
