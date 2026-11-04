@@ -145,13 +145,24 @@ def test_round_log_path(st):
         st.round_log(1, "../x")
 
 
-def test_inbox_take_clears(st):
-    assert st.take_inbox() == ""
+def test_reading_the_inbox_leaves_it(st):
+    assert st.read_inbox() == ""
     st.say("first")
     st.say("second")
-    text = st.take_inbox()
+    text = st.read_inbox()
     assert "first" in text and "second" in text and text.index("first") < text.index("second")
-    assert st.take_inbox() == ""
+    assert st.read_inbox() == text
+
+
+def test_clearing_the_inbox_removes_only_what_was_read(st):
+    st.say("first")
+    text = st.read_inbox()
+    st.say("second")
+    st.clear_inbox(text)
+    assert st.read_inbox() == "second\n\n"
+    st.clear_inbox("second\n\n")
+    assert not (st.root / "inbox.md").exists()
+    st.clear_inbox("second\n\n")  # nothing left is fine
 
 
 def test_stop_soon_and_now(st):

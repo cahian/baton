@@ -309,15 +309,25 @@ class Store:
         with self._inbox_lock(), self._inbox.open("a", encoding="utf-8") as fh:
             fh.write(text + "\n\n")
 
-    def take_inbox(self) -> str:
-        """Return the unread notes and clear them."""
+    def read_inbox(self) -> str:
+        """The unread notes, left in place until `clear_inbox` says they are safe elsewhere."""
         with self._inbox_lock():
             try:
-                text = self._inbox.read_text(encoding="utf-8")
+                return self._inbox.read_text(encoding="utf-8")
             except FileNotFoundError:
                 return ""
-            self._inbox.unlink(missing_ok=True)
-        return text
+
+    def clear_inbox(self, read: str) -> None:
+        """Delete `read`, as `read_inbox` returned it. A note that arrived since stays."""
+        with self._inbox_lock():
+            try:
+                rest = self._inbox.read_text(encoding="utf-8").removeprefix(read)
+            except FileNotFoundError:
+                return
+            if rest:
+                _atomic_write(self._inbox, rest)
+            else:
+                self._inbox.unlink(missing_ok=True)
 
     # stop
 

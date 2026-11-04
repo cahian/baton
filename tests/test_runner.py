@@ -913,7 +913,7 @@ def test_refused_start_keeps_notes_and_the_previous_tail(go, agents, work, store
     delivered = agents["antigravity"].prompts[0]
     assert "keep me" in delivered  # the refused start did not swallow it
     assert "tail from the last real round" in delivered
-    assert store.take_inbox() == ""
+    assert store.read_inbox() == ""
 
 
 def test_delivered_notes_are_consumed_once_started(go, agents, work, store):
@@ -936,7 +936,7 @@ def test_notes_survive_an_agent_that_dies_at_once(go, agents, work, store, world
     assert go() == 0
     assert "do not lose me" in agents["codex"].prompts[0]
     assert "do not lose me" in agents["antigravity"].prompts[0]
-    assert store.take_inbox() == ""
+    assert store.read_inbox() == ""
 
 
 def test_a_round_that_dies_at_once_leaves_the_previous_tail(go, agents, work, store, world):
@@ -1346,6 +1346,7 @@ def test_a_stop_wins_over_an_unread_note(go, agents, work, store):
     assert go() == 0
     assert agents["codex"].prompts == [] and agents["antigravity"].prompts == []
     assert kinds(store)[-1] == "stopped"
+    assert note_is_kept(store, "never read")
 
 
 def test_the_objective_callable_briefs_each_fresh_round(tmp_path, work, store, agents, world):
@@ -1358,3 +1359,164 @@ def test_the_objective_callable_briefs_each_fresh_round(tmp_path, work, store, a
     assert "first briefing" in agents["codex"].prompts[0]
     assert "second briefing" in agents["codex"].prompts[1]
     assert OBJECTIVE not in agents["codex"].prompts[0]
+
+
+# a note survives whatever ends the run
+
+
+class Died(BaseException):
+    """Stands for a kill -9: nothing after the point that raises it runs."""
+
+
+def dies(seconds):
+    raise Died()
+
+
+def note_is_kept(store, text):
+    inbox = store.root / "inbox.md"
+    in_inbox = inbox.exists() and text in inbox.read_text()
+    return in_inbox or text in str(store.load_state().get("notes", ""))
+
+
+def sent(agents):
+    return agents["codex"].prompts + agents["antigravity"].prompts
+
+
+def test_a_note_a_stop_left_unread_reaches_the_next_run(go, agents, work, store):
+    (work / "DONE").write_text("x")
+    store.say("never read")
+    store.request_stop()
+    go()
+    assert sent(agents) == []
+    go()
+    assert sum("never read" in p for p in sent(agents)) == 1
+
+
+def test_a_kill_during_a_wait_keeps_the_note(go, agents, work, store, world):
+    (work / "DONE").write_text("x")
+    store.say("person said something")
+    for agent in agents.values():
+        agent.avail = Availability(False, until=world.now + 7200, reason="spent")
+    with pytest.raises(Died):
+        go(sleep=dies)
+    assert note_is_kept(store, "person said something")
+
+
+def test_a_goal_does_not_finish_past_a_note_saved_before_a_kill(go, agents, work, store, world):
+    (work / "DONE").write_text("x")
+    store.say("person said something")
+    for agent in agents.values():
+        agent.avail = Availability(False, until=world.now + 7200, reason="spent")
+    with pytest.raises(Died):
+        go(sleep=dies)
+    for agent in agents.values():
+        agent.avail = Availability(True)
+    world.now += 8000
+    go()
+    assert any("person said something" in p for p in sent(agents))
+
+
+def test_a_kill_between_taking_the_inbox_and_spawning_keeps_the_note(go, agents, store):
+    store.say("note before the baseline read")
+
+    def dies_before_spawn(prompt, ctx):  # the baseline limits read, 15-60 s with the real CLIs
+        raise Died()
+
+    agents["codex"].run_round = dies_before_spawn
+    with pytest.raises(Died):
+        go()
+    assert note_is_kept(store, "note before the baseline read")
+
+
+def dies_saving_notes(store, monkeypatch):
+    """Make the state write that first holds a note die before it lands."""
+    real = store.save_state
+
+    def save_state(state):
+        if state.get("notes"):
+            raise Died()
+        real(state)
+
+    monkeypatch.setattr(store, "save_state", save_state)
+
+
+def test_the_inbox_outlives_the_save_in_unread_notes(go, work, store, monkeypatch):
+    (work / "DONE").write_text("x")
+    store.say("the gate passed")
+    dies_saving_notes(store, monkeypatch)
+    with pytest.raises(Died):
+        go()
+    assert "the gate passed" in (store.root / "inbox.md").read_text()
+
+
+def test_the_inbox_outlives_the_save_in_a_round(go, store, monkeypatch):
+    store.say("before a round")
+    dies_saving_notes(store, monkeypatch)
+    with pytest.raises(Died):
+        go()
+    assert "before a round" in (store.root / "inbox.md").read_text()
+
+
+def fails_saving_notes(store, monkeypatch, times):
+    """Make the state writes that hold a note fail, `times` times."""
+    real = store.save_state
+    left = [times]
+
+    def save_state(state):
+        if state.get("notes") and left[0]:
+            left[0] -= 1
+            raise OSError("no space left on device")
+        real(state)
+
+    monkeypatch.setattr(store, "save_state", save_state)
+
+
+def test_a_failed_save_leaves_the_note_unread_and_the_goal_open(
+    go, agents, work, store, monkeypatch
+):
+    (work / "DONE").write_text("x")
+    store.say("hold on")
+    fails_saving_notes(store, monkeypatch, 1)
+    go()
+    assert sum("hold on" in p for p in sent(agents)) == 1
+    assert kinds(store)[-1] == "finished"
+    assert any("could not save state" in str(e.get("error")) for e in store.events())
+
+
+def test_a_failed_save_before_a_round_keeps_the_note_for_a_later_one(
+    go, agents, work, store, monkeypatch
+):
+    store.say("hold on")
+    fails_saving_notes(store, monkeypatch, 1)
+    agents["codex"].script = [say(["x"]), done(work)]
+    go()
+    assert "hold on" not in agents["codex"].prompts[0]
+    assert sum("hold on" in p for p in agents["codex"].prompts) == 1
+    assert not (store.root / "inbox.md").exists()
+    assert any("could not save state" in str(e.get("error")) for e in store.events())
+
+
+def test_a_kill_after_the_save_does_not_repeat_the_note(go, agents, work, store):
+    (work / "DONE").write_text("x")
+    store.say("said once")
+    store.save_state({"notes": "said once\n\n"})  # saved, and the inbox was never deleted
+    go()
+    assert not (store.root / "inbox.md").exists()
+    assert sum(p.count("said once") for p in sent(agents)) == 1
+
+
+def test_a_note_that_lands_during_the_save_stays_in_the_inbox(go, agents, work, store, monkeypatch):
+    (work / "DONE").write_text("x")
+    store.say("first")
+    real = store.save_state
+    said = []
+
+    def save_state(state):
+        real(state)
+        if state.get("notes") and not said:
+            said.append(1)
+            store.say("second")
+
+    monkeypatch.setattr(store, "save_state", save_state)
+    go()
+    assert any("first" in p and "second" in p for p in sent(agents))

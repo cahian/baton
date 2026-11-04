@@ -417,11 +417,14 @@ class _Run:
         state.update(self.runner_state())
         self.store.save_state(state)
 
-    def persist_softly(self) -> None:
+    def persist_softly(self) -> bool:
+        """`persist`, reporting a failure as an event. True when the state was saved."""
         try:
             self.persist()
         except Exception as exc:
             self.emit("error", error=f"could not save state: {exc}")
+            return False
+        return True
 
     # the loop
 
@@ -537,10 +540,27 @@ class _Run:
         """True while a note from the person has not reached an agent. The inbox is moved into
         the carried notes (where the next round would take it anyway) so it is not lost."""
         try:
-            self.carried_notes += self.store.take_inbox()
+            left_in_inbox = self.collect_notes()
         except OSError:
-            pass
-        return bool(self.carried_notes.strip())
+            left_in_inbox = False
+        return left_in_inbox or bool(self.carried_notes.strip())
+
+    def collect_notes(self) -> bool:
+        """Move the inbox into the carried notes: read, save, then delete, so a note is always in
+        a file. True when the state could not be saved, which leaves the note in the inbox. Raises
+        OSError when the inbox cannot be read or deleted."""
+        text = self.store.read_inbox()
+        if not text:
+            return False
+        # Already carried when a kill came between the save and the delete.
+        if not self.carried_notes.endswith(text):
+            carried = self.carried_notes
+            self.carried_notes += text
+            if not self.persist_softly():
+                self.carried_notes = carried
+                return True
+        self.store.clear_inbox(text)
+        return False
 
     def stop_now(self) -> bool:
         return self.stop_requested() == "now"
@@ -564,7 +584,7 @@ class _Run:
             store.take_interrupt()  # one that arrived between rounds has nothing left to end
         except OSError:
             pass
-        self.carried_notes += store.take_inbox()
+        self.collect_notes()
         notes = self.carried_notes
         handoff = self.read_handoff()
         sid = self.sessions.get(agent)

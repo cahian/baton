@@ -524,7 +524,7 @@ def test_a_message_during_a_passing_verify_is_read_before_done(gw):
     text = second.read_all()
     assert "a late correction nobody has read" in gw.agents["codex"].prompts[0]
     assert text.count("[baton] done") == 1
-    assert Store(state_dir(gateway.job_name(SESSION))).take_inbox() == ""
+    assert Store(state_dir(gateway.job_name(SESSION))).read_inbox() == ""
     first.close()
 
 
@@ -1028,6 +1028,40 @@ def test_message_mark_ignores_what_is_around_the_message():
 
 
 # restarting
+
+
+def test_a_message_held_through_a_wait_survives_a_service_restart(gw):
+    (gw.work / "baton.toml").write_text('[verify]\ncommand = "sleep 1"\n')
+    agent = gw.agents["claude_api"]
+    agent.announce = "vendor-session"
+    spent = threading.Event()
+
+    def resting():
+        return Availability(False, until=time.time() + 3600, reason="spent")
+
+    agent.availability = lambda: resting() if spent.is_set() else Availability(True)
+    gw.agents["codex"].availability = resting
+    gw.stream("fix the bug")
+    assert wait_for(lambda: any(e["kind"] == "round_end" for e in gw.events()))
+    spent.set()
+    history = [
+        {"role": "user", "content": "fix the bug"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    gw.stream("wait, also do the docs", history=history)
+    assert wait_for(lambda: any(e["kind"] == "wait" for e in gw.events()))
+
+    gw.manager.shutdown(timeout=10)  # launchd's clean SIGTERM, not even a kill -9
+    agent.availability = lambda: Availability(True)
+    store = Store(state_dir(gateway.job_name(SESSION)))
+    state = store.load_state()
+    state["agents"]["claude_api"]["until"] = 0.0  # the reset arrived while the server was down
+    store.save_state(state)
+    gw.manager._closed = False
+    manager = restart(gw)
+    assert manager.recover() == 1
+    assert wait_for(lambda: not manager.get(SESSION).is_running())
+    assert any("also do the docs" in p for p in agent.prompts)
 
 
 def job_json(root):

@@ -42,7 +42,7 @@ def test_build_adapters_skips_disabled_agents(fakes):
 
 def test_say_adds_to_the_inbox(fakes, capsys):
     assert main(["say", str(fakes.goal()), "use", "the", "new API"]) == 0
-    assert store_for(fakes).take_inbox() == "use the new API\n\n"
+    assert store_for(fakes).read_inbox() == "use the new API\n\n"
     assert not store_for(fakes).take_interrupt()
 
 
@@ -50,7 +50,7 @@ def test_say_now_requests_interrupt(fakes):
     assert main(["say", str(fakes.goal()), "--now", "switch plans"]) == 0
     store = store_for(fakes)
     assert store.take_interrupt() is True
-    assert "switch plans" in store.take_inbox()
+    assert "switch plans" in store.read_inbox()
 
 
 def test_say_without_text_is_refused(fakes, capsys):
@@ -81,7 +81,7 @@ def test_a_broken_defaults_file_does_not_block_say(fakes):
     goal = fakes.goal()
     fakes.defaults(BROKEN_DEFAULTS)
     assert main(["say", str(goal), "still", "here"]) == 0
-    assert "still here" in Store(state_dir("demo")).take_inbox()
+    assert "still here" in Store(state_dir("demo")).read_inbox()
 
 
 def test_a_broken_defaults_file_still_blocks_run(fakes, capsys):
@@ -540,7 +540,7 @@ def test_say_and_stop_take_a_job_name(fakes):
     store = make_job("session-abc")
     assert main(["say", "--now", "session-abc", "use", "the", "new API"]) == 0
     assert store.take_interrupt() is True
-    assert "use the new API" in store.take_inbox()
+    assert "use the new API" in store.read_inbox()
     assert main(["stop", "session-abc", "--now"]) == 0
     assert store.stop_request() == "now"
 
