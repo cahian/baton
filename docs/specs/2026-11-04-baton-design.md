@@ -2,7 +2,7 @@
 
 ## Intent
 
-A single long coding goal should keep moving for days across three agents, Codex, Antigravity (Gemini 4 Argon) and optionally Claude through an organization API key,, without a person restarting anything and without ever spending pay-as-you-go credits.
+A single long coding goal should keep moving for days across three agents, in this order: Claude Opus 5.5 through an organization API key, Antigravity (Gemini 4 Argon) and Codex (GPT-6.1 Sol), all at medium effort,, without a person restarting anything and without ever spending pay-as-you-go credits.
 
 The real failure this exists to prevent: at 100% of its included usage, the Codex CLI keeps working and silently debits account credits. No error is raised and no 429 reaches the client. Any design that waits for a limit error loses money first. Limits must be read and acted on before they are reached.
 
@@ -52,7 +52,7 @@ snapshot uncommitted work
 run gate
 ```
 
-The current agent keeps working until it becomes unavailable, then the rotation moves to the other agent. With a limited reset time known for both, the wait ends at the earliest one, and that agent continues. Rotation is sticky and cyclic through `order`: an agent coming back does not preempt the one working. The initial agent is the first in `order`.
+The current agent keeps working until it becomes unavailable, then the rotation moves to the other agent. With a limited reset time known for both, the wait ends at the earliest one, and that agent continues. Rotation is sticky and cyclic through `order`: an agent coming back does not preempt the one working. The initial agent is the first in `order`, and when the last agent in `order` runs out the rotation wraps to the first available one.
 
 Exceptions in the loop are logged, followed by a 60 s sleep, then the loop continues. Only a passing gate, a stop request or a termination signal ends the process.
 
@@ -229,7 +229,7 @@ The verify command runs through the shell in the working directory with `verify.
 name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
-order = ["codex", "antigravity", "claude_api"]
+order = ["claude_api", "antigravity", "codex"]
 round_max_s = 3600
 idle_s = 1200
 snapshot = true
@@ -253,8 +253,8 @@ poll_s = 30
 
 [agents.claude_api]
 enabled = true
-model = "claude-sonnet-5-5"
-effort = "high"
+model = "claude-opus-5-5"
+effort = "medium"
 monthly_budget_usd = 200
 reserve_pct = 10
 round_budget_usd = 10
