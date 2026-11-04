@@ -273,6 +273,8 @@ def render_event(kind: str, f: Mapping) -> str:
         tail = str(f.get("tail") or "").strip()[-GATE_SHOWN_CHARS:]
         shown = f"\n```\n{tail}\n```" if tail else ""
         return f"\n[baton] verify did not pass{shown}\n\n"
+    if kind == "verify_unrunnable":
+        return f"\n[baton] warning: {f.get('message')}\n\n"
     if kind == "alert":
         return f"\n[baton] alert: {f.get('message') or f.get('reason') or f.get('outcome')}\n\n"
     if kind == "error":

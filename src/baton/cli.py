@@ -285,6 +285,8 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
             print(f"    reason: {info['reason']}")
         if info.get("usage"):
             print(f"    usage: {json.dumps(info['usage'], sort_keys=True)}")
+    if state.get("verify_warning"):
+        print(f"warning: {state['verify_warning']}")
     if state.get("group"):
         print(f"active group: {state['group']}")
     request = store.stop_request()

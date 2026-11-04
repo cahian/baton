@@ -39,6 +39,14 @@ COMMITS_MAX_CHARS = 2000
 # this length, so an agent that exits at once cannot burn quota in a tight loop.
 MIN_ROUND_S = 30
 GATE_POLL_S = 0.5
+# What a shell exits with when it cannot run the command: not executable, not found.
+UNRUNNABLE_EXITS = (126, 127)
+GATE_EXIT_RE = re.compile(r"\[exit code (\d+)\]\Z")
+UNRUNNABLE_MESSAGE = (
+    "the verify command exited {code}: it was not found or not executable, so it can never pass. "
+    "The service's PATH holds only agent, node and system directories: call the tool by its full "
+    "path. Rounds go on as usual."
+)
 
 RULES = """\
 Rules:
@@ -155,6 +163,12 @@ def run_gate(goal: Goal, should_kill: Callable[[], bool] | None = None) -> tuple
             _end_gate(proc)
         raise
     return code == 0, f"{tail.rstrip()}\n{note}".strip()
+
+
+def gate_exit_code(tail: str) -> int | None:
+    """The exit code `run_gate` put last in its text, None when the command did not exit."""
+    found = GATE_EXIT_RE.search(tail)
+    return int(found.group(1)) if found else None
 
 
 def _end_gate(proc: subprocess.Popen) -> None:
@@ -338,6 +352,7 @@ class _Run:
         self.owes_round = owes_round
         self.heads: dict[str, str] = {}
         self.pause_until = 0.0
+        self.verify_warning = ""
 
     # plumbing
 
@@ -398,6 +413,7 @@ class _Run:
             "group_start": self.group_start if self.group is not None else None,
             "notes": self.carried_notes,
             "owes_round": self.owes_round,
+            "verify_warning": self.verify_warning,
         }
 
     @staticmethod
@@ -491,6 +507,8 @@ class _Run:
         notes = state.get("notes")
         self.carried_notes = notes if isinstance(notes, str) else ""
         self.owes_round = self.owes_round or state.get("owes_round") is True
+        warning = state.get("verify_warning")
+        self.verify_warning = warning if isinstance(warning, str) else ""
         prepare_workdir(goal)
         self.sched = sched
         self.persist()
@@ -504,6 +522,7 @@ class _Run:
             passed, self.gate_tail = run_gate(goal, should_kill=self.stop_now)
             self.need_gate = False
             self.emit("gate", passed=passed, tail=self.gate_tail)
+            self.check_gate_ran()
             if passed and not self.owes_round and not self.unread_notes():
                 return self.finish("verify passed")
         self.need_gate = False
@@ -535,6 +554,19 @@ class _Run:
         if self.run_round(adapter) and not self.unread_notes():
             return self.finish("round completed")
         return None
+
+    def check_gate_ran(self) -> None:
+        """Warn once per run of gates that could not run; `baton status` shows the warning until
+        a gate ends any other way. It only informs: the rotation goes on."""
+        code = gate_exit_code(self.gate_tail)
+        warned = bool(self.verify_warning)
+        self.verify_warning = (
+            UNRUNNABLE_MESSAGE.format(code=code) if code in UNRUNNABLE_EXITS else ""
+        )
+        if self.verify_warning and not warned:
+            self.emit("verify_unrunnable", code=code, message=self.verify_warning)
+        if bool(self.verify_warning) != warned:
+            self.persist_softly()
 
     def unread_notes(self) -> bool:
         """True while a note from the person has not reached an agent. The inbox is moved into

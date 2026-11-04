@@ -1526,3 +1526,118 @@ def test_a_note_that_lands_during_the_save_stays_in_the_inbox(go, agents, work, 
     monkeypatch.setattr(store, "save_state", save_state)
     go()
     assert any("first" in p and "second" in p for p in sent(agents))
+
+
+# a verify command that cannot run
+
+
+def exits_with(tmp_path, work):
+    """A goal whose gate exits with the number in the file `code`."""
+    (work / "code").write_text("127")
+    return make_goal(tmp_path, work, verify='exit \\"$(cat code)\\"')
+
+
+def set_code(work, code):
+    def step(agent, prompt, ctx):
+        (work / "code").write_text(str(code))
+        return RoundResult(COMPLETED)
+
+    return step
+
+
+def warnings(store):
+    return [e for e in store.events() if e["kind"] == "verify_unrunnable"]
+
+
+def stops(store):
+    def step(agent, prompt, ctx):
+        store.request_stop()
+        return RoundResult(COMPLETED)
+
+    return step
+
+
+@pytest.mark.parametrize(
+    ("command", "code"),
+    [("definitely-not-a-command-xyz", 127), ("./not-executable", 126)],
+)
+def test_a_verify_command_that_cannot_run_warns_once(
+    go, tmp_path, agents, work, store, command, code
+):
+    (work / "not-executable").write_text("#!/bin/sh\n")
+    agents["codex"].script = [say(["x"]), say(["x"]), stops(store)]
+    go(make_goal(tmp_path, work, verify=command))
+    assert kinds(store).count("gate") == 4  # before each of the 3 rounds, and after the last
+    found = warnings(store)
+    assert len(found) == 1 and found[0]["code"] == code
+    assert "not found or not executable" in found[0]["message"]
+    assert "agent, node and system directories" in found[0]["message"]
+
+
+def test_the_warning_changes_no_rotation(tmp_path, world):
+    def rounds_with(code):
+        root = tmp_path / str(code)
+        work = root / "work"
+        work.mkdir(parents=True)
+        goal = exits_with(root, work)
+        (work / "code").write_text(str(code))
+        agents = {"codex": Fake("codex"), "antigravity": Fake("antigravity")}
+        agents["codex"].script = [result(LIMIT, until=world.now + 40), say(["x"])]
+        agents["antigravity"].script = [say(["x"]), set_code(work, 0)]
+        store = Store(root / "state")
+        assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+        assert kinds(store)[-1] == "finished"
+        return [(e["agent"], e["round"]) for e in store.events() if e["kind"] == "round_start"]
+
+    assert rounds_with(127) == rounds_with(1)
+
+
+def test_another_outcome_ends_the_run_of_failures(go, tmp_path, agents, work, store):
+    goal = exits_with(tmp_path, work)
+    agents["codex"].script = [
+        set_code(work, 126),
+        set_code(work, 1),
+        set_code(work, 127),
+        set_code(work, 0),
+    ]
+    go(goal)
+    assert [e["code"] for e in warnings(store)] == [127, 127]
+
+
+@pytest.mark.parametrize(
+    ("verify", "extra"),
+    [("echo [exit code 127]; exit 1", ""), ("echo [exit code 127]; sleep 30", "timeout_s = 1")],
+)
+def test_output_that_looks_like_an_exit_code_is_not_one(tmp_path, work, verify, extra):
+    _, tail = run_gate(make_goal(tmp_path, work, verify=verify, verify_extra=extra))
+    assert "[exit code 127]" in tail
+    assert runner.gate_exit_code(tail) != 127
+
+
+def test_the_warning_is_held_in_state_until_the_command_runs(go, tmp_path, agents, work, store):
+    goal = exits_with(tmp_path, work)
+    seen = []
+
+    def look(agent, prompt, ctx):
+        seen.append(store.load_state().get("verify_warning"))
+        (work / "code").write_text("0")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [look]
+    go(goal)
+    assert "not found or not executable" in seen[0]
+    assert store.load_state()["verify_warning"] == ""
+
+
+def test_a_restart_does_not_repeat_the_warning(go, tmp_path, agents, work, store):
+    goal = exits_with(tmp_path, work)
+
+    def dies_in_round(agent, prompt, ctx):
+        raise Died()
+
+    agents["codex"].script = [dies_in_round, set_code(work, 0)]
+    with pytest.raises(Died):
+        go(goal)
+    assert len(warnings(store)) == 1
+    go(goal)
+    assert len(warnings(store)) == 1

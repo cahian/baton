@@ -243,7 +243,8 @@ each enabled agent's binary and `node`, which `codex` needs, builds `PATH` from 
 writes `~/Library/LaunchAgents/local.baton.serve.plist` with absolute paths, and loads it. Running
 it again replaces the service. The log is `serve.log` in the state directory. Run it again when an
 agent or `node` moves. Your verification commands get that same `PATH`, so a tool they need from
-elsewhere must be called by its full path.
+elsewhere must be called by its full path. A verification command that exits 126 or 127 can never
+pass, so baton says so once in the chat and in `baton status`, and the rounds go on.
 
 [`examples/baton-serve.plist`](examples/baton-serve.plist) shows the same file with placeholders,
 for writing it by hand.

@@ -1138,6 +1138,20 @@ def test_a_restart_during_a_person_s_stop_keeps_the_stop_file(gw):
     assert job_json(job.store.root)["status"] == gateway.RUNNING
 
 
+def test_a_verify_command_that_cannot_run_is_explained_in_the_chat(gw):
+    (gw.work / "baton.toml").write_text('[verify]\ncommand = "test -f DONE || no-such-tool-xyz"\n')
+
+    def finish(agent, prompt, ctx):
+        (gw.work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    gw.agents["claude_api"].script = [say("trying"), say("trying"), say("now", then=finish)]
+    text = gw.stream("go").read_all()
+    assert text.count("not found or not executable") == 1
+    assert "agent, node and system directories" in text
+    assert "verify passed" in text
+
+
 def job_json(root):
     return json.loads((root / "job.json").read_text())
 

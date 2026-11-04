@@ -558,3 +558,19 @@ def test_a_goal_path_still_wins_over_a_job_name(fakes, capsys):
     assert main(["status", str(fakes.goal())]) == 0  # a path to a goal file, not the job "demo"
     assert "round 99" in capsys.readouterr().out  # same state dir, read through the goal
     assert main(["status", "demo"]) == 0
+
+
+def test_status_shows_a_verify_command_that_cannot_run(fakes, capsys):
+    goal = fakes.goal()
+    store_for(fakes).save_state(
+        {"verify_warning": "verify exited 127: not found or not executable"}
+    )
+    assert main(["status", str(goal)]) == 0
+    assert "warning: verify exited 127: not found or not executable" in capsys.readouterr().out
+
+
+def test_status_says_nothing_when_verify_runs(fakes, capsys):
+    goal = fakes.goal()
+    store_for(fakes).save_state({"verify_warning": ""})
+    assert main(["status", str(goal)]) == 0
+    assert "warning" not in capsys.readouterr().out
