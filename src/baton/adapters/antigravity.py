@@ -54,7 +54,7 @@ MAX_READ_BYTES = 256 * 1024
 # How many error lines of a round are kept to classify its failure.
 MAX_PROBLEMS = 20
 
-_AUTH_RE = re.compile(r"\bauthenticat|\bsign[ -]?in\b|\blog[ -]?in\b", re.IGNORECASE)
+_AUTH_RE = re.compile(r"authenticat|\bsign[ -]?in(?![a-z])|\blog[ -]?in(?![a-z])", re.IGNORECASE)
 _LIMIT_RE = re.compile(r"RESOURCE_EXHAUSTED|quota|rate[ _-]?limit|\b429\b", re.IGNORECASE)
 _PERCENT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)%")
 _NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")

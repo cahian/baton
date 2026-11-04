@@ -350,6 +350,9 @@ def test_classify_limit(text):
         "authentication failed or timed out",
         "Run 'agy' to log in",
         "please sign in again",
+        "UNAUTHENTICATED",
+        "you must reauthenticate",
+        "login_required",
     ],
 )
 def test_classify_auth(text):
@@ -365,6 +368,8 @@ def test_classify_auth(text):
         "conversation not found",
         "internal error 500",
         "could not assign interface",
+        "assign in order",
+        "catalog in memory",
         "the catalog index is stale",
         "design signing in progress elsewhere",
     ],
