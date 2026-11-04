@@ -235,6 +235,16 @@ def _duration(seconds: float) -> str:
     return f"{seconds} s"
 
 
+def _reasons(event: Mapping) -> str:
+    """One line per agent saying why it cannot run, from a `wait` event."""
+    agents = event.get("agents")
+    lines = []
+    for name, info in agents.items() if isinstance(agents, Mapping) else ():
+        reason = info.get("reason") if isinstance(info, Mapping) else ""
+        lines.append(f"- {name}: {reason or 'it gave no reason'}")
+    return "\n".join(lines)
+
+
 def render_event(kind: str, f: Mapping) -> str:
     """The chat text for one run event, "" for events the person does not need to see."""
     if kind == "output":
@@ -253,8 +263,10 @@ def render_event(kind: str, f: Mapping) -> str:
         how = "interrupted by your message" if f.get("interrupted") else str(outcome)
         return f"\n[baton] round {f.get('round')} ({f.get('agent')}) ended: {how}{why}\n\n"
     if kind == "wait":
-        why = f.get("reason") or "every agent is resting"
-        return f"\n[baton] waiting {_duration(f.get('seconds') or 0)}: {why}\n\n"
+        how_long = _duration(f.get("seconds") or 0)
+        if f.get("reason"):
+            return f"\n[baton] waiting {how_long}: {f['reason']}\n\n"
+        return f"\n[baton] no agent is available, waiting {how_long}:\n{_reasons(f)}\n\n"
     if kind == "gate":
         if f.get("passed"):
             return "\n[baton] verify passed\n\n"

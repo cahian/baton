@@ -22,6 +22,7 @@ from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, opencode_config, serve
 from baton.runner import run_goal
+from baton.service import ServiceError, install
 from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
 
 STATUS_EVENTS = 8
@@ -402,6 +403,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_service(args: argparse.Namespace) -> int:
+    try:
+        done = install(args.port)
+    except ServiceError as exc:
+        _err(str(exc))
+        return 1
+    for name, path in {**done.agents, **done.runtimes}.items():
+        print(f"{name}: {path}")
+    for name, command in done.missing.items():
+        print(f"{name}: {command} was not found on PATH; it will be unavailable in the service")
+    if "node" not in done.runtimes:
+        print("node: not found on PATH; an agent that is a node script will not start")
+    print(f"PATH for the service: {done.path_variable}")
+    print(f"installed and loaded {done.path}")
+    return 0
+
+
 def cmd_opencode_config(args: argparse.Namespace) -> int:
     print(json.dumps(opencode_config(args.port), indent=2))
     return 0
@@ -442,6 +460,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("goal", help="goal file, or a job name such as session-<id>")
     p.add_argument("--now", action="store_true", help="kill the current round")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("install-service", help="run `baton serve` under launchd (macOS)")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.set_defaults(func=cmd_install_service)
 
     p = sub.add_parser("opencode-config", help="print the provider JSON for opencode.json")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)

@@ -15,7 +15,7 @@ import pytest
 
 from baton import gateway, runner
 from baton.adapters.base import COMPLETED, LIMIT, Availability, RoundResult
-from baton.cli import main
+from baton.cli import build_adapters, main
 from baton.gateway import content_text, make_server
 from baton.proc import process_start
 from baton.store import Store, state_dir, workdir_lock
@@ -609,6 +609,67 @@ def test_other_sessions_are_not_held_up_while_one_hands_over(gw, tmp_path, monke
         release.set()
     waiting.join(20)
     first.read_all()
+
+
+class Refusing(Fake):
+    """An agent that says why it cannot run."""
+
+    def __init__(self, name, reason):
+        super().__init__(name)
+        self.reason = reason
+
+    def availability(self):
+        return Availability(False, until=time.time() + 3600, reason=self.reason)
+
+
+def test_a_wait_states_each_agent_s_real_reason(gw):
+    gw.agents["claude_api"] = Refusing("claude_api", "key file ~/x.key not found")
+    gw.agents["codex"] = Refusing("codex", "codex was not found on PATH")
+    s = gw.stream("go")
+    text = s.read_until("codex was not found on PATH")
+    assert "no agent is available" in text
+    assert "- claude_api: key file ~/x.key not found" in text
+    assert "- codex: codex was not found on PATH" in text
+    assert "resting" not in text
+    gw.job().halt()
+
+
+def test_an_agent_that_gives_no_reason_is_not_left_out():
+    text = gateway.render_event("wait", {"seconds": 60, "agents": {"codex": {"reason": ""}}})
+    assert "- codex: it gave no reason" in text
+
+
+def test_a_wait_with_its_own_reason_keeps_it():
+    text = gateway.render_event(
+        "wait", {"seconds": 60, "reason": "the last round ended at once", "agents": {}}
+    )
+    assert "waiting 1 min: the last round ended at once" in text
+
+
+def test_real_adapters_report_what_is_wrong_with_each_agent(fakes, tmp_path, monkeypatch):
+    """A service with no binary in reach: the stream says so, for each agent, in its own words."""
+    db = tmp_path / "opencode.db"
+    make_db(db, [(SESSION, str(fakes.work))])
+    monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
+    fakes.defaults(
+        '[agents.codex]\nbin = "/nonexistent/codex"\n'
+        '[agents.antigravity]\nbin = "/nonexistent/agy"\n'
+    )
+    server, manager = make_server(0, build_adapters)
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    ).start()
+    try:
+        s = Stream(server.server_address[1], request("go"))
+        text = s.read_until("- codex:") + s.read_until("\n\n")
+        line = {x.split(":")[0]: x for x in text.splitlines() if x.startswith("- ")}
+        assert "/nonexistent/agy" in line["- antigravity"] or "No such" in line["- antigravity"]
+        assert "/nonexistent/codex" in line["- codex"] or "No such" in line["- codex"]
+        assert "key file" in line["- claude_api"]
+    finally:
+        manager.shutdown(timeout=10)
+        server.shutdown()
+        server.server_close()
 
 
 def test_a_finished_job_is_replaced_by_a_new_one(gw):

@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from baton.config import load_defaults, load_goal
+from baton.gateway import SHUTDOWN_S
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
 
@@ -34,6 +35,21 @@ def test_example_plist_runs_baton_serve_and_keeps_it_alive():
     plist = plistlib.loads((EXAMPLES / "baton-serve.plist").read_bytes())
     assert plist["ProgramArguments"][1] == "serve"
     assert plist["KeepAlive"] is True
+    assert plist["ExitTimeOut"] > SHUTDOWN_S
+
+
+def test_example_plist_holds_placeholders_and_absolute_paths():
+    plist = plistlib.loads((EXAMPLES / "baton-serve.plist").read_bytes())
+    assert plist["ProgramArguments"][0].startswith("/path/to/")
+    assert plist["StandardOutPath"].startswith("/path/to/")
+    path = plist["EnvironmentVariables"]["PATH"].split(":")
+    assert "/path/to/node/bin" in path and "/path/to/agent/bin" in path
+
+
+def test_readme_points_launchd_users_at_install_service():
+    text = (EXAMPLES.parent / "README.md").read_text()
+    assert "baton install-service" in text
+    assert "`node`" in text
 
 
 ROOT = EXAMPLES.parent

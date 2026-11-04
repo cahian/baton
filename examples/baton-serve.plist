@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Keeps `baton serve` running. Replace the placeholders, then:
+  `baton install-service` writes this file for you, with the real paths, and loads it. This copy
+  shows what it writes, for anyone who wants to write it by hand. Replace every /path/to, then:
     cp examples/baton-serve.plist ~/Library/LaunchAgents/<label>.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
   Stop it with:  launchctl bootout gui/$(id -u)/<label>
-  launchd does not load your shell profile: PATH must reach baton, codex, agy and claude.
+
+  launchd loads no shell profile, so nothing here may depend on one. Every path is absolute. PATH
+  must reach each agent binary (codex, agy, claude) and node, which codex runs on; setting `bin`
+  alone is not enough. ExitTimeOut must stay above the 25 s that `baton serve` takes to stop.
 -->
 <plist version="1.0">
 <dict>
@@ -21,7 +25,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/path/to/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/path/to/agent/bin:/path/to/node/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
     <string>/path/to/home</string>
   </dict>
@@ -31,9 +35,11 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>30</integer>
+  <key>ExitTimeOut</key>
+  <integer>40</integer>
   <key>StandardOutPath</key>
-  <string>/path/to/baton-serve.log</string>
+  <string>/path/to/state/serve.log</string>
   <key>StandardErrorPath</key>
-  <string>/path/to/baton-serve.log</string>
+  <string>/path/to/state/serve.log</string>
 </dict>
 </plist>

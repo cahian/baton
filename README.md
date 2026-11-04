@@ -34,7 +34,7 @@ has already paid, so baton reads the limits and acts before they are reached.
 | Agent | What is read | Stop condition |
 |---|---|---|
 | Codex | `codex app-server` rate limits and credit balance. No model call, nothing spent. | 90% used in any window, or the credit balance drops |
-| Antigravity | the `/usage` and `/credits` slash commands. No model call, nothing spent. | 90% used in any Gemini row, or the credit balance drops |
+| Antigravity | the `/usage` and `/credits` slash commands. No model call, nothing spent. | 90% used in any Gemini row, or the credit balance drops. Both `Gemini Models` rows, Five Hour and Weekly, must be readable |
 | Claude | baton's own spend ledger (there is no API that returns the balance) | a spend ceiling of 180 USD by default, and a per-round cap |
 
 Rules that apply to all of them:
@@ -98,7 +98,8 @@ baton doctor
 
 Python 3.12 or newer. There are no runtime dependencies. You also need the CLIs you want to use on
 your `PATH` and logged in: `codex`, `agy` and `claude`. Binary paths can be overridden per agent
-with `bin`, since tmux and launchd may not load your shell aliases.
+with `bin`, in a goal file or in `defaults.toml`, since tmux and launchd may not load your shell
+aliases. A leading `~` is expanded.
 
 `baton doctor [goal]` checks binaries, logins, stray API-key variables, live limits and Claude's
 spend against its ceiling. It spends nothing and exits non-zero on a blocking problem.
@@ -185,6 +186,10 @@ of the goal file: its `[verify]`, timings and `[agents.*]` settings apply. `name
 the job finishes when a round completes. An invalid `baton.toml` is an error, never a silent
 fall-back to no gate.
 
+A `baton.toml` comes with the repository, so it may not set `bin`, `key_file`, `admin_key_file` or
+`full_access`: a file in a repository must not choose executables or credentials. Everywhere,
+`threshold_pct` may not go above 90, and an `antigravity.model` must start with `gemini-`.
+
 ## Using it from OpenCode
 
 OpenCode sees one OpenAI-compatible provider with one model, `baton/auto`, and keeps the history
@@ -206,22 +211,40 @@ and context on its side.
 
 Each OpenCode session becomes a job that runs in its own thread inside `baton serve`, independent of
 the HTTP connection. A dropped connection never stops it, and a new message in the session becomes
-a note that interrupts the running round. `baton jobs` lists every job, and `baton status`,
-`baton say` and `baton stop` accept its name (`session-<id>`) in place of a goal file. The stream shows the agents' text, one line per rotation,
-waits and gate results. Title requests are answered locally and spend nothing. The working
-directory is read from OpenCode's own database (`~/.local/share/opencode/opencode.db`, or the path
-in `BATON_OPENCODE_DB`); baton never guesses one.
+a note that interrupts the running round. A message gets at least one round, even if the gate
+already passes. A request that repeats what was already accepted, as a client's retry does, attaches
+to the stream and interrupts nothing, so it costs no round. `baton jobs` lists every job, and
+`baton status`, `baton say` and `baton stop` accept its name (`session-<id>`) in place of a goal
+file. The stream shows the agents' text, one line per rotation, waits and gate results, and when no
+agent can run it says why, for each one. Title requests are answered locally and spend nothing. The
+working directory is read from OpenCode's own database (`~/.local/share/opencode/opencode.db`, or
+the path in `BATON_OPENCODE_DB`); baton never guesses one.
 
-Since jobs live inside `baton serve`, keep it alive. On macOS, use launchd with
-[`examples/baton-serve.plist`](examples/baton-serve.plist), after replacing the placeholders:
+One runner works in a directory at a time, across `baton run` and `baton serve`. A directory inside
+or around a running one counts as busy, since the two would commit each other's work.
+
+### Keeping it running
+
+Jobs live inside `baton serve`, so keep it alive. If it dies, even by `kill -9`, the next
+`baton serve` first ends every agent left behind that it can prove is baton's own, then resumes
+every job that had not finished. A job a person stopped stays stopped. A group that cannot be
+verified is left alive and its job waits, because two agents at once could spend twice.
+
+On macOS, install it as a launchd service:
 
 ```
-cp examples/baton-serve.plist ~/Library/LaunchAgents/<label>.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+baton install-service            # --port 18777 by default
 ```
 
-launchd does not load your shell profile, so the plist sets `PATH` itself; it must reach `baton`,
-`codex`, `agy` and `claude`.
+launchd loads no shell profile, so this resolves everything from the shell you run it in. It finds
+each enabled agent's binary and `node`, which `codex` needs, builds `PATH` from their directories,
+writes `~/Library/LaunchAgents/local.baton.serve.plist` with absolute paths, and loads it. Running
+it again replaces the service. The log is `serve.log` in the state directory. Run it again when an
+agent or `node` moves. Your verification commands get that same `PATH`, so a tool they need from
+elsewhere must be called by its full path.
+
+[`examples/baton-serve.plist`](examples/baton-serve.plist) shows the same file with placeholders,
+for writing it by hand.
 
 ## Commands
 
@@ -235,6 +258,7 @@ launchd does not load your shell profile, so the plist sets `PATH` itself; it mu
 | `baton say <goal.toml or job> [--now] "note"` | Leave a note for the next round. `--now` also interrupts the current one. |
 | `baton stop <goal.toml or job> [--now]` | Stop after the current round, or kill the round with `--now`. |
 | `baton opencode-config [--port 18777]` | Print the provider JSON for `opencode.json`. |
+| `baton install-service [--port 18777]` | Write the launchd plist and load it (macOS). |
 
 State lives in `~/.local/state/baton/<goal name>/` (events, state, raw round logs, inbox), one
 runner per goal. `BATON_STATE_DIR` and `BATON_CONFIG` move the goals' state and the defaults file.
