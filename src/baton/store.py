@@ -68,6 +68,7 @@ class Store:
         self._state = self.root / "state.json"
         self._inbox = self.root / "inbox.md"
         self._stop = self.root / "stop"
+        self._interrupt = self.root / "interrupt"
         self._seq = max(self._last_seq(self._events), self._last_seq(self._rotated))
 
     # events
@@ -219,6 +220,20 @@ class Store:
 
     def clear_stop(self) -> None:
         self._stop.unlink(missing_ok=True)
+
+    # interrupt
+
+    def request_interrupt(self) -> None:
+        """Ask the runner to end the current round now."""
+        _atomic_write(self._interrupt, "1\n")
+
+    def take_interrupt(self) -> bool:
+        """True, and clears the request, when one was pending."""
+        try:
+            self._interrupt.unlink()
+        except FileNotFoundError:
+            return False
+        return True
 
     # lock
 

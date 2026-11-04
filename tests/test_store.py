@@ -176,3 +176,11 @@ def test_events_file_is_valid_jsonl(st):
     st.emit("a")
     for line in (st.root / "events.jsonl").read_text().splitlines():
         json.loads(line)
+
+
+def test_interrupt_is_taken_once(st):
+    assert st.take_interrupt() is False
+    st.request_interrupt()
+    st.request_interrupt()
+    assert st.take_interrupt() is True
+    assert st.take_interrupt() is False
