@@ -4,6 +4,7 @@ import os
 import plistlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -170,6 +171,45 @@ def test_a_service_still_leaving_is_waited_for(world, monkeypatch):
     world.fails.write_text("")
     assert main(["install-service"]) == 0
     assert len(tries) == 3
+
+
+def waits(world, monkeypatch):
+    """Record the pauses between tries, at their real length, without sleeping them."""
+    slept = []
+    monkeypatch.setattr(service, "BOOTSTRAP_PAUSE_S", 1.0)
+    monkeypatch.setattr(service, "time", SimpleNamespace(sleep=slept.append))
+    return slept
+
+
+def test_a_service_that_takes_its_whole_exit_timeout_is_waited_for(world, monkeypatch):
+    assert main(["install-service"]) == 0
+    slept = waits(world, monkeypatch)
+    real = service._launchctl
+
+    def launchctl(path, *args):
+        if args[0] == "bootstrap" and sum(slept) > service.EXIT_TIMEOUT_S:
+            world.fails.unlink()
+        return real(path, *args)
+
+    monkeypatch.setattr(service, "_launchctl", launchctl)
+    world.fails.write_text("")
+    assert main(["install-service"]) == 0
+
+
+def test_a_replacement_that_never_loads_gives_up_after_the_exit_timeout(world, monkeypatch, capsys):
+    assert main(["install-service"]) == 0
+    slept = waits(world, monkeypatch)
+    world.fails.write_text("")
+    assert main(["install-service"]) == 1
+    assert "Input/output error" in capsys.readouterr().err
+    assert service.EXIT_TIMEOUT_S < sum(slept) <= service.EXIT_TIMEOUT_S + 30
+
+
+def test_with_nothing_leaving_a_failed_load_is_reported_soon(world, monkeypatch):
+    slept = waits(world, monkeypatch)
+    world.fails.write_text("")
+    assert main(["install-service"]) == 1
+    assert sum(slept) < 10
 
 
 def test_a_failed_load_says_why(world, capsys):

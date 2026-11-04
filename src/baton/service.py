@@ -33,9 +33,11 @@ THROTTLE_S = 30
 # Variables that decide where this baton keeps things, so the service and the shell agree.
 PASSED_ON = ("BATON_STATE_DIR", "BATON_CONFIG", "BATON_OPENCODE_DB")
 LAUNCHCTL_TIMEOUT_S = EXIT_TIMEOUT_S + 20
-# A service that was just booted out takes a moment to leave its domain.
 BOOTSTRAP_TRIES = 5
 BOOTSTRAP_PAUSE_S = 1.0
+# A service that was just booted out stays in its domain until it has stopped, which launchd allows
+# ExitTimeOut for. Bootout can return before that.
+BOOTOUT_TRIES = EXIT_TIMEOUT_S + 15
 
 
 class ServiceError(Exception):
@@ -124,10 +126,12 @@ def load_service(launchctl: str, plist: Path) -> None:
     """Load `plist`, replacing a loaded copy, so installing twice is the same as once."""
     domain = f"gui/{os.getuid()}"
     target = f"{domain}/{LABEL}"
+    tries = BOOTSTRAP_TRIES
     if _launchctl(launchctl, "print", target).returncode == 0:
         _launchctl(launchctl, "bootout", target)
+        tries = BOOTOUT_TRIES
     problem = ""
-    for attempt in range(BOOTSTRAP_TRIES):
+    for attempt in range(tries):
         if attempt:
             time.sleep(BOOTSTRAP_PAUSE_S)
         done = _launchctl(launchctl, "bootstrap", domain, str(plist))
