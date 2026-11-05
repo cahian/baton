@@ -3,7 +3,16 @@ from pathlib import Path
 
 import pytest
 
-from baton.config import GoalError, default_agent, defaults_path, load_defaults, load_goal
+from baton.config import (
+    GoalError,
+    MemoryConfig,
+    default_agent,
+    defaults_path,
+    goal_from_table,
+    load_defaults,
+    load_goal,
+    load_memory,
+)
 
 BASE = {
     "name": 'name = "demo"',
@@ -418,3 +427,102 @@ def test_a_goal_file_may_set_poll_s(tmp_path):
     )
     goal = load_goal(path)
     assert (goal.agents["codex"].poll_s, goal.agents["antigravity"].poll_s) == (120, 240)
+
+
+# long-term memory
+
+
+@pytest.fixture(autouse=True)
+def memory_not_off(monkeypatch):
+    """The suite runs with BATON_MEMORY=off; load_memory is read here as a person would have it."""
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+
+
+def test_memory_defaults_match_spec(tmp_path):
+    assert load_memory() == MemoryConfig(
+        enabled=True, bin="ai-memory", port=18778, recall_chars=6000
+    )
+
+
+def test_memory_table_is_read_from_the_defaults_file(tmp_path, monkeypatch):
+    defaults(
+        tmp_path,
+        monkeypatch,
+        '[memory]\nenabled = false\nbin = "~/bin/ai-memory"\nport = 20000\nrecall_chars = 0\n',
+    )
+    cfg = load_memory()
+    assert not cfg.enabled and cfg.port == 20000 and cfg.recall_chars == 0
+    assert cfg.bin == str(Path("~/bin/ai-memory").expanduser())
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "bogus = 1",
+        "port = 1023",
+        "port = 65536",
+        "port = true",
+        'port = "18778"',
+        "recall_chars = -1",
+        "recall_chars = 20001",
+        "recall_chars = 1.5",
+        'enabled = "yes"',
+        'bin = ""',
+    ],
+)
+def test_a_bad_memory_value_is_refused(tmp_path, monkeypatch, line):
+    defaults(tmp_path, monkeypatch, f"[memory]\n{line}\n")
+    with pytest.raises(GoalError, match=r"defaults\.toml"):
+        load_memory()
+
+
+@pytest.mark.parametrize("line", ["port = 1024", "port = 65535", "recall_chars = 20000"])
+def test_memory_bounds_are_accepted(tmp_path, monkeypatch, line):
+    defaults(tmp_path, monkeypatch, f"[memory]\n{line}\n")
+    load_memory()
+
+
+def test_memory_must_be_a_table(tmp_path, monkeypatch):
+    defaults(tmp_path, monkeypatch, "memory = 1\n")
+    with pytest.raises(GoalError, match="memory must be a table"):
+        load_memory()
+
+
+def test_the_defaults_file_accepts_a_memory_table_without_judging_it(tmp_path, monkeypatch):
+    """A bad [memory] must not keep a goal from loading: the runner turns memory off instead."""
+    defaults(tmp_path, monkeypatch, "[memory]\nport = 5\n[agents.codex]\npoll_s = 7\n")
+    assert load_defaults() == {"codex": {"poll_s": 7}}
+    assert load_goal(write(tmp_path, minimal())).agents["codex"].poll_s == 7
+
+
+def test_baton_memory_off_wins_over_the_file(tmp_path, monkeypatch):
+    defaults(tmp_path, monkeypatch, "[memory]\nenabled = true\nport = 20000\n")
+    monkeypatch.setenv("BATON_MEMORY", "off")
+    assert load_memory().enabled is False
+    monkeypatch.setenv("BATON_MEMORY", "OFF")
+    assert load_memory().enabled is False
+    monkeypatch.setenv("BATON_MEMORY", "on")
+    assert load_memory().enabled is True
+
+
+def test_a_goal_has_memory_on_unless_it_says_otherwise(tmp_path):
+    assert load_goal(write(tmp_path, minimal())).memory is True
+    off = minimal().replace('objective = "Ship it."', 'objective = "x"\nmemory = false')
+    assert load_goal(write(tmp_path, off)).memory is False
+
+
+def test_goal_memory_must_be_a_bool(tmp_path):
+    bad = minimal().replace('objective = "Ship it."', 'objective = "x"\nmemory = "off"')
+    with pytest.raises(GoalError, match="memory must be true or false"):
+        load_goal(write(tmp_path, bad))
+
+
+def test_a_repository_table_may_set_memory(tmp_path):
+    goal = goal_from_table(
+        {"memory": False},
+        name="demo",
+        workdir=tmp_path,
+        objective="x",
+        path=tmp_path / "baton.toml",
+    )
+    assert goal.memory is False

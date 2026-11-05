@@ -178,6 +178,17 @@ def test_status_says_in_a_sentence_which_agent_came_back(fakes, capsys):
     assert "outcome=preempted" not in out
 
 
+def test_status_shows_memory_events_through_its_generic_line(fakes, capsys):
+    store = store_for(fakes)
+    store.save_state({"round": 2, "current": "codex", "agents": {}})
+    store.emit("memory", event="recalled", hits=3, chars=900)
+    store.emit("memory", event="error", reason="memory is unavailable: gone")
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "memory event=recalled hits=3 chars=900" in out
+    assert "memory event=error reason=memory is unavailable: gone" in out
+
+
 def test_status_says_when_the_daily_preemption_cap_is_active(fakes, capsys):
     store = store_for(fakes)
     now = time.time()

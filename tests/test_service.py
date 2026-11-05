@@ -148,6 +148,61 @@ def test_the_service_keeps_the_shell_s_state_directory(world, monkeypatch):
     assert environment["HOME"] == str(world.home)
 
 
+def memory_installed(world, monkeypatch):
+    executable(world.root / "memory-dir/ai-memory")
+    world.path("tools", "codex-dir", "agy-dir", "claude-dir", "node-dir", "memory-dir")
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+
+
+def test_path_reaches_ai_memory_when_it_is_installed(world, monkeypatch):
+    memory_installed(world, monkeypatch)
+    assert main(["install-service"]) == 0
+    dirs = world.plist()["EnvironmentVariables"]["PATH"].split(":")
+    assert str(world.root / "memory-dir") in dirs
+    assert len(dirs) == len(set(dirs))
+
+
+def test_path_reaches_the_ai_memory_a_bin_setting_names(world, monkeypatch):
+    executable(world.root / "elsewhere/my-memory")
+    world.path("tools", "codex-dir", "agy-dir", "claude-dir", "node-dir", "elsewhere")
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+    config = world.root / "defaults.toml"
+    config.write_text('[memory]\nbin = "my-memory"\n')
+    monkeypatch.setenv("BATON_CONFIG", str(config))
+    assert main(["install-service"]) == 0
+    assert str(world.root / "elsewhere") in world.plist()["EnvironmentVariables"]["PATH"].split(":")
+
+
+def test_without_ai_memory_the_path_is_what_it_was(world, monkeypatch):
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+    assert main(["install-service"]) == 0
+    dirs = world.plist()["EnvironmentVariables"]["PATH"].split(":")
+    assert str(world.root / "memory-dir") not in dirs and len(dirs) == 8
+
+
+def test_memory_that_is_off_adds_nothing_to_the_path(world, monkeypatch):
+    memory_installed(world, monkeypatch)
+    monkeypatch.setenv("BATON_MEMORY", "off")
+    assert main(["install-service"]) == 0
+    assert str(world.root / "memory-dir") not in world.plist()["EnvironmentVariables"]["PATH"]
+
+
+def test_broken_memory_settings_do_not_stop_the_install(world, monkeypatch):
+    memory_installed(world, monkeypatch)
+    config = world.root / "defaults.toml"
+    config.write_text("[memory]\nport = 5\n")
+    monkeypatch.setenv("BATON_CONFIG", str(config))
+    assert main(["install-service"]) == 0
+    assert str(world.root / "memory-dir") not in world.plist()["EnvironmentVariables"]["PATH"]
+
+
+def test_the_service_keeps_the_shell_s_memory_switch(world, monkeypatch):
+    monkeypatch.setenv("BATON_MEMORY", "off")
+    assert main(["install-service"]) == 0
+    assert world.plist()["EnvironmentVariables"]["BATON_MEMORY"] == "off"
+    assert "BATON_MEMORY" in service.PASSED_ON
+
+
 def test_installing_twice_replaces_the_loaded_service(world):
     assert main(["install-service"]) == 0
     assert world.verbs == ["print", "bootstrap"]

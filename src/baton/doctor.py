@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 from baton.adapters import antigravity, claude_api, codex
-from baton.config import AGENT_NAMES, AgentConfig, Goal, default_agent
+from baton.config import AGENT_NAMES, AgentConfig, Goal, GoalError, default_agent, load_memory
 from baton.ledger import MIN_GRANT_USD, LedgerError
+from baton.memory import Memory
 from baton.proc import SCRUBBED_ENV
 
 PS_TIMEOUT_S = 10
@@ -198,6 +199,15 @@ def _usd(value: Decimal) -> str:
     return format(value.normalize() if value == value.to_integral_value() else value, "f")
 
 
+NOT_CONFIGURED = "not configured (optional): rounds use the other agents only"
+
+
+def _claude_unconfigured(cfg: AgentConfig) -> bool:
+    """True when Claude is enabled but there is no key file: it was never set up, and Claude is
+    optional. A key file in any state (even with the wrong mode) means a setup was begun."""
+    return not os.path.lexists(Path(cfg.key_file).expanduser())
+
+
 def _claude_checks(cfg: AgentConfig, env: Mapping[str, str], blocking: bool) -> list[Check]:
     """Everything about the Claude API agent that can be read without spending: its binary, its
     key file (never its content), the spend ledger against the ceiling, the optional cost report,
@@ -278,6 +288,28 @@ def _interactive() -> Check:
     )
 
 
+def _memory(goal: Goal | None) -> Check:
+    """Long-term memory is always optional: whatever is wrong with it, rounds run without it."""
+    name = "memory"
+    if goal is not None and not goal.memory:
+        return Check(name, True, False, "off (memory = false in the goal)")
+    try:
+        cfg = load_memory()
+    except GoalError as exc:
+        return Check(name, False, False, f"settings ignored, rounds run without memory: {exc}")
+    if not cfg.enabled:
+        why = (
+            "BATON_MEMORY=off"
+            if os.environ.get("BATON_MEMORY", "").strip().lower() == "off"
+            else "enabled = false in [memory]"
+        )
+        return Check(name, True, False, f"off ({why})")
+    mem = Memory(cfg, goal.workdir if goal is not None else Path.cwd(), "doctor")
+    # A binary that is missing, or an old server in the way of the configured port, is a warning:
+    # either way the rounds go on without memory.
+    return Check(name, mem.binary() is not None and not mem.conflict(), False, mem.status())
+
+
 def run_checks(goal: Goal | None, env: Mapping[str, str]) -> list[Check]:
     """All checks, in display order. Never starts a round."""
     checks = _environment(env)
@@ -303,6 +335,9 @@ def run_checks(goal: Goal | None, env: Mapping[str, str]) -> list[Check]:
         blocking = name in wanted
         if name == "claude_api":
             others = any(agents[a].enabled for a in wanted if a != name)
+            if cfg.enabled and others and _claude_unconfigured(cfg):
+                checks.append(Check("claude_api", True, False, NOT_CONFIGURED))
+                continue
             checks += _claude_checks(cfg, env, blocking and not others)
             continue
         binary, usable = _binary(cfg, env, blocking)
@@ -318,4 +353,5 @@ def run_checks(goal: Goal | None, env: Mapping[str, str]) -> list[Check]:
             checks.append(Check(f"{name} limits", False, blocking, "skipped: no binary"))
         if name == "codex":
             checks.append(_interactive())
+    checks.append(_memory(goal))
     return checks

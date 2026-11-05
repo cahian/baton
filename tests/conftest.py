@@ -55,6 +55,9 @@ def isolated_baton_files(tmp_path, monkeypatch):
     monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "config" / "defaults.toml"))
     monkeypatch.setenv("BATON_LEDGER", str(tmp_path / "ledger" / "claude-spend.json"))
     monkeypatch.setenv("BATON_STATE_DIR", str(tmp_path / "state-base"))
+    # Long-term memory is off in every test: none may start a real `ai-memory`, even if one is on
+    # the PATH. A test that needs memory builds `Memory` with fakes, or turns this back on itself.
+    monkeypatch.setenv("BATON_MEMORY", "off")
 
 
 class Fakes:

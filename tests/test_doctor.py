@@ -7,6 +7,7 @@ from conftest import agy_credits, agy_usage, codex_limits, iso
 from baton import doctor
 from baton.config import load_goal
 from baton.doctor import Check, Proc, interactive_codex, run_checks
+from baton.memory import Memory
 
 SECRET = "fake-very-secret-value-12345"
 
@@ -288,10 +289,9 @@ def test_stray_anthropic_variables_are_flagged(fakes, monkeypatch):
         assert SECRET not in c.name and SECRET not in c.detail
 
 
-def test_claude_without_a_key_is_a_warning_when_others_can_run(fakes):
-    checks = run(fakes, claude="")  # no key file written
-    key = check(checks, "claude_api key")
-    assert not key.ok and not key.blocking and "not found" in key.detail
+def test_claude_without_a_key_is_no_problem_when_others_can_run(fakes):
+    checks = run(fakes, claude="")  # no key file written: Claude is optional
+    assert check(checks, "claude_api").ok
     assert not blocking_failures(checks)
 
 
@@ -312,6 +312,91 @@ def test_claude_missing_binary(fakes):
     checks = run(fakes, claude='bin = "/nonexistent/claude"\n')
     binary = check(checks, "claude_api binary")
     assert not binary.ok and not binary.blocking and "/nonexistent/claude" in binary.detail
+
+
+NOT_CONFIGURED = "not configured (optional): rounds use the other agents only"
+
+
+def lines(checks):
+    return [c.name for c in checks if c.name.startswith("claude_api")]
+
+
+def test_claude_with_no_key_file_is_one_ok_line(fakes):
+    checks = run(fakes, claude="")  # the fake claude binary is on PATH, no key file
+    line = check(checks, "claude_api")
+    assert line.name == "claude_api" and line.ok and not line.blocking
+    assert line.detail == NOT_CONFIGURED
+    assert lines(checks) == ["claude_api"]  # no binary, key, spend or console line
+    assert not blocking_failures(checks)
+
+
+def test_claude_with_neither_binary_nor_key_is_the_same_one_line(fakes):
+    checks = run(fakes, claude='bin = "/nonexistent/claude"\n')
+    assert check(checks, "claude_api").detail == NOT_CONFIGURED
+    assert lines(checks) == ["claude_api"]
+
+
+def test_the_not_configured_line_names_no_agent(fakes):
+    detail = check(run(fakes, claude=""), "claude_api").detail
+    assert "Codex" not in detail and "Antigravity" not in detail
+
+
+def test_claude_not_configured_prints_exactly_that_line(fakes, capsys):
+    from baton.cli import main
+
+    path = fakes.goal(claude="")
+    assert main(["doctor", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert f"[  ok] claude_api: {NOT_CONFIGURED}\n" in out
+    for word in ("binary", "key", "spend", "console"):
+        assert f"claude_api {word}" not in out
+
+
+def test_claude_with_a_key_but_no_binary_keeps_the_warnings(fakes):
+    fakes.claude_key(CLAUDE_KEY)
+    checks = run(fakes, claude='bin = "/nonexistent/claude"\n')
+    assert "claude_api" not in lines(checks)
+    assert not check(checks, "claude_api binary").ok
+    assert check(checks, "claude_api key").ok
+
+
+def test_claude_with_a_key_of_the_wrong_mode_keeps_the_warning(fakes):
+    fakes.claude_key(CLAUDE_KEY, mode=0o644)
+    checks = run(fakes, claude="")
+    assert "claude_api" not in lines(checks)
+    key = check(checks, "claude_api key")
+    assert not key.ok and "600" in key.detail
+
+
+def test_claude_disabled_keeps_its_one_disabled_line(fakes):
+    checks = run(fakes)  # enabled = false
+    assert check(checks, "claude_api binary").detail == "disabled in the goal file"
+    assert "claude_api" not in lines(checks)
+
+
+def test_claude_as_the_only_agent_keeps_its_blocking_checks_even_with_no_key(fakes):
+    checks = run(fakes, claude="", order=("claude_api",))
+    assert "claude_api" not in lines(checks)
+    assert check(checks, "claude_api key").blocking
+    assert blocking_failures(checks)
+
+
+def test_claude_is_the_only_agent_when_the_others_are_disabled(fakes):
+    checks = run(
+        fakes,
+        claude="",
+        codex="enabled = false",
+        agy="enabled = false",
+        order=("codex", "antigravity", "claude_api"),
+    )
+    assert "claude_api" not in lines(checks)
+    assert blocking_failures(checks)
+
+
+def test_claude_not_configured_without_a_goal(fakes, monkeypatch):
+    monkeypatch.setenv("HOME", str(fakes.root / "home"))
+    checks = run_checks(None, os.environ)
+    assert check(checks, "claude_api").detail == NOT_CONFIGURED
 
 
 def test_claude_outside_the_order_never_blocks(fakes):
@@ -395,3 +480,155 @@ def test_doctor_reads_the_budget_from_the_defaults_file(fakes):
     spend = check(claude(fakes), "claude_api spend")
     assert "80" in spend.detail and "budget 100" in spend.detail and "20%" in spend.detail
     assert "spend limit of 80 USD" in check(claude(fakes), "claude_api console").detail
+
+
+# long-term memory
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    """Memory switched on, with its server probe, its processes and its binary lookup faked, so
+    that no test here depends on whether ai-memory is installed on the machine running it.
+    `found` maps what `which` is asked for to the path it answers; nothing in it, no binary."""
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+    state = {"up": False, "started": [], "found": {}}
+
+    def which(command, path=None):
+        return state["found"].get(command)
+
+    def build(cfg, workdir, job):
+        def refuse(*a, **k):
+            state["started"].append(a)
+            raise AssertionError("doctor must start nothing")
+
+        return Memory(
+            cfg,
+            workdir,
+            job,
+            run=refuse,
+            popen=refuse,
+            health=lambda port: state["up"],
+            which=which,
+        )
+
+    monkeypatch.setattr(doctor, "Memory", build)
+    return state
+
+
+def memory_check(checks):
+    return check(checks, "memory")
+
+
+def fake_binary(fakes, probe, name="ai-memory"):
+    """An ai-memory that the faked lookup finds, under `name` and under its full path."""
+    path = fakes.bindir / name
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    probe["found"][name] = probe["found"][str(path)] = str(path)
+    return path
+
+
+def test_memory_off_by_the_environment_is_reported_and_not_a_problem(fakes):
+    c = memory_check(run(fakes))  # BATON_MEMORY=off from the autouse fixture
+    assert c.ok and not c.blocking and "off" in c.detail and "BATON_MEMORY" in c.detail
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", " off ", "Off\n"])
+def test_the_environment_reason_is_given_for_every_spelling_that_turns_memory_off(
+    fakes, monkeypatch, value
+):
+    monkeypatch.setenv("BATON_MEMORY", value)
+    c = memory_check(run(fakes))
+    assert c.ok and "BATON_MEMORY=off" in c.detail and "enabled = false" not in c.detail
+
+
+@pytest.mark.parametrize("value", ["on", "0", "false", "", " "])
+def test_a_variable_that_does_not_turn_memory_off_is_not_the_reason(fakes, monkeypatch, value):
+    """Only what `load_memory` treats as off is named as the reason: with anything else set, an
+    `enabled = false` in the settings is what turned it off."""
+    monkeypatch.setenv("BATON_MEMORY", value)
+    fakes.defaults("[memory]\nenabled = false\n")
+    c = memory_check(run(fakes))
+    assert c.ok and "enabled = false" in c.detail and "BATON_MEMORY" not in c.detail
+
+
+def test_memory_off_in_the_settings_is_reported(fakes, monkeypatch):
+    monkeypatch.delenv("BATON_MEMORY")
+    fakes.defaults("[memory]\nenabled = false\n")
+    c = memory_check(run(fakes))
+    assert c.ok and "off" in c.detail and "enabled = false" in c.detail
+
+
+def test_memory_off_in_the_goal_is_reported(fakes, probe):
+    c = memory_check(run(fakes, extra="memory = false"))
+    assert c.ok and "off" in c.detail and "goal" in c.detail
+
+
+def test_a_missing_binary_is_a_warning_that_says_rounds_run_without_memory(fakes, probe):
+    c = memory_check(run(fakes))
+    assert not c.ok and not c.blocking
+    assert "without memory" in c.detail and "ai-memory" in c.detail
+    assert not blocking_failures(run(fakes))
+
+
+def test_an_ai_memory_on_the_real_path_is_not_seen_by_the_memory_tests(fakes, probe):
+    """These tests answer for themselves, whatever is installed where they run."""
+    real = fakes.bindir / "ai-memory"
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    c = memory_check(run(fakes))
+    assert not c.ok and "without memory" in c.detail and str(real) not in c.detail
+
+
+def test_an_installed_binary_is_reported_with_its_path_and_the_server_state(fakes, probe):
+    path = fake_binary(fakes, probe)
+    down = memory_check(run(fakes))
+    assert down.ok and str(path) in down.detail and "not running" in down.detail
+    probe["up"] = True
+    up = memory_check(run(fakes))
+    assert up.ok and str(path) in up.detail and "up" in up.detail and "not running" not in up.detail
+    assert probe["started"] == []
+
+
+def test_an_old_server_in_the_way_is_a_warning_with_the_same_words(fakes, probe, monkeypatch):
+    from baton.store import state_base
+
+    fake_binary(fakes, probe)
+    data = state_base() / ".ai-memory"
+    data.mkdir(parents=True)
+    (data / "config.toml").write_text('bind = "127.0.0.1:19999"\n')
+
+    def build(cfg, workdir, job):
+        return Memory(
+            cfg,
+            workdir,
+            job,
+            health=lambda port: port == 19999,
+            which=lambda command, path=None: probe["found"].get(command),
+        )
+
+    monkeypatch.setattr(doctor, "Memory", build)
+    c = memory_check(run(fakes))
+    assert not c.ok and not c.blocking
+    assert "stop the old server" in c.detail and "19999" in c.detail
+    assert not blocking_failures(run(fakes))
+
+
+def test_a_bin_from_the_settings_is_the_one_looked_up(fakes, probe):
+    path = fake_binary(fakes, probe, "my-ai-memory")
+    fakes.defaults(f'[memory]\nbin = "{path}"\n')
+    assert str(path) in memory_check(run(fakes)).detail
+
+
+def test_bad_memory_settings_are_a_warning_not_a_blocker(fakes, probe):
+    fakes.defaults("[memory]\nport = 5\n")
+    checks = run(fakes)
+    c = memory_check(checks)
+    assert not c.ok and not c.blocking
+    assert "port" in c.detail and "without memory" in c.detail
+    assert not blocking_failures(checks)
+
+
+def test_the_memory_check_is_there_without_a_goal_too(fakes, probe):
+    checks = run_checks(None, os.environ)
+    assert len([c for c in checks if c.name == "memory"]) == 1

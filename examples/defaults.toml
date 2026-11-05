@@ -1,6 +1,14 @@
 # Copy to ~/.config/baton/defaults.toml. These [agents.*] tables apply under every goal, and a
 # goal file may override any of them except the three budget settings, which only live here.
 
+# Long-term memory: baton drives a private ai-memory instance (see the README). Without the
+# binary on PATH nothing happens and rounds run as before. `BATON_MEMORY=off` turns it off everywhere.
+[memory]
+enabled = true
+bin = "ai-memory"      # a name on PATH, or a path
+port = 18778           # 1024-65535; the instance is its own, not ai-memory's default 49374
+recall_chars = 6000    # most memory put in one prompt, 0-20000; 0 stops recall, recording goes on
+
 [agents.claude_api]
 enabled = true
 model = "claude-opus-5-5"

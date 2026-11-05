@@ -66,10 +66,17 @@ GOAL_KEYS = frozenset(
         "round_max_s",
         "idle_s",
         "snapshot",
+        "memory",
         "verify",
         "agents",
     }
 )
+MEMORY_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "bin": "ai-memory",
+    "port": 18778,
+    "recall_chars": 6000,
+}
 GLOBAL_ONLY = ("monthly_budget_usd", "reserve_pct", "budget_reset_day")
 # What a `baton.toml` may not set: it comes with the repository, so it must not choose which
 # executables run, which credentials are read, whether the sandbox is on or how rarely the guard
@@ -103,6 +110,16 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    """The `[memory]` table of the defaults file: the long-term memory (ai-memory) baton drives."""
+
+    enabled: bool = True
+    bin: str = "ai-memory"
+    port: int = 18778
+    recall_chars: int = 6000
+
+
+@dataclass(frozen=True)
 class GoalRef:
     """What names a goal: enough to find its state, whatever is wrong with its settings."""
 
@@ -120,6 +137,7 @@ class Goal:
     round_max_s: int
     idle_s: int
     snapshot: bool
+    memory: bool
     verify_command: str | None
     verify_timeout_s: int
     agents: dict[str, AgentConfig]
@@ -257,7 +275,9 @@ def load_defaults() -> dict[str, dict[str, Any]]:
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise GoalError(f"invalid defaults file {path}: {exc}") from exc
     try:
-        _check_keys(data, {"agents"}, "the defaults file")
+        # [memory] is read, and judged, by load_memory: a bad one must not keep a goal from
+        # loading, since memory is never allowed to stop a goal.
+        _check_keys(data, {"agents", "memory"}, "the defaults file")
         agents = _table(data, "agents", "")
         unknown = sorted(set(agents) - set(AGENT_NAMES))
         if unknown:
@@ -271,6 +291,39 @@ def load_defaults() -> dict[str, dict[str, Any]]:
     except GoalError as exc:
         raise GoalError(f"{path}: {exc}") from exc
     return tables
+
+
+def load_memory() -> MemoryConfig:
+    """The `[memory]` table of the defaults file, with every default applied.
+
+    Held to the same rules as `load_defaults`: a key that is unknown or a value that is invalid
+    raises GoalError. `BATON_MEMORY=off` in the environment turns memory off whatever the file says.
+    """
+    if os.environ.get("BATON_MEMORY", "").strip().lower() == "off":
+        return MemoryConfig(enabled=False)
+    path = defaults_path()
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return MemoryConfig()
+    except OSError as exc:
+        raise GoalError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    try:
+        data = tomllib.loads(raw.decode("utf-8"), parse_float=Decimal)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise GoalError(f"invalid defaults file {path}: {exc}") from exc
+    try:
+        table = _table(data, "memory", "")
+        _check_keys(table, set(MEMORY_DEFAULTS), "[memory]")
+        d = MEMORY_DEFAULTS
+        return MemoryConfig(
+            enabled=_bool(table, "enabled", d["enabled"], "memory."),
+            bin=os.path.expanduser(_str(table, "bin", d["bin"], "memory.")),
+            port=_int(table, "port", d["port"], "memory.", 1024, 65535),
+            recall_chars=_int(table, "recall_chars", d["recall_chars"], "memory.", 0, 20000),
+        )
+    except GoalError as exc:
+        raise GoalError(f"{path}: {exc}") from exc
 
 
 def default_agent(name: str) -> AgentConfig:
@@ -386,6 +439,7 @@ def goal_from_table(
         round_max_s=_int(data, "round_max_s", 3600, "", 1, 10**7),
         idle_s=_int(data, "idle_s", 1200, "", 1, 10**7),
         snapshot=_bool(data, "snapshot", True, ""),
+        memory=_bool(data, "memory", True, ""),
         verify_command=verify_command,
         verify_timeout_s=_int(verify, "timeout_s", 3600, "verify.", 1, 10**7),
         agents=agents,
