@@ -494,11 +494,12 @@ class AntigravityAdapter:
         guard = Guard(self.cfg, self._read, _evaluate, self._poll_clock, self._wall_clock)
         problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
         reported = False
+        worked = False  # this attempt printed a step: whatever ends it, it did work
         final: dict | None = None
         subagents: set[tuple] = set()
 
         def on_line(line: str) -> RoundResult | None:
-            nonlocal reported, final
+            nonlocal reported, worked, final
             event = _parse_event(line)
             if event is None:
                 if line.strip():
@@ -506,13 +507,24 @@ class AntigravityAdapter:
                 return None
             kind = event.get("event")
             if kind == "init" and not reported:
-                cid = _payload(event).get("conversation_id")
-                if isinstance(cid, str) and cid:
-                    reported = True
-                    ctx.on_session(cid)
+                # agy puts the id at the top level of init; the payload is the older place.
+                for cid in (event.get("conversation_id"), _payload(event).get("conversation_id")):
+                    if isinstance(cid, str) and cid:
+                        reported = True
+                        if ctx.session_id is not None and cid != ctx.session_id:
+                            # An id agy does not know is not an error to it: it starts a new
+                            # conversation and runs, but a resumed prompt lacks the objective.
+                            return RoundResult(
+                                TRANSIENT,
+                                reason=f"conversation {ctx.session_id} not found; agy began {cid}",
+                                resume_failed=True,
+                            )
+                        ctx.on_session(cid)
+                        break
             elif kind == "result":
                 final = _payload(event)
             elif kind == "step_update":
+                worked = True
                 return self._subagent(event, ctx, subagents)
             return None
 
@@ -525,7 +537,7 @@ class AntigravityAdapter:
             )
             if exit_.stopped is not None:
                 return exit_.stopped
-            return self._outcome(exit_.timed_out, final, problems, ctx)
+            return self._outcome(exit_.timed_out, final, problems, ctx, worked)
 
         return run_guarded(guard, ctx, self.cfg.bin, start)
 
@@ -548,7 +560,12 @@ class AntigravityAdapter:
         return check_subagent(self.cfg, ctx, name, model, enforce=True)
 
     def _outcome(
-        self, timed_out: bool, final: dict | None, problems: deque[str], ctx: RoundContext
+        self,
+        timed_out: bool,
+        final: dict | None,
+        problems: deque[str],
+        ctx: RoundContext,
+        worked: bool,
     ) -> RoundResult:
         if timed_out:
             return RoundResult(TIMEOUT, reason="round exceeded its time limit")
@@ -564,7 +581,9 @@ class AntigravityAdapter:
         refusal = classify(text, self._wall_clock())
         if refusal is not None:
             return refusal
-        if ctx.session_id is not None:
+        # A resumed round that never started a step failed to resume; one that worked and was then
+        # cut off (agy's own "interrupted") keeps its conversation and what it did.
+        if ctx.session_id is not None and not worked:
             return RoundResult(TRANSIENT, reason=f"resume failed: {summary}", resume_failed=True)
         return RoundResult(TRANSIENT, reason=summary)
 

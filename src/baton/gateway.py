@@ -46,6 +46,8 @@ MODEL_ID = "auto"
 # An empty-content delta this often keeps long waits from tripping a client's idle timeout.
 HEARTBEAT_S = 15.0
 HISTORY_MAX_CHARS = 24000
+# A person's message in an over-long history keeps this much of its start: a long spec stays.
+PERSON_MAX_CHARS = 8000
 TITLE_WORDS = 6
 TITLE_PREFIX = "Here is the first message of the conversation:"
 MAX_BODY_BYTES = 32 * 1024 * 1024
@@ -127,20 +129,63 @@ def message_mark(messages: list, index: int) -> tuple[int, str]:
     return position, hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+GAP = "..."
+
+
 def history_text(messages: list) -> str:
-    """The conversation as plain text, the last HISTORY_MAX_CHARS of it."""
-    lines: list[str] = []
+    """The conversation as plain text. Over HISTORY_MAX_CHARS the person's words are kept first,
+    newest first, each cut to its first PERSON_MAX_CHARS, so a long reply cannot push out the goal;
+    assistant messages share what is left, newest first, the last one cut to its tail. Each place
+    where whole messages or the start of a reply were left out holds a `...`."""
+    turns: list[tuple[str, str]] = []
     for message in messages:
         role = _role(message)
         if role not in ("user", "assistant"):
             continue  # the system prompt and tool traffic belong to OpenCode's own agent
         text = _text_of(message).strip()
         if text:
-            lines.append(f"{'Person' if role == 'user' else 'Assistant'}: {text}")
-    joined = "\n\n".join(lines)
-    if len(joined) > HISTORY_MAX_CHARS:
-        joined = "..." + joined[-HISTORY_MAX_CHARS:]
-    return joined
+            turns.append((role, text))
+    prefix = {"user": "Person: ", "assistant": "Assistant: "}
+    joined = "\n\n".join(prefix[role] + text for role, text in turns)
+    if len(joined) <= HISTORY_MAX_CHARS:
+        return joined
+    # What each message costs in the limit: its text and the blank line that joins it.
+    keep: dict[int, str] = {}
+    left = HISTORY_MAX_CHARS
+    for i in range(len(turns) - 1, -1, -1):
+        role, text = turns[i]
+        if role != "user":
+            continue
+        if len(text) > PERSON_MAX_CHARS:
+            text = text[:PERSON_MAX_CHARS] + " ..."
+        if len(text) + 2 > left:
+            continue
+        keep[i] = text
+        left -= len(text) + 2
+    for i in range(len(turns) - 1, -1, -1):
+        role, text = turns[i]
+        if role != "assistant":
+            continue
+        if len(text) + 2 <= left:
+            keep[i] = text
+            left -= len(text) + 2
+            continue
+        if left > 2:
+            keep[i] = text[-(left - 2) :]  # the end of a reply is where it got to
+        break
+    parts: list[str] = []
+    gap = False
+    for i, (role, text) in enumerate(turns):
+        if i not in keep:
+            gap = True
+            continue
+        if gap or (role == "assistant" and keep[i] != text):
+            parts.append(GAP)
+            gap = False
+        parts.append(prefix[role] + keep[i])
+    if gap:
+        parts.append(GAP)
+    return "\n\n".join(parts)
 
 
 def title_for(messages: list) -> str:
@@ -294,16 +339,22 @@ def render_event(kind: str, f: Mapping) -> str:
 
 def slim_conversation(context: list) -> list[dict]:
     """The part of a conversation that a briefing can use, as plain text: `job.json` is rewritten
-    with each message, and requests can carry megabytes of tool traffic."""
+    with each message, and requests can carry megabytes of tool traffic. Every message of the
+    person stays, each cut to its first HISTORY_MAX_CHARS; assistant text is dropped, the oldest
+    first, once it passes the limit."""
     kept: list[dict] = []
     size = 0
     for message in reversed(context):
         role, text = _role(message), _text_of(message)
-        if role in ("user", "assistant") and text.strip():
-            kept.append({"role": role, "content": text})
-            size += len(text)
+        if role not in ("user", "assistant") or not text.strip():
+            continue
+        if role == "user":
+            text = text[:HISTORY_MAX_CHARS]
+        else:
             if size > HISTORY_MAX_CHARS:
-                break
+                continue
+            size += len(text)
+        kept.append({"role": role, "content": text})
     return kept[::-1]
 
 

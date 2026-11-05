@@ -588,9 +588,12 @@ Without `verify.command`, the goal is finished when a cycle ends (a round, with 
 
 Between rounds each agent gets the same context: the repository, its commits, `.baton/HANDOFF.md`
 (kept current by the agents), the last gate output and the tail of the previous round. `.baton/`
-lives in the working directory and is added to `.git/info/exclude`. With `ai-memory` installed, what
-earlier goals learned in the directory is added too (see [Long-term memory](#long-term-memory);
-`memory = false` turns it off). After each round baton commits
+lives in the working directory and is added to `.git/info/exclude`. A handoff over 16000 characters
+is cut in the middle: its first 4000 and its last 12000 are kept, with a line saying how much was
+left out. From OpenCode, an over-long conversation keeps the person's messages first, newest first,
+each cut to its first 8000 characters, and gives assistant messages the room that is left, each
+gap marked with `...`. With `ai-memory` installed, what earlier goals learned in the directory is
+added too (see [Long-term memory](#long-term-memory); `memory = false` turns it off). After each round baton commits
 uncommitted work locally as `baton: snapshot round <n> (<agent>)` so a hard stop loses nothing. It
 never pushes (`snapshot = false` turns the commits off).
 

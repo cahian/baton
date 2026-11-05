@@ -662,6 +662,31 @@ def test_session_id_from_init(fake, tmp_path, monkeypatch):
     assert seen == ["conv-42"]
 
 
+def test_session_id_from_a_nested_init_still_works(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_AGY_CONVERSATION_ID", "conv-nested")
+    monkeypatch.setenv("FAKE_AGY_INIT_SHAPE", "nested")
+    seen = []
+    res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path, on_session=seen.append))
+    assert res.outcome == COMPLETED
+    assert seen == ["conv-nested"]
+
+
+def test_top_level_id_wins_over_the_payload_one(tmp_path):
+    seen = []
+    line = json.dumps(
+        {"event": "init", "conversation_id": "top", "init": {"conversation_id": "inner"}}
+    )
+    # A stub child that prints only that init line; the round ends without a result, which is
+    # beside the point here.
+    script = tmp_path / "child.py"
+    script.write_text(f"print({line!r})\n")
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+    wrapper.chmod(0o755)
+    adapter(str(wrapper), Reads()).run_round("go", make_ctx(tmp_path, on_session=seen.append))
+    assert seen == ["top"]
+
+
 def test_resume_argv(fake, tmp_path):
     seen = []
     adapter(fake.bin, Reads()).run_round(
@@ -672,13 +697,44 @@ def test_resume_argv(fake, tmp_path):
     assert seen == ["conv-7"]
 
 
-def test_failed_resume_sets_resume_failed(fake, tmp_path, monkeypatch):
+def test_failed_resume_without_any_step_sets_resume_failed(fake, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_AGY_RESULT_STATUS", "ERROR")
     monkeypatch.setenv("FAKE_AGY_RESULT_ERROR", "conversation not found")
     monkeypatch.setenv("FAKE_AGY_EXEC_EXIT", "1")
+    monkeypatch.setenv("FAKE_AGY_NO_STEPS", "1")
     res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path, session_id="gone"))
     assert res.outcome == TRANSIENT and res.resume_failed
     assert "conversation not found" in res.reason
+
+
+def test_a_resumed_round_that_worked_before_failing_keeps_its_session(fake, tmp_path, monkeypatch):
+    # Real case: agy ended itself with "interrupted" after many steps.
+    monkeypatch.setenv("FAKE_AGY_RESULT_STATUS", "ERROR")
+    monkeypatch.setenv("FAKE_AGY_RESULT_ERROR", "interrupted")
+    monkeypatch.setenv("FAKE_AGY_EXEC_EXIT", "1")
+    res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path, session_id="conv-7"))
+    assert res.outcome == TRANSIENT and not res.resume_failed
+    assert "interrupted" in res.reason
+
+
+def test_an_unknown_conversation_ends_the_round_as_a_failed_resume(fake, tmp_path, monkeypatch):
+    # Real agy: a warning, an init with a NEW id, then a run that lacks the objective.
+    monkeypatch.setenv("FAKE_AGY_UNKNOWN_CONVERSATION", "1")
+    seen = []
+    res = adapter(fake.bin, Reads()).run_round(
+        "again", make_ctx(tmp_path, session_id="gone", on_session=seen.append)
+    )
+    assert res.outcome == TRANSIENT and res.resume_failed
+    assert "gone" in res.reason and "conv-fresh" in res.reason
+    assert seen == []  # the new id is not saved
+
+
+def test_a_matching_conversation_id_keeps_working(fake, tmp_path):
+    seen = []
+    res = adapter(fake.bin, Reads()).run_round(
+        "again", make_ctx(tmp_path, session_id="conv-7", on_session=seen.append)
+    )
+    assert res.outcome == COMPLETED and seen == ["conv-7"]
 
 
 def test_failed_fresh_round_is_plain_transient(fake, tmp_path, monkeypatch):

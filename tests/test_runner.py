@@ -3,6 +3,7 @@ import os
 import subprocess
 import threading
 import time
+import types
 
 import pytest
 
@@ -2864,6 +2865,58 @@ def test_the_handoff_is_read_from_disk_after_the_round_without_the_prompt_cut(
     mem = memory.mem()
     assert mem.rounds[0].handoff == long_handoff  # what the agent wrote, whole
     assert mem.lessons == [long_handoff]  # so the lessons at the top survive the 16000 cut
+
+
+def handoff_of(work, text, limit=True):
+    # read_handoff only needs the goal's workdir.
+    (work / ".baton").mkdir(exist_ok=True)
+    (work / ".baton" / "HANDOFF.md").write_text(text)
+    stub = types.SimpleNamespace(goal=types.SimpleNamespace(workdir=work))
+    return runner._Run.read_handoff(stub, limit=limit)
+
+
+def test_a_handoff_within_the_limit_is_returned_unchanged(work):
+    for size in (10, runner.HANDOFF_MAX_CHARS):
+        text = "h" * size
+        assert handoff_of(work, text) == text
+
+
+def test_a_long_handoff_keeps_its_top_and_its_end_and_says_what_it_left_out(work):
+    head = "## Objective\n- ship it, authorised by the person\n" + "H" * 5000
+    middle = "m" * 30000
+    tail = "- next: run the tests\nEND"
+    text = head + middle + tail
+    shown = handoff_of(work, text)
+    keep_tail = runner.HANDOFF_MAX_CHARS - runner.HANDOFF_HEAD_CHARS
+    assert shown.startswith(text[: runner.HANDOFF_HEAD_CHARS])
+    assert shown.endswith(text[-keep_tail:]) and shown.endswith("END")
+    left_out = len(text) - runner.HANDOFF_MAX_CHARS
+    (marker,) = [x for x in shown.splitlines() if "left out" in x]
+    assert f"{left_out} characters" in marker and "HANDOFF.md" in marker
+    assert len(shown) <= runner.HANDOFF_MAX_CHARS + len(marker) + 2
+
+
+def test_a_handoff_one_over_the_limit_leaves_out_one_character(work):
+    shown = handoff_of(work, "a" * (runner.HANDOFF_MAX_CHARS + 1))
+    assert "1 characters" in shown
+
+
+def test_the_whole_handoff_is_still_available_unlimited(work):
+    text = "top\n" + "x" * 50000 + "\nbottom"
+    assert handoff_of(work, text, limit=False) == text
+
+
+def test_the_prompt_carries_the_top_of_a_long_handoff(go, agents, work):
+    def writes(agent, prompt, ctx):
+        (work / ".baton").mkdir(exist_ok=True)
+        text = "OBJECTIVE-AT-THE-TOP\n" + "x" * 30000 + "\nLAST-LINE"
+        (work / ".baton" / "HANDOFF.md").write_text(text)
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [writes, done(work)]
+    go()
+    prompt = agents["codex"].prompts[1]
+    assert "OBJECTIVE-AT-THE-TOP" in prompt and "LAST-LINE" in prompt
 
 
 def test_lessons_are_offered_after_every_record(go, agents, work, store, memory):

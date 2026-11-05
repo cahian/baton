@@ -101,6 +101,21 @@ def test_e2e_rotation_with_fake_clis(fakes, monkeypatch):
     assert state["current"] == "antigravity" and state["group"] is None
 
 
+def test_e2e_antigravity_resumes_its_conversation_on_the_next_round(fakes, monkeypatch):
+    monkeypatch.setenv("FAKE_AGY_CONVERSATION_ID", "conv-real")
+    # The gate fails after the first round, so a second one runs.
+    goal = fakes.goal(
+        order=("antigravity",), verify=f"test $(wc -l < {fakes.agy_calls_file}) -ge 2"
+    )
+    assert main(["run", str(goal)]) == 0
+    first, second = fakes.agy_calls()[:2]
+    assert "--conversation" not in first["argv"]
+    argv = second["argv"]
+    assert argv[argv.index("--conversation") + 1] == "conv-real"
+    state = Store(state_dir("demo")).load_state()
+    assert "conv-real" in state["sessions"].values()
+
+
 def test_e2e_split_deltas_and_tool_steps_read_unbroken(fakes, monkeypatch):
     def step(state, **info):
         update = {"step_index": 2, "state": state, "step_type": "tool", "tool_name": "run_command"}

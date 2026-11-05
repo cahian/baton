@@ -53,6 +53,8 @@ from baton.store import Store, workdir_lock
 GATE_TAIL_CHARS = 4000
 ROUND_TAIL_CHARS = 8000
 HANDOFF_MAX_CHARS = 16000
+# The top of a long handoff holds the objective and what the person allowed: it is always kept.
+HANDOFF_HEAD_CHARS = 4000
 # Waits are sliced so a stop request is noticed within this many seconds.
 STEP_S = 5
 ERROR_SLEEP_S = 60
@@ -1402,4 +1404,9 @@ class _Run:
             )
         except OSError:
             return ""
-        return text[-HANDOFF_MAX_CHARS:] if limit else text
+        if not limit or len(text) <= HANDOFF_MAX_CHARS:
+            return text
+        tail = HANDOFF_MAX_CHARS - HANDOFF_HEAD_CHARS
+        left_out = len(text) - HANDOFF_HEAD_CHARS - tail
+        marker = f"[{left_out} characters left out here; .baton/HANDOFF.md holds them]"
+        return f"{text[:HANDOFF_HEAD_CHARS]}\n{marker}\n{text[-tail:]}"

@@ -781,8 +781,166 @@ def test_history_is_capped(gw):
     big += [{"role": "assistant", "content": "NEWEST reply"}]
     gw.stream("go on", history=big).read_all()
     prompt = gw.agents["claude_api"].prompts[0]
-    assert "NEWEST reply" in prompt and "OLDEST" not in prompt
+    # The long message keeps its start, cut to PERSON_MAX_CHARS, and the newest reply stays whole.
+    assert "NEWEST reply" in prompt and "OLDEST" in prompt
+    assert "x" * (gateway.PERSON_MAX_CHARS + 1) not in prompt
     assert len(prompt) < gateway.HISTORY_MAX_CHARS + 6000
+
+
+def turn(role, text):
+    return {"role": role, "content": text}
+
+
+def lines_of(history):
+    return history.split("\n\n")
+
+
+def test_history_under_the_limit_is_unchanged():
+    messages = [turn("user", "hello"), turn("assistant", "hi there"), turn("user", "go on")]
+    assert gateway.history_text(messages) == "Person: hello\n\nAssistant: hi there\n\nPerson: go on"
+
+
+def test_a_huge_assistant_message_keeps_every_person_message_in_order():
+    messages = [
+        turn("user", "GOAL: build the thing"),
+        turn("assistant", "A" * 30000),
+        turn("user", "and authorised: push it"),
+        turn("assistant", "short reply"),
+        turn("user", "last words"),
+    ]
+    out = gateway.history_text(messages)
+    persons = [x for x in lines_of(out) if x.startswith("Person: ")]
+    assert persons == [
+        "Person: GOAL: build the thing",
+        "Person: and authorised: push it",
+        "Person: last words",
+    ]
+    assert out.index("GOAL") < out.index("authorised") < out.index("last words")
+    assert "short reply" in out and "A" * 30000 not in out
+
+
+def test_person_messages_over_the_limit_lose_the_oldest_and_are_cut_each():
+    messages = []
+    for i in range(5):
+        messages.append(turn("user", f"U{i} " + "x" * 9000))
+        messages.append(turn("assistant", f"reply{i}"))
+    out = gateway.history_text(messages)
+    persons = [x for x in lines_of(out) if x.startswith("Person: ")]
+    cut = gateway.PERSON_MAX_CHARS
+    assert [p[8:11] for p in persons] == ["U3 ", "U4 "]  # the oldest go
+    assert all(
+        len(p) == len("Person: ") + cut + len(" ...") and p.endswith(" ...") for p in persons
+    )
+    assert out.startswith("...")
+
+
+def test_an_oversized_newest_person_message_is_cut_and_the_older_ones_stay():
+    paste = "PASTE " + "p" * (gateway.HISTORY_MAX_CHARS + 100)
+    messages = [
+        turn("user", "GOAL: build the thing"),
+        turn("assistant", "ok"),
+        turn("user", "and you may push"),
+        turn("user", paste),
+    ]
+    parts = lines_of(gateway.history_text(messages))
+    assert parts == [
+        "Person: GOAL: build the thing",
+        "Assistant: ok",
+        "Person: and you may push",
+        "Person: " + paste[: gateway.PERSON_MAX_CHARS] + " ...",
+    ]
+
+
+def test_a_long_person_message_is_cut_only_when_the_history_is_over_the_limit():
+    spec = "SPEC " + "s" * (gateway.PERSON_MAX_CHARS + 5000)
+    assert gateway.history_text([turn("user", spec)]) == "Person: " + spec
+
+
+def test_the_newest_assistant_message_keeps_its_tail():
+    messages = [turn("user", "ask"), turn("assistant", "HEAD" + "z" * 40000 + "TAIL")]
+    out = gateway.history_text(messages)
+    assert out.endswith("TAIL") and "HEAD" not in out
+    assert "Person: ask" in out
+
+
+def test_older_assistant_messages_go_before_newer_ones():
+    messages = [
+        turn("assistant", "FIRST " + "a" * 20000),
+        turn("user", "u"),
+        turn("assistant", "SECOND " + "b" * 20000),
+    ]
+    out = gateway.history_text(messages)
+    assert "FIRST" not in out
+    assert out.endswith("b" * 100)  # the newest keeps what the limit leaves of it
+
+
+def test_each_gap_holds_one_marker_however_many_messages_it_hides():
+    messages = [turn("user", "one")]
+    messages += [turn("assistant", f"drop{i} " + "x" * 3000) for i in range(5)]
+    messages += [turn("user", "two"), turn("assistant", "fits")]
+    messages += [turn("assistant", "q" * 30000), turn("user", "three")]
+    out = gateway.history_text(messages)
+    parts = lines_of(out)
+    assert parts.count("...") == 2  # the gap after "one", and the gap in front of the tail
+    assert parts[0] == "Person: one" and parts[-1] == "Person: three"
+    # Never a marker next to a marker.
+    assert all(not (a == b == "...") for a, b in zip(parts, parts[1:], strict=False))
+
+
+def test_history_size_is_bounded_by_the_limit_plus_markers_and_prefixes():
+    messages = []
+    for i in range(40):
+        messages.append(turn("user", f"u{i} " + "u" * 500))
+        messages.append(turn("assistant", f"a{i} " + "a" * 5000))
+    out = gateway.history_text(messages)
+    prefixes = len(messages) * len("Assistant: ")
+    assert len(out) <= gateway.HISTORY_MAX_CHARS + prefixes + 2 * len(messages)
+
+
+def test_saved_context_keeps_user_messages_past_a_huge_assistant_message():
+    context = [
+        turn("user", "the goal"),
+        turn("assistant", "H" * (gateway.HISTORY_MAX_CHARS + 5000)),
+        turn("user", "the authorisation"),
+        turn("assistant", "latest"),
+    ]
+    kept = gateway.slim_conversation(context)
+    assert [m["content"] for m in kept if m["role"] == "user"] == [
+        "the goal",
+        "the authorisation",
+    ]
+    assert kept[-1] == turn("assistant", "latest")  # order is kept
+
+
+def test_saved_context_cuts_a_huge_user_message_and_keeps_those_around_it():
+    context = [
+        turn("user", "before"),
+        turn("user", "HEAD" + "p" * 300_000),
+        turn("user", "after"),
+    ]
+    kept = gateway.slim_conversation(context)
+    assert [m["content"] for m in kept][0] == "before" and kept[-1]["content"] == "after"
+    assert len(kept) == 3
+    assert kept[1]["content"] == ("HEAD" + "p" * 300_000)[: gateway.HISTORY_MAX_CHARS]
+
+
+def test_saved_context_stops_at_the_limit_for_assistant_text_only():
+    chunk = gateway.HISTORY_MAX_CHARS // 2 + 10
+    context = [
+        turn("assistant", "oldest " + "a" * chunk),
+        turn("user", "u1"),
+        turn("assistant", "middle " + "b" * chunk),
+        turn("assistant", "newest " + "c" * chunk),
+        turn("user", "u2"),
+    ]
+    kept = gateway.slim_conversation(context)
+    assert [m["content"][:6] for m in kept if m["role"] == "assistant"] == ["middle", "newest"]
+    assert [m["content"] for m in kept if m["role"] == "user"] == ["u1", "u2"]
+
+
+def test_saved_context_under_the_limit_is_unchanged():
+    context = [turn("user", "a"), turn("assistant", "b"), turn("system", "x"), turn("user", " ")]
+    assert gateway.slim_conversation(context) == [turn("user", "a"), turn("assistant", "b")]
 
 
 def test_quoted_string_and_content_parts_are_understood(gw):
