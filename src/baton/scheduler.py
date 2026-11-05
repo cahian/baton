@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -12,6 +13,7 @@ from baton.adapters.base import (
     COMPLETED,
     CREDIT_GUARD,
     LIMIT,
+    PREEMPTED,
     TIMEOUT,
     Adapter,
     Availability,
@@ -38,15 +40,30 @@ def _num(value: Any) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+def read_availability(adapter: Adapter) -> Availability:
+    """The adapter's availability; an agent that cannot be read is an unavailable one."""
+    try:
+        return adapter.availability()
+    except Exception as exc:
+        return Availability(False, reason=f"availability check failed: {exc}")
+
+
 class Scheduler:
     """Decides which agent runs next.
 
-    The current agent keeps working until it is unavailable; only then does the other one take
-    over, and an agent that comes back never preempts the one working. With everyone exhausted
-    `pick` returns None and `next_wake` says when to look again.
+    Plan agents (included usage that comes back at a reset) come first. The current plan agent
+    keeps working until it is unavailable; only then does the next one in `order` take over,
+    wrapping around, and a plan agent that comes back never preempts another that is working. A
+    metered agent (paid by use, nothing that would ever stop it) is a fallback wherever it stands
+    in `order`: it is picked only while no plan agent is available. While one runs, the runner
+    reads the plan agents with `plan_ready_to_check` and `record_read`, and ends the metered round
+    when one is back; `record` gives that round (`preempted`) no cooldown. With everyone
+    exhausted `pick` returns None and `next_wake` says when to look again.
 
     Cooldowns live in memory first. They are written to the store when `save` is called and
-    after `record`, and a store that cannot be read or written never resets them.
+    after `record`, and a store that cannot be read or written never resets them. The runner's
+    watcher thread calls `plan_ready_to_check` and `record_read` while the main thread holds the
+    round, so every public method takes one lock.
     """
 
     def __init__(
@@ -62,6 +79,7 @@ class Scheduler:
         self._adapters = adapters
         self._store = store
         self._clock = clock
+        self._lock = threading.RLock()
         self._agents: dict[str, dict] = {name: self._blank() for name in self.order}
         self.current: str = self.order[0]
         saved = store.load_state()  # StateError is the caller's to survive
@@ -98,45 +116,74 @@ class Scheduler:
 
     # choosing
 
+    def _plan_names(self) -> list[str]:
+        return [n for n in self.order if not self._adapters[n].metered]
+
     def _candidates(self) -> list[str]:
-        """The current agent first, then the others in `order`, wrapping around from it."""
-        at = self.order.index(self.current)
-        return self.order[at:] + self.order[:at]
+        """The plan agents, from the current one when it is a plan agent and else from the start
+        of `order`, wrapping around; then the metered agents, in `order`."""
+        plan = self._plan_names()
+        if self.current in plan:
+            at = plan.index(self.current)
+            plan = plan[at:] + plan[:at]
+        return plan + [n for n in self.order if self._adapters[n].metered]
+
+    def _apply(self, agent: dict, avail: Availability) -> None:
+        """Write a read of `agent` into its state: ready, or resting until its reset (or, when
+        that is unknown, until it is worth asking again)."""
+        agent["usage"] = dict(avail.usage)
+        if avail.ok:
+            agent["until"] = 0.0
+            agent["reason"] = ""
+            return
+        now = self._clock()
+        known = self._known(avail.until, now)
+        agent["until"] = known if known is not None else now + UNAVAILABLE_RETRY_S
+        agent["reason"] = avail.reason
 
     def pick(self) -> Adapter | None:
         """The adapter to run now, or None when every agent is cooling down or unavailable."""
-        for name in self._candidates():
-            agent = self._agents[name]
+        with self._lock:
+            for name in self._candidates():
+                agent = self._agents[name]
+                if agent["until"] > self._clock():
+                    continue
+                adapter = self._adapters[name]
+                avail = read_availability(adapter)
+                self._apply(agent, avail)
+                if avail.ok:
+                    self.current = name
+                    return adapter
+            return None
+
+    def plan_ready_to_check(self) -> list[str]:
+        """The plan agents whose cooldown has passed, in `order`: the ones worth reading while a
+        metered agent runs. Moves nothing."""
+        with self._lock:
             now = self._clock()
-            if agent["until"] > now:
-                continue
-            adapter = self._adapters[name]
-            try:
-                avail = adapter.availability()
-            except Exception as exc:  # an unreadable agent is an unavailable one
-                avail = Availability(False, reason=f"availability check failed: {exc}")
-            agent["usage"] = dict(avail.usage)
-            if avail.ok:
-                agent["until"] = 0.0
-                agent["reason"] = ""
-                self.current = name
-                return adapter
-            now = self._clock()
-            known = self._known(avail.until, now)
-            agent["until"] = known if known is not None else now + UNAVAILABLE_RETRY_S
-            agent["reason"] = avail.reason
-        return None
+            return [n for n in self._plan_names() if self._agents[n]["until"] <= now]
+
+    def record_read(self, name: str, avail: Availability) -> None:
+        """Write down a read made outside `pick`, with the same rules. Never moves `current`."""
+        with self._lock:
+            if name in self._agents:
+                self._apply(self._agents[name], avail)
 
     def next_wake(self) -> float:
         """Epoch of the earliest possible retry, never sooner than 30 s from now."""
-        now = self._clock()
-        untils = [a["until"] for a in self._agents.values() if a["until"] > now]
-        return max(min(untils), now + MIN_WAIT_S) if untils else now + MIN_WAIT_S
+        with self._lock:
+            now = self._clock()
+            untils = [a["until"] for a in self._agents.values() if a["until"] > now]
+            return max(min(untils), now + MIN_WAIT_S) if untils else now + MIN_WAIT_S
 
     # outcomes
 
     def record(self, agent: str, result: RoundResult) -> None:
         """Apply the outcome table to `agent`, then write it down if the store allows."""
+        with self._lock:
+            self._record(agent, result)
+
+    def _record(self, agent: str, result: RoundResult) -> None:
         if agent not in self._agents:
             return
         state = self._agents[agent]
@@ -144,6 +191,8 @@ class Scheduler:
         outcome = result.outcome
         if result.resume_failed:
             return  # the round never really ran; it is retried fresh and is not the agent's fault
+        if outcome == PREEMPTED:
+            return  # ended by baton because a plan agent is back: nobody's failure, no cooldown
         if outcome in (COMPLETED, TIMEOUT):
             state.update(until=0.0, limit_n=0, transient_n=0, reason="")
         elif outcome == LIMIT:
@@ -176,24 +225,26 @@ class Scheduler:
 
     def snapshot(self) -> dict:
         """Per-agent state for state.json and the panel."""
-        now = self._clock()
-        agents = {}
-        for name, raw in self._agents.items():
-            agents[name] = {
-                "status": "cooldown" if raw["until"] > now else "ready",
-                "until": raw["until"],
-                "limit_n": raw["limit_n"],
-                "transient_n": raw["transient_n"],
-                "reason": raw["reason"],
-                "usage": raw["usage"],
-            }
-        return {"current": self.current, "agents": agents}
+        with self._lock:
+            now = self._clock()
+            agents = {}
+            for name, raw in self._agents.items():
+                agents[name] = {
+                    "status": "cooldown" if raw["until"] > now else "ready",
+                    "until": raw["until"],
+                    "limit_n": raw["limit_n"],
+                    "transient_n": raw["transient_n"],
+                    "reason": raw["reason"],
+                    "usage": dict(raw["usage"]),
+                }
+            return {"current": self.current, "agents": agents}
 
     def save(self) -> None:
         """Write the rotation into state.json next to whatever else it holds.
 
         Raises StateError when the file cannot be read, and then leaves it alone.
         """
-        state = self._store.load_state()
-        state.update(self.snapshot())
-        self._store.save_state(state)
+        with self._lock:
+            state = self._store.load_state()
+            state.update(self.snapshot())
+            self._store.save_state(state)

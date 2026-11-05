@@ -27,8 +27,9 @@ TOOLS = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
 class Fake:
     """Scripted adapter. A step is `fn(agent, prompt, ctx) -> RoundResult`."""
 
-    def __init__(self, name):
+    def __init__(self, name, metered=False):
         self.name = name
+        self.metered = metered
         self.script = []
         self.prompts = []
         self.sessions = []
@@ -191,7 +192,8 @@ def gw(fakes, monkeypatch, tmp_path):
     db = tmp_path / "opencode.db"
     make_db(db, [(SESSION, str(fakes.work)), ("ses_other", str(fakes.work))])
     monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
-    # These tests drive claude_api first; the real default now starts with codex.
+    # These tests drive the fake named claude_api first. It is declared non-metered: they test
+    # the gateway's mechanics, and the real claude_api would run only after the plan agents.
     monkeypatch.setattr(config, "DEFAULT_ORDER", ("claude_api", "antigravity", "codex"))
     agents = {"claude_api": Fake("claude_api"), "codex": Fake("codex")}
 

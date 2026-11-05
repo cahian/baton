@@ -2,12 +2,14 @@ import json
 import os
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
+from conftest import codex_limits
 
 from baton.adapters import claude_api
 from baton.adapters.base import (
@@ -312,7 +314,9 @@ def test_the_key_does_not_reach_the_next_agents_process(fakes, monkeypatch):
 
     fakes.claude_key(KEY)
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "0")
-    goal = fakes.goal(claude="", order=("claude_api", "codex"))
+    # Codex is full for two seconds, so Claude, the fallback, takes this round.
+    fakes.codex_scenario(codex_limits(95, reset=time.time() + 2), codex_limits(12))
+    goal = fakes.goal(claude="", order=("codex", "claude_api"), agy="enabled = false")
     assert main(["run", str(goal)]) == 0  # no verify: finishes after the Claude round
     assert fakes.claude_calls()[0]["env"]["ANTHROPIC_API_KEY"] == KEY
     # a Codex round afterwards: it sees no Anthropic variable at all
@@ -392,6 +396,7 @@ def test_missing_key_is_unavailable_and_nonblocking(env, tmp_path):
 
     class Other:
         name = "codex"
+        metered = False
 
         def availability(self):
             return Availability(True)

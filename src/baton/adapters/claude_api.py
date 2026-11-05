@@ -359,6 +359,7 @@ def _fmt(value: Decimal) -> str:
 
 class ClaudeApiAdapter:
     name = "claude_api"
+    metered = True
     # Seconds between the runner's checks. There is nothing to poll: the round's own cap is
     # `--max-budget-usd`, and the ledger already counts this round.
     tick_s = 1.0

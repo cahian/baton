@@ -49,8 +49,9 @@ class World:
 class Fake:
     """Scripted adapter. Each script step is `fn(agent, prompt, ctx) -> RoundResult`."""
 
-    def __init__(self, name):
+    def __init__(self, name, metered=False):
         self.name = name
+        self.metered = metered
         self.avail = Availability(True)
         self.script = []
         self.prompts = []

@@ -305,6 +305,7 @@ def _event_message(event: dict) -> str:
 
 class CodexAdapter:
     name = "codex"
+    metered = False
     # Seconds between the runner's checks; the limits are read every cfg.poll_s of poll_clock.
     tick_s = 1.0
 
