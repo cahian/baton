@@ -84,6 +84,7 @@ def make_cfg(env, **kw) -> AgentConfig:
         bin=env.bin,
         full_access=True,
         key_file=str(env.key),
+        round_budget_usd=Decimal("10"),  # the adapter's mechanics; the default has its own test
     )
     d.update(kw)
     return AgentConfig(**d)
