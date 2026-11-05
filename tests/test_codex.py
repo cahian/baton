@@ -341,6 +341,17 @@ def test_check_limits_flag_block_falls_back_to_latest_reset():
     assert a.until == NOW + 2000
 
 
+def test_the_flag_alone_does_not_wait_for_the_latest_window_reset():
+    # at 12% and 31% used no window explains the refusal: the cause is unknown, so ask again soon
+    a = check_limits(limits(allowed=False), 90, NOW)
+    assert not a.ok and a.until == NOW + 300
+
+
+def test_the_flag_with_a_window_at_the_threshold_keeps_that_windows_reset():
+    r = limits(allowed=False, primary=95, primary_reset=NOW + 700, secondary_reset=NOW + 9000)
+    assert check_limits(r, 90, NOW).until == NOW + 700
+
+
 # --- balance ---------------------------------------------------------------------------------
 
 

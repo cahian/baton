@@ -209,6 +209,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
     windows: dict[str, dict] = {}
     balance: Decimal | None = None
     limits: dict | None = None
+    flag_only = False  # ordinaryUsageAllowed=false with no limit named: the cause is unknown
 
     if not isinstance(result, dict):
         blind.append("limits result is not an object")
@@ -245,6 +246,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
             blind.append("ordinaryUsageAllowed is missing or not a boolean")
         elif allowed is False:
             reasons.append("ordinary usage is not allowed")
+            flag_only = limits["rateLimitReachedType"] is None
 
     saturated = []
     for name, window in windows.items():
@@ -258,7 +260,10 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
     def resets(group: list[dict]) -> list[float]:
         return [float(w["resetsAt"]) for w in group if _is_number(w.get("resetsAt"))]
 
-    if reasons:
+    if reasons and flag_only and not saturated:
+        # No window explains the refusal, and the latest window reset can be days away.
+        until = now + RETRY_S
+    elif reasons:
         known = resets(saturated) or resets(list(windows.values()))
         until = max(known) if known else None
         if until is not None and until <= now:
