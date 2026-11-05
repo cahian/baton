@@ -1044,6 +1044,7 @@ class _Run:
             tree_before = tree_fingerprint(goal.workdir)
 
         buf = ""
+        mid_line = False  # the text shown so far stops short of a line end
         worked = False
         killed = False
         interrupted = False
@@ -1054,18 +1055,36 @@ class _Run:
             else None
         )
 
+        def close_line() -> None:
+            nonlocal buf, mid_line
+            if mid_line:
+                buf = (buf + "\n")[-ROUND_TAIL_CHARS:]
+                self.emit("output", agent=agent, round=n, text="\n", fragment=True)
+                mid_line = False
+
         def on_output(line: str) -> None:
-            nonlocal buf, worked
+            nonlocal buf, worked, mid_line
+            fragment = False
             try:
                 text = adapter.render(line)
                 is_work = getattr(adapter, "is_work", None)
                 if text and (is_work is None or is_work(line)):
                     worked = True
+                is_fragment = getattr(adapter, "is_fragment", None)
+                fragment = bool(text and is_fragment is not None and is_fragment(line))
             except Exception:
                 text = None
-            if text:
-                buf = (buf + text + "\n")[-ROUND_TAIL_CHARS:]
-                self.emit("output", agent=agent, round=n, text=text)
+            if not text:
+                return
+            if fragment:
+                # Joined with the next one by the reader, which adds no newline of its own.
+                buf = (buf + text)[-ROUND_TAIL_CHARS:]
+                mid_line = not text.endswith("\n")
+                self.emit("output", agent=agent, round=n, text=text, fragment=True)
+                return
+            close_line()
+            buf = (buf + text + "\n")[-ROUND_TAIL_CHARS:]
+            self.emit("output", agent=agent, round=n, text=text)
 
         def should_kill() -> bool:
             nonlocal killed, interrupted, preempted
@@ -1136,10 +1155,13 @@ class _Run:
                 previous=self.prev_agent,
             )
             try:
-                return adapter.run_round(prompt, ctx)
+                attempted = adapter.run_round(prompt, ctx)
             except Exception as exc:
+                close_line()  # before any other event of this attempt
                 self.emit("error", error=f"{agent} round failed: {type(exc).__name__}: {exc}")
                 return RoundResult(TRANSIENT, reason=f"adapter error: {type(exc).__name__}")
+            close_line()
+            return attempted
 
         started = self.clock()
         if watch is not None:

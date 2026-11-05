@@ -639,6 +639,13 @@ def test_a_wait_states_each_agent_s_real_reason(gw):
     gw.job().halt()
 
 
+def test_a_fragment_is_shown_as_it_is_and_a_line_gets_its_newline():
+    assert gateway.render_event("output", {"text": "rende", "fragment": True}) == "rende"
+    assert gateway.render_event("output", {"text": "\n", "fragment": True}) == "\n"
+    assert gateway.render_event("output", {"text": "rende"}) == "rende\n"
+    assert gateway.render_event("output", {"text": "rende", "fragment": False}) == "rende\n"
+
+
 def test_an_agent_that_gives_no_reason_is_not_left_out():
     text = gateway.render_event("wait", {"seconds": 60, "agents": {"codex": {"reason": ""}}})
     assert "- codex: it gave no reason" in text

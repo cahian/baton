@@ -480,6 +480,100 @@ def test_render_extracts_text_delta():
     assert a.render("   ") is None
 
 
+def tool_line(tool, parameters=None, state="ACTIVE", **step):
+    update = {"step_index": 3, "state": state, "step_type": "tool", "tool_name": tool, **step}
+    if parameters is not None:
+        update["tool_info"] = {"name": tool, "parameters": parameters}
+    return json.dumps({"event": "step_update", "step_update": update})
+
+
+def delta_line(text):
+    return json.dumps({"event": "step_update", "step_update": {"text_delta": text}})
+
+
+def test_render_shows_a_command_as_it_starts():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line("run_command", {"CommandLine": "git status"})) == "$ git status"
+    # the same step reported again as DONE shows nothing
+    assert a.render(tool_line("run_command", {"CommandLine": "git status"}, state="DONE")) is None
+
+
+def test_render_shows_another_tool_with_its_first_parameter():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line("read_file", {"Path": "/a/b", "Other": "x"})) == "read_file: /a/b"
+    # the first one that is a non-blank string, in order
+    params = {"Lines": 5, "Blank": "  ", "Path": "/a/b"}
+    assert a.render(tool_line("read_file", params)) == "read_file: /a/b"
+    assert a.render(tool_line("read_file", {"Lines": 5})) == "read_file"
+    assert a.render(tool_line("manage_task")) == "manage_task"
+    # a command without a usable CommandLine is any other tool
+    assert a.render(tool_line("run_command", {"CommandLine": "  ", "Cwd": "/w"})) == (
+        "run_command: /w"
+    )
+    assert a.render(tool_line("run_command", {"CommandLine": 7})) == "run_command"
+
+
+@pytest.mark.parametrize("info", [None, "text", ["a"], 5])
+def test_render_tolerates_tool_info_that_is_not_a_dict(info):
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    line = tool_line("read_file", state="ACTIVE", tool_info=info)
+    assert a.render(line) == "read_file"
+    line = tool_line("read_file", state="ACTIVE", tool_info={"parameters": info})
+    assert a.render(line) == "read_file"
+
+
+@pytest.mark.parametrize("name", [None, "", 5])
+def test_render_shows_no_tool_step_without_a_name(name):
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line(None, {"Path": "/a"}, tool_name=name)) is None
+
+
+def test_render_does_not_show_a_step_that_is_not_a_tool():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    line = tool_line("read_file", {"Path": "/a"}, step_type="agent_response")
+    assert a.render(line) is None
+
+
+def test_render_keeps_the_first_line_of_a_command_and_marks_the_cut():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    command = "  echo one\necho two\n"
+    assert a.render(tool_line("run_command", {"CommandLine": command})) == "$ echo one …"
+    # a trailing newline alone leaves nothing out
+    assert a.render(tool_line("run_command", {"CommandLine": "ls\n"})) == "$ ls"
+
+
+def test_render_ends_a_command_at_any_line_break():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    # CRLF, and a bare CR that would overwrite text in a terminal
+    assert a.render(tool_line("run_command", {"CommandLine": "a\r\nb"})) == "$ a …"
+    assert a.render(tool_line("run_command", {"CommandLine": "a\rb"})) == "$ a …"
+    assert a.render(tool_line("run_command", {"CommandLine": "a\r\n"})) == "$ a"
+
+
+def test_render_cuts_a_long_value_at_200_characters():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line("read_file", {"Path": "x" * 200})) == f"read_file: {'x' * 200}"
+    assert a.render(tool_line("read_file", {"Path": "x" * 201})) == f"read_file: {'x' * 200} …"
+
+
+def test_render_returns_a_text_delta_untouched():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(delta_line("\n\n")) == "\n\n"
+    assert a.render(delta_line(" rende")) == " rende"
+
+
+def test_only_a_text_delta_is_a_fragment():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.is_fragment(delta_line("rende")) is True
+    assert a.is_fragment(delta_line("\n")) is True
+    assert a.is_fragment(delta_line("")) is False
+    assert a.is_fragment(tool_line("run_command", {"CommandLine": "ls"})) is False
+    assert a.is_fragment('{"event":"result","result":{"status":"ERROR","error":"boom"}}') is False
+    assert a.is_fragment("plain text line") is False
+    assert a.is_fragment("{not json") is False
+    assert a.is_fragment('{"event":"step_update","step_update":{"text_delta":5}}') is False
+
+
 def test_argv_fresh_and_resume():
     a = AntigravityAdapter(make_cfg("/opt/agy"), read=Reads())
     assert a.argv("do it", None) == [
@@ -999,12 +1093,20 @@ def test_read_text_sees_a_scrubbed_environment(fake, tmp_path, monkeypatch):
         ('{"event":"step_update","step_update":{"text_delta":"reading the code"}}', True),
         ('{"event":"result","result":{"status":"ERROR","error":"RESOURCE_EXHAUSTED"}}', False),
         ("429 Too Many Requests", False),
+        (tool_line("run_command", {"CommandLine": "ls"}), True),
     ],
 )
 def test_only_the_agent_acting_counts_as_work(line, work):
     adapter = AntigravityAdapter(make_cfg())
     assert adapter.render(line)  # the person sees all of them
     assert adapter.is_work(line) is work
+
+
+def test_a_finished_tool_step_shows_nothing_and_is_not_work():
+    adapter = AntigravityAdapter(make_cfg())
+    line = tool_line("run_command", {"CommandLine": "ls"}, state="DONE")
+    assert adapter.render(line) is None
+    assert adapter.is_work(line) is False
 
 
 # --- a read of the wrong type must not lose the balance --------------------------------------

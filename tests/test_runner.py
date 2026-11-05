@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from baton import runner
+from baton import gateway, runner
 from baton.adapters.base import (
     AUTH,
     COMPLETED,
@@ -691,6 +691,120 @@ def test_output_events_only_for_rendered_lines(go, agents, work, store):
     assert go() == 0
     outs = [e for e in store.events() if e["kind"] == "output"]
     assert [e["text"] for e in outs] == ["visible"]
+
+
+class Streaming(Fake):
+    """An adapter that streams fragments: a line starting with `~` is one, the rest are whole."""
+
+    def render(self, line):
+        return line.lstrip("~") or None
+
+    def is_fragment(self, line):
+        return line.startswith("~")
+
+
+def shown(store):
+    """What a person reads: the output events joined the way the gateway joins them."""
+    return "".join(
+        gateway.render_event("output", e) for e in store.events() if e["kind"] == "output"
+    )
+
+
+def streaming_run(go, store, work, steps):
+    agents = {"codex": Streaming("codex"), "antigravity": Streaming("antigravity")}
+    agents["codex"].script = steps
+    agents["antigravity"].script = [done(work)]
+    assert go(adapters=agents) == 0
+    return agents
+
+
+def test_fragments_are_joined_into_one_line(go, work, store):
+    streaming_run(go, store, work, [say(["~rende", "~rização\n"], done(work))])
+    outs = [e for e in store.events() if e["kind"] == "output"]
+    assert [(e["text"], e.get("fragment")) for e in outs] == [
+        ("rende", True),
+        ("rização\n", True),
+    ]
+    assert shown(store) == "renderização\n"
+
+
+def test_a_whole_line_after_a_fragment_closes_the_line_first(go, work, store):
+    streaming_run(go, store, work, [say(["~abc", "$ ls"], done(work))])
+    outs = [e for e in store.events() if e["kind"] == "output"]
+    assert [(e["text"], e.get("fragment")) for e in outs] == [
+        ("abc", True),
+        ("\n", True),
+        ("$ ls", None),
+    ]
+    assert shown(store) == "abc\n$ ls\n"
+
+
+def test_a_round_ending_on_a_fragment_closes_the_line_before_round_end(go, work, store):
+    streaming_run(go, store, work, [say(["~abc"], result(LIMIT, until=1_000_000.0 + 3600))])
+    events = [e for e in store.events() if e["kind"] in ("output", "round_end")]
+    assert [e["kind"] for e in events[:3]] == ["output", "output", "round_end"]
+    assert events[1]["text"] == "\n" and events[1]["fragment"] is True
+    assert shown(store) == "abc\n"
+
+
+def test_a_round_ending_on_a_complete_fragment_adds_no_newline(go, work, store):
+    streaming_run(go, store, work, [say(["~abc\n"], done(work))])
+    assert shown(store) == "abc\n"
+
+
+def test_an_adapter_that_raises_after_a_fragment_still_closes_the_line(go, work, store):
+    def boom(agent, prompt, ctx):
+        ctx.on_output("~abc")
+        raise RuntimeError("adapter bug")
+
+    streaming_run(go, store, work, [boom])
+    events = [e for e in store.events() if e["kind"] in ("output", "error")]
+    assert [e["kind"] for e in events] == ["output", "output", "error"]
+    assert shown(store).startswith("abc\n")
+
+
+def test_round_tail_holds_the_joined_text(go, work, store):
+    def last(agent, prompt, ctx):
+        ctx.on_output("~half a sent")
+        ctx.on_output("~ence")
+        return RoundResult(LIMIT, until=1_000_000.0 + 3600)
+
+    agents = streaming_run(go, store, work, [last])
+    prompt = agents["antigravity"].prompts[0]
+    assert "half a sentence\n" in prompt
+    assert "half a sent\n" not in prompt
+
+
+def test_a_failed_resume_starts_the_fresh_attempt_on_a_clean_line(go, work, store):
+    store.save_state({"workdir": str(work), "sessions": {"codex": "stale"}, "round": 4})
+
+    def failing_resume(agent, prompt, ctx):
+        ctx.on_output("~cut o")
+        return RoundResult(TRANSIENT, reason="resume failed: gone", resume_failed=True)
+
+    steps = [failing_resume, say(["~fresh\n"], done(work))]
+    streaming_run(go, store, work, steps)
+    assert shown(store) == "cut o\nfresh\n"
+
+
+def test_an_adapter_without_is_fragment_gets_the_events_it_always_did(go, agents, work, store):
+    agents["codex"].script = [say(["one", "two"], done(work))]
+    assert go() == 0
+    outs = [e for e in store.events() if e["kind"] == "output"]
+    assert outs == [e for e in outs if "fragment" not in e]
+    assert [e["text"] for e in outs] == ["one", "two"]
+
+
+def test_an_is_fragment_that_raises_gives_no_output(go, work, store):
+    class Broken(Streaming):
+        def is_fragment(self, line):
+            raise ValueError("bad")
+
+    agents = {"codex": Broken("codex"), "antigravity": Streaming("antigravity")}
+    agents["codex"].script = [say(["~abc"], done(work))]
+    agents["antigravity"].script = [done(work)]
+    assert go(adapters=agents) == 0
+    assert [e for e in store.events() if e["kind"] == "output"] == []
 
 
 def test_state_json_carries_rotation_and_runner_state(go, agents, work, store, world):

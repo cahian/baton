@@ -231,7 +231,7 @@ def _event_line(event: dict) -> str:
     stamp = datetime.fromtimestamp(float(event.get("ts", 0)), UTC).strftime("%H:%M:%S")
     if event.get("kind") == "round_end" and event.get("outcome") == "preempted":
         return f"  {stamp} {preempted_sentence(event)}"
-    skip = {"ts", "seq", "kind", "text", "tail", "agents"}
+    skip = {"ts", "seq", "kind", "text", "fragment", "tail", "agents"}
     details = " ".join(
         f"{k}={v}" for k, v in event.items() if k not in skip and v not in (None, "")
     )

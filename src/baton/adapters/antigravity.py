@@ -374,6 +374,36 @@ def _parse_event(line: str) -> dict | None:
     return event if isinstance(event, dict) else None
 
 
+# A tool line shows at most this much of its value: a command can be a whole script.
+BRIEF_CHARS = 200
+
+
+def _brief(value: str) -> str:
+    stripped = value.strip()
+    shown = stripped.splitlines()[0][:BRIEF_CHARS]  # any break, a bare \r would overwrite text
+    return shown if shown == stripped else f"{shown} …"
+
+
+def _tool_line(step: dict) -> str | None:
+    """One line for a tool step as it starts (ACTIVE; its DONE shows nothing), or None."""
+    name = step.get("tool_name")
+    if step.get("step_type") != "tool" or step.get("state") != "ACTIVE":
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    info = step.get("tool_info")
+    params = info.get("parameters") if isinstance(info, dict) else None
+    if not isinstance(params, dict):
+        params = {}
+    command = params.get("CommandLine")
+    if name == "run_command" and isinstance(command, str) and command.strip():
+        return f"$ {_brief(command)}"
+    for value in params.values():
+        if isinstance(value, str) and value.strip():
+            return f"{name}: {_brief(value)}"
+    return name
+
+
 # The tools that start or manage a subagent, as `step_update` names them.
 SUBAGENT_TOOLS = ("define_subagent", "invoke_subagent", "manage_subagents")
 
@@ -542,6 +572,14 @@ class AntigravityAdapter:
         event = _parse_event(line)
         return event is not None and event.get("event") == "step_update" and bool(self.render(line))
 
+    def is_fragment(self, line: str) -> bool:
+        """A text delta can end mid-word, so it is joined with the next one, not put on a line."""
+        event = _parse_event(line)
+        if event is None or event.get("event") != "step_update":
+            return False
+        delta = _payload(event).get("text_delta")
+        return isinstance(delta, str) and bool(delta)
+
     def render(self, line: str) -> str | None:
         event = _parse_event(line)
         if event is None:
@@ -551,7 +589,9 @@ class AntigravityAdapter:
         body = _payload(event)
         if kind == "step_update":
             delta = body.get("text_delta")
-            return delta if isinstance(delta, str) and delta else None
+            if isinstance(delta, str) and delta:
+                return delta  # a fragment: never stripped, a space or a newline can be all of it
+            return _tool_line(body)
         if kind == "result" and body.get("status") != "SUCCESS":
             error = body.get("error")
             return f"error: {error}" if isinstance(error, str) and error else None

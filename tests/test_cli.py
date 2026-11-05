@@ -189,6 +189,16 @@ def test_status_shows_memory_events_through_its_generic_line(fakes, capsys):
     assert "memory event=error reason=memory is unavailable: gone" in out
 
 
+def test_status_does_not_print_the_fragment_flag_of_an_output_event(fakes, capsys):
+    store = store_for(fakes)
+    store.save_state({"round": 3, "current": "antigravity", "agents": {}})
+    store.emit("output", agent="antigravity", round=3, text="rende", fragment=True)
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "output agent=antigravity round=3" in out
+    assert "fragment" not in out
+
+
 def test_status_says_when_the_daily_preemption_cap_is_active(fakes, capsys):
     store = store_for(fakes)
     now = time.time()

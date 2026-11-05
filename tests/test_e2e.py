@@ -1,5 +1,6 @@
 """The whole flow through `main`, with the fake CLIs standing in for both vendors."""
 
+import json
 import os
 import signal
 import subprocess
@@ -11,6 +12,7 @@ import pytest
 from conftest import codex_limits
 
 from baton.cli import main
+from baton.gateway import render_event
 from baton.proc import process_start
 from baton.store import Store, state_dir
 
@@ -97,6 +99,32 @@ def test_e2e_rotation_with_fake_clis(fakes, monkeypatch):
     assert "frobnicate" in fakes.agy_calls()[0]["argv"][1]
     state = Store(state_dir("demo")).load_state()
     assert state["current"] == "antigravity" and state["group"] is None
+
+
+def test_e2e_split_deltas_and_tool_steps_read_unbroken(fakes, monkeypatch):
+    def step(state, **info):
+        update = {"step_index": 2, "state": state, "step_type": "tool", "tool_name": "run_command"}
+        update["tool_info"] = {"name": "run_command", "parameters": info}
+        return {"event": "step_update", "step_update": update}
+
+    def delta(text):
+        return {"event": "step_update", "step_update": {"text_delta": text}}
+
+    monkeypatch.setenv("FAKE_AGY_TEXT", "rende")
+    extra = [
+        delta("rização ok\n"),
+        step("ACTIVE", CommandLine="git status"),
+        step("DONE", CommandLine="git status"),
+        delta("next "),
+        delta("step"),
+    ]
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps(extra))
+    goal = fakes.goal(order=("antigravity",), verify=agy_ran(fakes))
+    assert main(["run", str(goal)]) == 0
+    outs = [e for e in events(fakes) if e["kind"] in ("output", "round_end")]
+    assert outs[-1]["kind"] == "round_end"  # the last line is closed before the round ends
+    shown = "".join(render_event("output", e) for e in outs if e["kind"] == "output")
+    assert shown == "renderização ok\n$ git status\nnext step\n"
 
 
 def test_e2e_credit_drop_kills_codex_process(fakes, monkeypatch):

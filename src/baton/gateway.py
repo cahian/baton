@@ -248,7 +248,8 @@ def _reasons(event: Mapping) -> str:
 def render_event(kind: str, f: Mapping) -> str:
     """The chat text for one run event, "" for events the person does not need to see."""
     if kind == "output":
-        return f"{f.get('text', '')}\n"
+        text = f.get("text", "")
+        return text if f.get("fragment") else f"{text}\n"
     if kind == "round_start":
         agent, previous, n = f.get("agent"), f.get("previous"), f.get("round")
         if previous and previous != agent:
