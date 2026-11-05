@@ -227,6 +227,7 @@ def test_argv_has_bare_model_effort_and_round_cap(env):
         "--effort",
         "medium",
         "--dangerously-skip-permissions",
+        "--allowedTools=Bash,Edit,Read,Write",
         "--max-budget-usd",
         "10.00",
     ]
@@ -247,6 +248,16 @@ def test_resume_argv(env):
     assert argv[:2] == ["-p", "--output-format"] or argv[0] == "-p"
     assert argv[argv.index("--resume") + 1] == "abc-123"
     assert "--bare" in argv and "--max-budget-usd" in argv  # a resume is capped just the same
+
+
+@pytest.mark.parametrize("session_id", [None, "abc-123"])
+def test_allowed_tools_and_env_scrub_travel_together(env, session_id):
+    """The scrub forces the default permission mode, so only the explicit tool list lets the agent
+    write; dropping either half leaves rounds that succeed and change nothing."""
+    assert run(env, session_id=session_id).outcome == COMPLETED
+    (call,) = env.calls()
+    assert "--allowedTools=Bash,Edit,Read,Write" in call["argv"]
+    assert call["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
 
 
 def test_session_id_from_init(env):
