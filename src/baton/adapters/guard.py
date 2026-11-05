@@ -72,7 +72,14 @@ class Guard:
             return RoundResult(
                 LIMIT, until=self.wall_clock() + RETRY_S, reason=f"cannot read limits: {exc}"
             )
-        ev = self.evaluate(result, self.cfg.threshold_pct, self.wall_clock())
+        try:
+            ev = self.evaluate(result, self.cfg.threshold_pct, self.wall_clock())
+        except Exception as exc:
+            return RoundResult(
+                LIMIT,
+                until=self.wall_clock() + RETRY_S,
+                reason=f"limits could not be judged: {exc}",
+            )
         if not ev.avail.ok or ev.balance is None:
             return RoundResult(LIMIT, until=ev.avail.until, reason=ev.avail.reason)
         self.baseline = ev.balance
@@ -110,7 +117,10 @@ class Guard:
             result = self.read()
         except Exception as exc:
             return None, f"limits read failed: {exc}", False
-        ev = self.evaluate(result, self.cfg.threshold_pct, self.wall_clock())
+        try:
+            ev = self.evaluate(result, self.cfg.threshold_pct, self.wall_clock())
+        except Exception as exc:
+            return None, f"limits could not be judged: {exc}", False
         unreadable = ev.avail.reason if ev.blind else None
         if ev.balance is not None and ev.balance < self.baseline:
             return (

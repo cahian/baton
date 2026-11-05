@@ -21,7 +21,8 @@ from baton.adapters.codex import CodexAdapter
 from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_goal_ref
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, opencode_config, serve
-from baton.runner import run_goal
+from baton.runner import preempted_sentence, run_goal
+from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
 from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
 
@@ -228,6 +229,8 @@ def _runner_pid(root: Path) -> int | None:
 
 def _event_line(event: dict) -> str:
     stamp = datetime.fromtimestamp(float(event.get("ts", 0)), UTC).strftime("%H:%M:%S")
+    if event.get("kind") == "round_end" and event.get("outcome") == "preempted":
+        return f"  {stamp} {preempted_sentence(event)}"
     skip = {"ts", "seq", "kind", "text", "tail", "agents"}
     details = " ".join(
         f"{k}={v}" for k, v in event.items() if k not in skip and v not in (None, "")
@@ -285,6 +288,12 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
             print(f"    reason: {info['reason']}")
         if info.get("usage"):
             print(f"    usage: {json.dumps(info['usage'], sort_keys=True)}")
+    frees = preempt_cap_frees_at(state.get("preempts"), now)
+    if frees is not None:
+        print(
+            f"preemption cap: Claude was ended {MAX_PREEMPTS_PER_DAY} times in the last 24 hours "
+            f"to give way to a plan agent, so it is not ended again before {_when(frees)}"
+        )
     if state.get("verify_warning"):
         print(f"warning: {state['verify_warning']}")
     if state.get("group"):

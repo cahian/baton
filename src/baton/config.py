@@ -45,7 +45,7 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "bin": "claude",
         "monthly_budget_usd": Decimal("200"),
         "reserve_pct": 10,
-        "round_budget_usd": Decimal("10"),
+        "round_budget_usd": Decimal("5"),
         "budget_reset_day": 1,
         "key_file": "~/.config/baton/anthropic.key",
         "admin_key_file": "",
@@ -96,7 +96,7 @@ class AgentConfig:
     # Only claude_api reads these; the goal file accepts them for no other agent.
     monthly_budget_usd: Decimal = Decimal("200")
     reserve_pct: int = 10
-    round_budget_usd: Decimal = Decimal("10")
+    round_budget_usd: Decimal = Decimal("5")
     budget_reset_day: int = 1
     key_file: str = "~/.config/baton/anthropic.key"
     admin_key_file: str = ""

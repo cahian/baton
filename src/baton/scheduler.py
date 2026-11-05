@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -12,6 +13,7 @@ from baton.adapters.base import (
     COMPLETED,
     CREDIT_GUARD,
     LIMIT,
+    PREEMPTED,
     TIMEOUT,
     Adapter,
     Availability,
@@ -27,6 +29,15 @@ AUTH_S = 30 * 60
 # An agent that could not be checked is asked again after this long.
 UNAVAILABLE_RETRY_S = 5 * 60
 MIN_WAIT_S = 30
+# A plan agent whose round, right after it ended a metered one, fails in less than this long
+# without having worked is blocked from preempting again: it read ok but cannot hold a round.
+PREEMPT_PROOF_S = 300
+# At most this many metered rounds are ended to give way to a plan agent in 24 hours; each kill
+# leaves a round's budget counted in the ledger, so this bounds that overcount whatever the cause.
+MAX_PREEMPTS_PER_DAY = 6
+PREEMPT_WINDOW_S = 24 * 3600
+# A time further ahead than this is not a clock being a little off, it is a bad value.
+PREEMPT_SKEW_S = 3600
 # A reset further out than this is a bad reading (milliseconds for seconds, say), not a reset,
 # and counts as unknown.
 MAX_COOLDOWN_S = 8 * 24 * 3600
@@ -38,15 +49,60 @@ def _num(value: Any) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+def preempts_in_window(raw: Any, now: float) -> list[float]:
+    """The epoch times in `raw` that are valid and fall in the last 24 hours, oldest first, no
+    more than the cap's worth (the newest). Anything else, or a `raw` that is no list, is
+    dropped."""
+    if not isinstance(raw, list):
+        return []
+    times = []
+    for item in raw:
+        t = _num(item)
+        if t is not None and now - PREEMPT_WINDOW_S < t <= now + PREEMPT_SKEW_S:
+            times.append(t)
+    return sorted(times)[-MAX_PREEMPTS_PER_DAY:]
+
+
+def preempt_cap_frees_at(raw: Any, now: float) -> float | None:
+    """When the day's preemptions run out for good, or None while the cap is not reached."""
+    window = preempts_in_window(raw, now)
+    if len(window) < MAX_PREEMPTS_PER_DAY:
+        return None
+    return window[-MAX_PREEMPTS_PER_DAY] + PREEMPT_WINDOW_S
+
+
+def read_availability(adapter: Adapter) -> Availability:
+    """The adapter's availability; an agent that cannot be read is an unavailable one."""
+    try:
+        return adapter.availability()
+    except Exception as exc:
+        return Availability(False, reason=f"availability check failed: {exc}")
+
+
 class Scheduler:
     """Decides which agent runs next.
 
-    The current agent keeps working until it is unavailable; only then does the other one take
-    over, and an agent that comes back never preempts the one working. With everyone exhausted
-    `pick` returns None and `next_wake` says when to look again.
+    Plan agents (included usage that comes back at a reset) come first. The current plan agent
+    keeps working until it is unavailable; only then does the next one in `order` take over,
+    wrapping around, and a plan agent that comes back never preempts another that is working. A
+    metered agent (paid by use, nothing that would ever stop it) is a fallback wherever it stands
+    in `order`: it is picked only while no plan agent is available. While one runs, the runner
+    reads the plan agents with `plan_ready_to_check` and `record_read`, and ends the metered round
+    when one is back; `record` gives that round (`preempted`) no cooldown. A plan agent that
+    reads ok but whose next round fails within `PREEMPT_PROOF_S` (and not as completed or
+    timeout) is blocked: `plan_ready_to_check` leaves it out, so it stops costing a metered round
+    per attempt, until a round of it completes, times out or lasts that long. `pick` still tries
+    it at a round boundary. An agent that carries that mark and reads not available in `pick`
+    (the watcher saw it ok, the read there said no) is blocked at once, as if its round had
+    failed. As a backstop, `MAX_PREEMPTS_PER_DAY` preemptions in 24 hours make
+    `plan_ready_to_check` return nothing, so the watcher stops reading and killing.
+    With everyone exhausted `pick` returns None and
+    `next_wake` says when to look again.
 
     Cooldowns live in memory first. They are written to the store when `save` is called and
-    after `record`, and a store that cannot be read or written never resets them.
+    after `record`, and a store that cannot be read or written never resets them. The runner's
+    watcher thread calls `plan_ready_to_check` and `record_read` while the main thread holds the
+    round, so every public method takes one lock.
     """
 
     def __init__(
@@ -62,11 +118,14 @@ class Scheduler:
         self._adapters = adapters
         self._store = store
         self._clock = clock
+        self._lock = threading.RLock()
         self._agents: dict[str, dict] = {name: self._blank() for name in self.order}
         self.current: str = self.order[0]
+        self._preempts: list[float] = []
         saved = store.load_state()  # StateError is the caller's to survive
         if saved.get("current") in self._agents:
             self.current = saved["current"]
+        self._preempts = preempts_in_window(saved.get("preempts"), clock())
         stored = saved.get("agents")
         if isinstance(stored, dict):
             for name, raw in stored.items():
@@ -75,7 +134,15 @@ class Scheduler:
 
     @staticmethod
     def _blank() -> dict:
-        return {"until": 0.0, "limit_n": 0, "transient_n": 0, "reason": "", "usage": {}}
+        return {
+            "until": 0.0,
+            "limit_n": 0,
+            "transient_n": 0,
+            "reason": "",
+            "usage": {},
+            "blocked": False,
+            "after_preempt": False,
+        }
 
     @staticmethod
     def _restore(agent: dict, raw: dict) -> None:
@@ -88,6 +155,8 @@ class Scheduler:
             agent["reason"] = raw["reason"]
         if isinstance(raw.get("usage"), dict):
             agent["usage"] = raw["usage"]
+        agent["blocked"] = raw.get("blocked") is True
+        agent["after_preempt"] = raw.get("after_preempt") is True
 
     def _known(self, until: Any, now: float) -> float | None:
         """`until` as a usable reset time, or None when it is missing, past or nonsense."""
@@ -98,45 +167,92 @@ class Scheduler:
 
     # choosing
 
+    def _plan_names(self) -> list[str]:
+        return [n for n in self.order if not self._adapters[n].metered]
+
     def _candidates(self) -> list[str]:
-        """The current agent first, then the others in `order`, wrapping around from it."""
-        at = self.order.index(self.current)
-        return self.order[at:] + self.order[:at]
+        """The plan agents, from the current one when it is a plan agent and else from the start
+        of `order`, wrapping around; then the metered agents, in `order`."""
+        plan = self._plan_names()
+        if self.current in plan:
+            at = plan.index(self.current)
+            plan = plan[at:] + plan[:at]
+        return plan + [n for n in self.order if self._adapters[n].metered]
+
+    def _apply(self, agent: dict, avail: Availability) -> None:
+        """Write a read of `agent` into its state: ready, or resting until its reset (or, when
+        that is unknown, until it is worth asking again)."""
+        agent["usage"] = dict(avail.usage)
+        if avail.ok:
+            agent["until"] = 0.0
+            agent["reason"] = ""
+            return
+        now = self._clock()
+        known = self._known(avail.until, now)
+        agent["until"] = known if known is not None else now + UNAVAILABLE_RETRY_S
+        agent["reason"] = avail.reason
 
     def pick(self) -> Adapter | None:
         """The adapter to run now, or None when every agent is cooling down or unavailable."""
-        for name in self._candidates():
-            agent = self._agents[name]
+        with self._lock:
+            for name in self._candidates():
+                agent = self._agents[name]
+                if agent["until"] > self._clock():
+                    continue
+                adapter = self._adapters[name]
+                avail = read_availability(adapter)
+                self._apply(agent, avail)
+                if avail.ok:
+                    self.current = name
+                    return adapter
+                self._block_unproven(agent)
+            return None
+
+    def _block_unproven(self, agent: dict) -> None:
+        """An agent whose preemption it caused and that now reads not available: the watcher saw
+        it ok and this read says no, so it cannot hold a round, and the watcher must not kill
+        another one for it. Same as a round of it failing at once."""
+        if agent["after_preempt"]:
+            agent["blocked"], agent["after_preempt"] = True, False
+            self._save_quietly()
+
+    def plan_ready_to_check(self) -> list[str]:
+        """The plan agents whose cooldown has passed and that are not blocked, in `order`: the
+        ones worth reading while a metered agent runs. Moves nothing. Nothing at all once the day's
+        preemptions are used up."""
+        with self._lock:
             now = self._clock()
-            if agent["until"] > now:
-                continue
-            adapter = self._adapters[name]
-            try:
-                avail = adapter.availability()
-            except Exception as exc:  # an unreadable agent is an unavailable one
-                avail = Availability(False, reason=f"availability check failed: {exc}")
-            agent["usage"] = dict(avail.usage)
-            if avail.ok:
-                agent["until"] = 0.0
-                agent["reason"] = ""
-                self.current = name
-                return adapter
-            now = self._clock()
-            known = self._known(avail.until, now)
-            agent["until"] = known if known is not None else now + UNAVAILABLE_RETRY_S
-            agent["reason"] = avail.reason
-        return None
+            if len(preempts_in_window(self._preempts, now)) >= MAX_PREEMPTS_PER_DAY:
+                return []
+            return [
+                n
+                for n in self._plan_names()
+                if self._agents[n]["until"] <= now and not self._agents[n]["blocked"]
+            ]
+
+    def record_read(self, name: str, avail: Availability) -> None:
+        """Write down a read made outside `pick`, with the same rules. Never moves `current`."""
+        with self._lock:
+            if name in self._agents:
+                self._apply(self._agents[name], avail)
 
     def next_wake(self) -> float:
         """Epoch of the earliest possible retry, never sooner than 30 s from now."""
-        now = self._clock()
-        untils = [a["until"] for a in self._agents.values() if a["until"] > now]
-        return max(min(untils), now + MIN_WAIT_S) if untils else now + MIN_WAIT_S
+        with self._lock:
+            now = self._clock()
+            untils = [a["until"] for a in self._agents.values() if a["until"] > now]
+            return max(min(untils), now + MIN_WAIT_S) if untils else now + MIN_WAIT_S
 
     # outcomes
 
-    def record(self, agent: str, result: RoundResult) -> None:
-        """Apply the outcome table to `agent`, then write it down if the store allows."""
+    def record(self, agent: str, result: RoundResult, seconds: float | None = None) -> None:
+        """Apply the outcome table to `agent`, then write it down if the store allows.
+
+        `seconds` is how long the round ran; without it no block on preempting is set."""
+        with self._lock:
+            self._record(agent, result, seconds)
+
+    def _record(self, agent: str, result: RoundResult, seconds: float | None) -> None:
         if agent not in self._agents:
             return
         state = self._agents[agent]
@@ -144,6 +260,16 @@ class Scheduler:
         outcome = result.outcome
         if result.resume_failed:
             return  # the round never really ran; it is retried fresh and is not the agent's fault
+        if outcome == PREEMPTED:
+            # ended by baton because a plan agent is back: nobody's failure, no cooldown. The
+            # agent that was back has a round to prove itself with, the next one it runs.
+            if result.back in self._agents:
+                self._agents[result.back]["after_preempt"] = True
+            self._preempts = preempts_in_window([*self._preempts, now], now)
+            self._save_quietly()
+            return
+        if not self._adapters[agent].metered:
+            self._judge_preempt(state, outcome, seconds)
         if outcome in (COMPLETED, TIMEOUT):
             state.update(until=0.0, limit_n=0, transient_n=0, reason="")
         elif outcome == LIMIT:
@@ -160,10 +286,23 @@ class Scheduler:
             state["until"] = now + self._backoff(state, "transient_n", TRANSIENT_BACKOFF)
         if outcome not in (COMPLETED, TIMEOUT):
             state["reason"] = result.reason
+        self._save_quietly()
+
+    def _save_quietly(self) -> None:
         try:
             self.save()
         except (StateError, OSError):
             pass  # memory is authoritative; the next save() writes all of it
+
+    @staticmethod
+    def _judge_preempt(state: dict, outcome: str, seconds: float | None) -> None:
+        """Block or unblock a plan agent for preempting, from a round of its own. The round that
+        follows a preemption it caused is the one that counts against it."""
+        followed, state["after_preempt"] = state["after_preempt"], False
+        if outcome in (COMPLETED, TIMEOUT) or (seconds is not None and seconds >= PREEMPT_PROOF_S):
+            state["blocked"] = False
+        elif followed and seconds is not None:
+            state["blocked"] = True
 
     @staticmethod
     def _backoff(state: dict, counter: str, bounds: tuple[int, int]) -> float:
@@ -176,24 +315,32 @@ class Scheduler:
 
     def snapshot(self) -> dict:
         """Per-agent state for state.json and the panel."""
-        now = self._clock()
-        agents = {}
-        for name, raw in self._agents.items():
-            agents[name] = {
-                "status": "cooldown" if raw["until"] > now else "ready",
-                "until": raw["until"],
-                "limit_n": raw["limit_n"],
-                "transient_n": raw["transient_n"],
-                "reason": raw["reason"],
-                "usage": raw["usage"],
+        with self._lock:
+            now = self._clock()
+            agents = {}
+            for name, raw in self._agents.items():
+                agents[name] = {
+                    "status": "cooldown" if raw["until"] > now else "ready",
+                    "until": raw["until"],
+                    "limit_n": raw["limit_n"],
+                    "transient_n": raw["transient_n"],
+                    "reason": raw["reason"],
+                    "usage": dict(raw["usage"]),
+                    "blocked": raw["blocked"],
+                    "after_preempt": raw["after_preempt"],
+                }
+            return {
+                "current": self.current,
+                "agents": agents,
+                "preempts": preempts_in_window(self._preempts, now),
             }
-        return {"current": self.current, "agents": agents}
 
     def save(self) -> None:
         """Write the rotation into state.json next to whatever else it holds.
 
         Raises StateError when the file cannot be read, and then leaves it alone.
         """
-        state = self._store.load_state()
-        state.update(self.snapshot())
-        self._store.save_state(state)
+        with self._lock:
+            state = self._store.load_state()
+            state.update(self.snapshot())
+            self._store.save_state(state)

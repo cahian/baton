@@ -58,8 +58,13 @@ def test_e2e_a_note_survives_an_agent_that_dies_with_a_429(fakes, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
     monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
     monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "API Error: 429 Too Many Requests")
+    # Codex is full for two seconds, so Claude, the fallback, runs first and then Codex takes over.
+    fakes.codex_scenario(codex_limits(95, reset=time.time() + 2), codex_limits(12))
     goal = fakes.goal(
-        order=("claude_api", "codex"), claude="", verify=f"test -f {fakes.codex_calls_file}"
+        order=("codex", "claude_api"),
+        claude="",
+        agy="enabled = false",
+        verify=f"test -f {fakes.codex_calls_file}",
     )
     Store(state_dir("demo")).say("do not lose me")
     assert main(["run", str(goal)]) == 0

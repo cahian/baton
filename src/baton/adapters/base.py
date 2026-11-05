@@ -7,13 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-COMPLETED, LIMIT, CREDIT_GUARD, AUTH, TRANSIENT, TIMEOUT = (
+COMPLETED, LIMIT, CREDIT_GUARD, AUTH, TRANSIENT, TIMEOUT, PREEMPTED = (
     "completed",
     "limit",
     "credit_guard",
     "auth",
     "transient",
     "timeout",
+    "preempted",
 )
 
 
@@ -25,6 +26,7 @@ class RoundResult:
     until: float | None = None
     reason: str = ""
     resume_failed: bool = False
+    back: str = ""  # PREEMPTED only: the plan agent whose return ended the round
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,9 @@ class RoundContext:
 
 class Adapter(Protocol):
     name: str
+    # True for an agent paid by use, with no reset that would ever stop it: it runs only while
+    # no plan agent can, and a plan agent coming back ends its round.
+    metered: bool
 
     def availability(self) -> Availability: ...
 

@@ -173,6 +173,17 @@ def _is_number(value: object) -> bool:
     return False
 
 
+def _is_percent(value: object) -> bool:
+    """A usage percentage that fits a finite float: 1e5000 or 10**400 is blind, not a number."""
+    if not _is_number(value):
+        return False
+    try:
+        as_float = float(value)  # type: ignore[arg-type]
+    except (OverflowError, ValueError):
+        return False
+    return as_float == as_float and as_float not in (float("inf"), float("-inf"))
+
+
 def _plain(value: object) -> object:
     """JSON-friendly copy of a number for the usage dict."""
     if isinstance(value, Decimal):
@@ -209,6 +220,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
     windows: dict[str, dict] = {}
     balance: Decimal | None = None
     limits: dict | None = None
+    flag_only = False  # ordinaryUsageAllowed=false with no limit named: the cause is unknown
 
     if not isinstance(result, dict):
         blind.append("limits result is not an object")
@@ -231,7 +243,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
             window = limits.get(name)
             if window is None and not required:
                 continue
-            if isinstance(window, dict) and _is_number(window.get("usedPercent")):
+            if isinstance(window, dict) and _is_percent(window.get("usedPercent")):
                 windows[name] = window
                 usage[f"{name}_pct"] = _plain(window["usedPercent"])
             else:
@@ -245,6 +257,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
             blind.append("ordinaryUsageAllowed is missing or not a boolean")
         elif allowed is False:
             reasons.append("ordinary usage is not allowed")
+            flag_only = limits.get("rateLimitReachedType") is None
 
     saturated = []
     for name, window in windows.items():
@@ -256,9 +269,22 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
         return Eval(Availability(True, usage=usage), False, False, balance)
 
     def resets(group: list[dict]) -> list[float]:
-        return [float(w["resetsAt"]) for w in group if _is_number(w.get("resetsAt"))]
+        # A reset that does not fit a finite float (10**400, 1e999) is no reset.
+        epochs = []
+        for w in group:
+            if _is_number(w.get("resetsAt")):
+                try:
+                    epoch = float(w["resetsAt"])
+                except OverflowError:
+                    continue
+                if epoch == epoch and epoch not in (float("inf"), float("-inf")):
+                    epochs.append(epoch)
+        return epochs
 
-    if reasons:
+    if reasons and flag_only and not saturated:
+        # No window explains the refusal, and the latest window reset can be days away.
+        until = now + RETRY_S
+    elif reasons:
         known = resets(saturated) or resets(list(windows.values()))
         until = max(known) if known else None
         if until is not None and until <= now:
@@ -305,6 +331,7 @@ def _event_message(event: dict) -> str:
 
 class CodexAdapter:
     name = "codex"
+    metered = False
     # Seconds between the runner's checks; the limits are read every cfg.poll_s of poll_clock.
     tick_s = 1.0
 

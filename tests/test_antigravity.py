@@ -980,3 +980,28 @@ def test_only_the_agent_acting_counts_as_work(line, work):
     adapter = AntigravityAdapter(make_cfg())
     assert adapter.render(line)  # the person sees all of them
     assert adapter.is_work(line) is work
+
+
+# --- a read of the wrong type must not lose the balance --------------------------------------
+
+
+@pytest.mark.parametrize("junk", [None, b"bytes", 5], ids=["none", "bytes", "int"])
+def test_a_usage_answer_of_the_wrong_type_does_not_hide_a_balance_drop(junk):
+    from baton.adapters.antigravity import evaluate
+    from baton.adapters.guard import Guard
+
+    reads = Reads([usage(), junk], [credits("10"), credits("9")])
+    a = AntigravityAdapter(make_cfg(), read=reads, poll_clock=Clock())
+    guard = Guard(a.cfg, a._read, evaluate, Clock(), lambda: NOW)
+    assert guard.start() is None
+    res = guard.tick()
+    assert res is not None and res.outcome == CREDIT_GUARD and "dropped" in res.reason
+
+
+def test_a_credits_answer_of_the_wrong_type_is_blind_not_a_crash():
+    from baton.adapters.antigravity import evaluate
+
+    reads = Reads([usage()], [None])
+    a = AntigravityAdapter(make_cfg(), read=reads, poll_clock=Clock())
+    ev = evaluate(a._read(), 90, NOW)
+    assert ev.blind and ev.balance is None and not ev.avail.ok

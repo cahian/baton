@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -16,6 +17,7 @@ from baton.adapters.base import (
     AUTH,
     COMPLETED,
     CREDIT_GUARD,
+    PREEMPTED,
     TIMEOUT,
     TRANSIENT,
     Adapter,
@@ -24,7 +26,7 @@ from baton.adapters.base import (
 )
 from baton.config import Goal
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, clean_env, kill_group, process_start
-from baton.scheduler import Scheduler
+from baton.scheduler import Scheduler, read_availability
 from baton.store import Store, workdir_lock
 
 GATE_TAIL_CHARS = 4000
@@ -39,6 +41,10 @@ COMMITS_MAX_CHARS = 2000
 # this length, so an agent that exits at once cannot burn quota in a tight loop.
 MIN_ROUND_S = 30
 GATE_POLL_S = 0.5
+# While a metered agent runs, the plan agents are read at most this often (seconds), and the
+# watcher is given this long to finish when the round ends.
+PREEMPT_POLL_S = 30
+PREEMPT_JOIN_S = 2
 # What a shell exits with when it cannot run the command: not executable, not found.
 UNRUNNABLE_EXITS = (126, 127)
 GATE_EXIT_RE = re.compile(r"\[exit code (\d+)\]\Z")
@@ -289,6 +295,60 @@ def commits_since(workdir: Path, sha: str) -> str:
     if len(text) > COMMITS_MAX_CHARS:
         text = text[:COMMITS_MAX_CHARS].rsplit("\n", 1)[0] + "\n..."
     return text
+
+
+# preemption
+
+
+class PreemptionWatch:
+    """Reads the plan agents from a thread of its own while a metered round runs.
+
+    Every read happens here, never in the stream's callback, so a slow read cannot hold up the
+    stream. It looks at most once per `poll_s`, and only at plan agents past their cooldown; each
+    answer goes back through `Scheduler.record_read`, so a "no" (or a read that raised) moves that
+    agent's `until` out and it is not asked again before then. The first agent that reads ok is
+    left in `back` and `found` is set; the runner's should-kill callback does the killing.
+    """
+
+    def __init__(self, sched: Scheduler, adapters: Mapping[str, Adapter], poll_s: float) -> None:
+        self._sched = sched
+        self._adapters = adapters
+        self._poll_s = poll_s
+        self._over = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="baton-preempt", daemon=True)
+        self.found = threading.Event()
+        self.back = ""
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """End the watch and wait a bounded time for it. A read still stuck is abandoned: the
+        thread is a daemon, and its answer is dropped."""
+        self._over.set()
+        self._thread.join(timeout=PREEMPT_JOIN_S)
+
+    def _run(self) -> None:
+        while not self._over.wait(self._poll_s):
+            try:
+                for name in self._sched.plan_ready_to_check():
+                    avail = read_availability(self._adapters[name])
+                    if self._over.is_set():
+                        return  # the round is over: a late answer is nobody's to act on
+                    self._sched.record_read(name, avail)
+                    if avail.ok:
+                        self.back = name
+                        self.found.set()
+                        return
+            except Exception:
+                pass  # a failed check leaves the round running
+
+
+def preempted_sentence(event: Mapping) -> str:
+    """What the person reads for a `round_end` that ended because a plan agent came back."""
+    back = event.get("back") or "a plan agent"
+    agent, n = event.get("agent"), event.get("round")
+    return f"round {n}: {agent} stopped because {back} is available again"
 
 
 # the loop
@@ -637,6 +697,12 @@ class _Run:
         worked = False
         killed = False
         interrupted = False
+        preempted = False
+        watch = (
+            PreemptionWatch(self.sched, self.adapters, PREEMPT_POLL_S)
+            if getattr(adapter, "metered", False)
+            else None
+        )
 
         def on_output(line: str) -> None:
             nonlocal buf, worked
@@ -652,7 +718,7 @@ class _Run:
                 self.emit("output", agent=agent, round=n, text=text)
 
         def should_kill() -> bool:
-            nonlocal killed, interrupted
+            nonlocal killed, interrupted, preempted
             if killed:
                 return True
             try:
@@ -662,6 +728,8 @@ class _Run:
                     killed = interrupted = True
             except OSError:
                 pass
+            if not killed and watch is not None and watch.found.is_set():
+                killed = preempted = True  # a stop or a note, seen above, takes precedence
             return killed
 
         spawned = False
@@ -712,19 +780,31 @@ class _Run:
                 return RoundResult(TRANSIENT, reason=f"adapter error: {type(exc).__name__}")
 
         started = self.clock()
-        result = attempt(sid)
-        if result.resume_failed and sid is not None:
-            self.sessions.pop(agent, None)
-            self.emit("alert", agent=agent, message="resume failed: running the round fresh")
-            # The failed attempt delivered nothing: the fresh one decides what was spent.
-            spawned = worked = False
-            buf = ""
-            result = attempt(None)
+        if watch is not None:
+            watch.start()
+        try:
+            result = attempt(sid)
+            if result.resume_failed and sid is not None:
+                self.sessions.pop(agent, None)
+                self.emit("alert", agent=agent, message="resume failed: running the round fresh")
+                # The failed attempt delivered nothing: the fresh one decides what was spent.
+                spawned = worked = False
+                buf = ""
+                result = attempt(None)
+        finally:
+            if watch is not None:
+                watch.stop()
+        if preempted and watch is not None and result.outcome in (COMPLETED, TIMEOUT, TRANSIENT):
+            # What the adapter made of being killed (a stop, a crash) is not the round's story.
+            # A credit_guard, limit or auth that came with it is real and stays.
+            result = RoundResult(
+                PREEMPTED, reason=f"{watch.back} is available again", back=watch.back
+            )
 
         self.group = None
         ended = self.clock()
         # Record first: nothing after this can lose a credit_guard or limit outcome.
-        self.sched.record(agent, result)
+        self.sched.record(agent, result, seconds=ended - started)
         if result.outcome in (CREDIT_GUARD, AUTH):
             self.emit("alert", agent=agent, outcome=result.outcome, reason=result.reason)
         snapshotted = snapshot_work(goal, n, agent)
@@ -755,6 +835,7 @@ class _Run:
             seconds=round(ended - started, 1),
             interrupted=interrupted,
             snapshot=snapshotted,
+            back=watch.back if result.outcome == PREEMPTED and watch is not None else None,
         )
         self.persist_softly()
         return not goal.verify_command and result.outcome == COMPLETED and not killed

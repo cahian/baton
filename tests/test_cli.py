@@ -160,6 +160,44 @@ def test_status_prints_cooldowns(fakes, capsys):
     assert "limit" in out  # the last event
 
 
+def test_status_says_in_a_sentence_which_agent_came_back(fakes, capsys):
+    store = store_for(fakes)
+    store.save_state({"round": 4, "current": "claude_api", "agents": {}})
+    store.emit(
+        "round_end",
+        round=4,
+        agent="claude_api",
+        outcome="preempted",
+        reason="codex is available again",
+        back="codex",
+        seconds=12.0,
+    )
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "round 4: claude_api stopped because codex is available again" in out
+    assert "outcome=preempted" not in out
+
+
+def test_status_says_when_the_daily_preemption_cap_is_active(fakes, capsys):
+    store = store_for(fakes)
+    now = time.time()
+    first = now - 3600
+    store.save_state({"round": 9, "agents": {}, "preempts": [first + i for i in range(6)]})
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "ended 6 times in the last 24 hours" in out
+    assert cli._when(first + 24 * 3600) in out
+
+
+def test_status_is_silent_about_the_cap_below_it_or_with_old_or_damaged_times(fakes, capsys):
+    store = store_for(fakes)
+    now = time.time()
+    for preempts in ([now - i for i in range(5)], [now - 90_000 - i for i in range(6)], "oops"):
+        store.save_state({"round": 9, "agents": {}, "preempts": preempts})
+        assert main(["status", str(fakes.goal())]) == 0
+        assert "preempt" not in capsys.readouterr().out.lower()
+
+
 def test_status_reports_a_live_runner(fakes, capsys):
     holder = subprocess.Popen(
         [

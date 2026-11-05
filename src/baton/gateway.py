@@ -29,7 +29,7 @@ from urllib.parse import quote
 from baton.adapters.base import Adapter
 from baton.config import Goal, GoalError, check_repo_table, goal_from_table
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group
-from baton.runner import run_goal
+from baton.runner import preempted_sentence, run_goal
 from baton.store import (
     AlreadyRunning,
     StateError,
@@ -257,6 +257,8 @@ def render_event(kind: str, f: Mapping) -> str:
         return f"\n[baton] round {n}: {agent}{resumed}\n\n"
     if kind == "round_end":
         outcome = f.get("outcome")
+        if outcome == "preempted":
+            return f"\n[baton] {preempted_sentence(f)}.\n\n"
         if outcome == "completed" and not f.get("interrupted"):
             return ""
         why = f" ({f['reason']})" if f.get("reason") else ""

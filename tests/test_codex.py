@@ -341,6 +341,17 @@ def test_check_limits_flag_block_falls_back_to_latest_reset():
     assert a.until == NOW + 2000
 
 
+def test_the_flag_alone_does_not_wait_for_the_latest_window_reset():
+    # at 12% and 31% used no window explains the refusal: the cause is unknown, so ask again soon
+    a = check_limits(limits(allowed=False), 90, NOW)
+    assert not a.ok and a.until == NOW + 300
+
+
+def test_the_flag_with_a_window_at_the_threshold_keeps_that_windows_reset():
+    r = limits(allowed=False, primary=95, primary_reset=NOW + 700, secondary_reset=NOW + 9000)
+    assert check_limits(r, 90, NOW).until == NOW + 700
+
+
 # --- balance ---------------------------------------------------------------------------------
 
 
@@ -847,3 +858,109 @@ def test_only_the_agent_acting_counts_as_work(line, work):
     adapter = CodexAdapter(make_cfg(), read=lambda: {})
     assert adapter.render(line)  # the person sees all of them
     assert adapter.is_work(line) is work
+
+
+# --- a read that cannot be judged must not lose the balance ----------------------------------
+
+
+def _guard(reads):
+    from baton.adapters.codex import evaluate
+    from baton.adapters.guard import Guard
+
+    clock = iter(range(0, 10_000, 100))
+    it = iter(reads)
+    return Guard(make_cfg(), lambda: next(it), evaluate, lambda: next(clock), lambda: NOW)
+
+
+def _flag_without_reached_type(balance):
+    return without(limits(balance=balance, allowed=False), "rateLimits", "rateLimitReachedType")
+
+
+def test_the_flag_false_without_a_reached_type_does_not_raise():
+    a = check_limits(_flag_without_reached_type("9"), 90, NOW)
+    assert not a.ok and "rateLimitReachedType is missing" in a.reason and a.until == NOW + 300
+
+
+def test_a_balance_drop_in_a_read_with_no_reached_type_and_the_flag_false_is_credit_guard():
+    guard = _guard([limits(balance="10"), _flag_without_reached_type("9")])
+    assert guard.start() is None
+    res = guard.tick()
+    assert res is not None and res.outcome == CREDIT_GUARD and "dropped" in res.reason
+
+
+def test_the_closing_read_sees_a_drop_in_a_read_with_no_reached_type_and_the_flag_false():
+    guard = _guard([limits(balance="10"), _flag_without_reached_type("9")])
+    assert guard.start() is None
+    res = guard.close()
+    assert res is not None and res.outcome == CREDIT_GUARD and "dropped" in res.reason
+
+
+def test_a_reset_too_large_for_a_float_is_not_a_reset():
+    r = limits(primary=95, primary_reset=10**400, secondary_reset=10**400)
+    a = check_limits(r, 90, NOW)
+    assert not a.ok and a.until is None  # refused, reset unknown: the scheduler backs off
+
+
+# --- a read that cannot be judged counts as unreadable ---------------------------------------
+
+
+def test_a_used_percent_beyond_a_float_is_a_blind_field_not_an_exception():
+    huge = Decimal("1e5000")
+    a = check_limits(limits(primary=huge), 90, NOW)
+    assert not a.ok and "primary window is missing or unreadable" in a.reason
+
+
+def test_a_balance_drop_beside_a_used_percent_beyond_a_float_is_credit_guard_in_tick():
+    guard = _guard([limits(balance="100"), limits(primary=Decimal("1e5000"), balance="90")])
+    assert guard.start() is None
+    res = guard.tick()
+    assert res is not None and res.outcome == CREDIT_GUARD and "dropped" in res.reason
+
+
+def test_a_balance_drop_beside_a_used_percent_beyond_a_float_is_credit_guard_in_close():
+    guard = _guard([limits(balance="100"), limits(primary=Decimal("1e5000"), balance="90")])
+    assert guard.start() is None
+    res = guard.close()
+    assert res is not None and res.outcome == CREDIT_GUARD and "dropped" in res.reason
+
+
+def test_an_evaluate_that_raises_is_a_blind_read_in_tick_and_credit_guard_on_the_second():
+    from baton.adapters.guard import Guard
+
+    def boom(result, threshold, now):
+        raise ValueError("boom")
+
+    clock = iter(range(0, 10_000, 100))
+    guard = Guard(make_cfg(), lambda: {}, boom, lambda: next(clock), lambda: NOW)
+    guard.baseline = Decimal(100)
+    guard.last_poll = -1000.0
+    assert guard.tick() is None and guard.failures == 1
+    res = guard.tick()
+    assert res is not None and res.outcome == CREDIT_GUARD and "could not be judged" in res.reason
+
+
+def test_an_evaluate_that_raises_is_credit_guard_from_close():
+    from baton.adapters.guard import Guard
+
+    def boom(result, threshold, now):
+        raise ValueError("boom")
+
+    reads = []
+    guard = Guard(make_cfg(), lambda: reads.append(1) or {}, boom, lambda: 0.0, lambda: NOW)
+    guard.baseline = Decimal(100)
+    res = guard.close()
+    assert res is not None and res.outcome == CREDIT_GUARD and "could not be judged" in res.reason
+    assert len(reads) == 2  # retried once
+
+
+def test_an_evaluate_that_raises_at_start_is_a_limit_and_nothing_spawns(tmp_path):
+    from baton.adapters.guard import Guard, run_guarded
+
+    def boom(result, threshold, now):
+        raise ValueError("boom")
+
+    guard = Guard(make_cfg(), lambda: {}, boom, lambda: 0.0, lambda: NOW)
+    ran = []
+    res = run_guarded(guard, make_ctx(tmp_path), "codex", lambda c: ran.append(1) or None)
+    assert res.outcome == LIMIT and res.until == NOW + 300 and "could not be judged" in res.reason
+    assert not ran

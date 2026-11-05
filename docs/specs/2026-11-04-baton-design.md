@@ -52,7 +52,16 @@ snapshot uncommitted work
 run gate
 ```
 
-The current agent keeps working until it becomes unavailable, then the rotation moves to the other agent. With a limited reset time known for both, the wait ends at the earliest one, and that agent continues. Rotation is sticky and cyclic through `order`: an agent coming back does not preempt the one working. The initial agent is the first in `order`, and when the last agent in `order` runs out the rotation wraps to the first available one.
+Agents come in two kinds. Plan agents (`codex`, `antigravity`) have included usage that comes back at a reset; a metered agent (`claude_api`) is paid by use and has no reset that would ever stop it, so it would run until the credit is gone. The rotation therefore treats a metered agent as a fallback, wherever it appears in `order`:
+
+- The current plan agent keeps working until it becomes unavailable, then the rotation moves to the next plan agent in `order`, wrapping around. A plan agent that comes back does not preempt another plan agent that is working.
+- A metered agent runs only while no plan agent is available.
+- While a metered agent runs, the plan agents are read (without a model call) from their reset time onward. As soon as one reads available, the metered round is killed and that agent takes over. If both are available, the first in `order` goes first. This preemption is not a failure and gives the metered agent no cooldown.
+- A plan agent that reads available but whose round, right after such a preemption, fails (anything but `completed` or `timeout`) within 300 s is blocked from preempting: it is no longer read while a metered agent runs, so one bad agent cannot cost a metered round per attempt. The block is kept in `state.json`. It ends when a round of that agent completes, times out or lasts at least 300 s. At a round boundary the agent is still picked as usual. An agent that carries the mark from its preemption and then reads not available in that pick (the watcher read it available, the pick says no) is blocked at once, as if its round had failed immediately.
+- At most 6 preemptions (`MAX_PREEMPTS_PER_DAY`) are made in any 24 hours, whatever the cause: the times are kept in `state.json`, and once 6 are in the window the plan agents are no longer read while a metered agent runs, bounding the ledger overcount at 6 rounds' budgets a day. Selection at a round boundary is unaffected, and `baton status` says when the cap is active.
+- With no agent available, the wait ends at the earliest known reset.
+
+A preempted Claude round has no `result` event, so its whole reservation stays counted. That overcounts and never overspends; `round_budget_usd` defaults to 5 USD to keep it small.
 
 Exceptions in the loop are logged, followed by a 60 s sleep, then the loop continues. Only a passing gate, a stop request or a termination signal ends the process.
 
@@ -98,7 +107,7 @@ Start a round only if all hold, otherwise the agent is unavailable:
 
 While a round runs, read limits every `poll_s` (default 15). Stop the round, with `limit`, when any start condition fails. Stop it, with `credit_guard`, as soon as the balance is below the balance read immediately before the round. Compare with `Decimal`. Two consecutive failed reads stop the round with `credit_guard`: being blind is treated as danger.
 
-`resetsAt` of the saturated window, or the latest one if several, sets the cooldown.
+`resetsAt` of the saturated window, or the latest one if several, sets the cooldown. When `ordinaryUsageAllowed` is false and no window is at the threshold, the cause is unknown and the agent is read again after 5 min.
 
 Command:
 
@@ -157,7 +166,7 @@ Spend tracking is a ledger shared across all goals at `~/.local/state/baton/clau
 
 - Spend comes from `total_cost_usd` in the `result` event. It is a local estimate, so `reserve_pct` also absorbs its error.
 - A period starts on `budget_reset_day` (default 1) at 00:00 UTC.
-- Before a round, atomically reserve `round_budget_usd` (default 10). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 5 USD the agent is unavailable until the next period.
+- Before a round, atomically reserve `round_budget_usd` (default 5). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 5 USD the agent is unavailable until the next period.
 - After a round, replace the reservation with the actual cost. If a round ends with no `result` event, the full reservation stays counted. Crashes therefore overcount and never undercount.
 - An unreadable or corrupt ledger means unavailable. Never recreate it silently.
 
@@ -259,7 +268,7 @@ model = "claude-opus-5-5"
 effort = "medium"
 monthly_budget_usd = 200
 reserve_pct = 10
-round_budget_usd = 10
+round_budget_usd = 5
 budget_reset_day = 1
 key_file = "~/.config/baton/anthropic.key"
 admin_key_file = ""

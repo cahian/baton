@@ -2,12 +2,14 @@ import json
 import os
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
+from conftest import codex_limits
 
 from baton.adapters import claude_api
 from baton.adapters.base import (
@@ -82,6 +84,7 @@ def make_cfg(env, **kw) -> AgentConfig:
         bin=env.bin,
         full_access=True,
         key_file=str(env.key),
+        round_budget_usd=Decimal("10"),  # the adapter's mechanics; the default has its own test
     )
     d.update(kw)
     return AgentConfig(**d)
@@ -312,7 +315,9 @@ def test_the_key_does_not_reach_the_next_agents_process(fakes, monkeypatch):
 
     fakes.claude_key(KEY)
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "0")
-    goal = fakes.goal(claude="", order=("claude_api", "codex"))
+    # Codex is full for two seconds, so Claude, the fallback, takes this round.
+    fakes.codex_scenario(codex_limits(95, reset=time.time() + 2), codex_limits(12))
+    goal = fakes.goal(claude="", order=("codex", "claude_api"), agy="enabled = false")
     assert main(["run", str(goal)]) == 0  # no verify: finishes after the Claude round
     assert fakes.claude_calls()[0]["env"]["ANTHROPIC_API_KEY"] == KEY
     # a Codex round afterwards: it sees no Anthropic variable at all
@@ -392,6 +397,7 @@ def test_missing_key_is_unavailable_and_nonblocking(env, tmp_path):
 
     class Other:
         name = "codex"
+        metered = False
 
         def availability(self):
             return Availability(True)
@@ -607,6 +613,38 @@ def test_a_stop_request_ends_the_round_and_keeps_the_reservation(env, monkeypatc
     result = run(env, should_kill=seen.is_set, on_spawn=lambda pid: seen.set())
     assert result.outcome == COMPLETED
     assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_a_refusal_already_on_the_stream_wins_over_a_stop_that_lands_before_the_exit(
+    env, monkeypatch
+):
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "Credit balance is too low")
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "0")
+    monkeypatch.setenv("FAKE_CLAUDE_LINGER", "30")
+    seen = threading.Event()
+    adapter = make_adapter(env)
+    result = run(
+        env,
+        adapter,
+        on_output=lambda line: seen.set() if "Credit balance" in line else None,
+        should_kill=seen.is_set,  # the error result is on the stream, the process is still alive
+    )
+    assert result.outcome == LIMIT and result.until == NEXT_PERIOD
+    assert env.ledger.exhausted()
+    assert not adapter.availability().ok
+
+
+def test_a_stop_on_a_healthy_stream_is_still_a_stop(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_LINGER", "30")
+    seen = threading.Event()
+    result = run(
+        env,
+        on_output=lambda line: seen.set() if "working" in line else None,
+        should_kill=seen.is_set,
+    )
+    assert result.outcome == COMPLETED and result.reason == "stop requested"
+    assert not env.ledger.exhausted()
 
 
 def test_a_timeout_is_a_timeout_and_keeps_the_reservation(env, monkeypatch):

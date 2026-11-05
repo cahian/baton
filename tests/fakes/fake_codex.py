@@ -81,7 +81,10 @@ def app_server() -> None:
 def exec_cmd() -> None:
     pidfile = os.environ.get("FAKE_CODEX_EXEC_PIDFILE")
     if pidfile:
-        Path(pidfile).write_text(str(os.getpid()))
+        # In one step: a test that sees the file must also see the number in it.
+        partial = Path(f"{pidfile}.{os.getpid()}")
+        partial.write_text(str(os.getpid()))
+        partial.replace(pidfile)
     stdin_text = sys.stdin.read()
     calls = os.environ.get("FAKE_CODEX_CALLS")
     if calls:

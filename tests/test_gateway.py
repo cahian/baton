@@ -27,8 +27,9 @@ TOOLS = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
 class Fake:
     """Scripted adapter. A step is `fn(agent, prompt, ctx) -> RoundResult`."""
 
-    def __init__(self, name):
+    def __init__(self, name, metered=False):
         self.name = name
+        self.metered = metered
         self.script = []
         self.prompts = []
         self.sessions = []
@@ -191,7 +192,8 @@ def gw(fakes, monkeypatch, tmp_path):
     db = tmp_path / "opencode.db"
     make_db(db, [(SESSION, str(fakes.work)), ("ses_other", str(fakes.work))])
     monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
-    # These tests drive claude_api first; the real default now starts with codex.
+    # These tests drive the fake named claude_api first. It is declared non-metered: they test
+    # the gateway's mechanics, and the real claude_api would run only after the plan agents.
     monkeypatch.setattr(config, "DEFAULT_ORDER", ("claude_api", "antigravity", "codex"))
     agents = {"claude_api": Fake("claude_api"), "codex": Fake("codex")}
 
@@ -640,6 +642,21 @@ def test_a_wait_states_each_agent_s_real_reason(gw):
 def test_an_agent_that_gives_no_reason_is_not_left_out():
     text = gateway.render_event("wait", {"seconds": 60, "agents": {"codex": {"reason": ""}}})
     assert "- codex: it gave no reason" in text
+
+
+def test_a_preempted_round_says_which_agent_came_back():
+    text = gateway.render_event(
+        "round_end",
+        {
+            "round": 4,
+            "agent": "claude_api",
+            "outcome": "preempted",
+            "reason": "codex is available again",
+            "back": "codex",
+        },
+    )
+    assert "[baton] round 4: claude_api stopped because codex is available again." in text
+    assert "preempted" not in text
 
 
 def test_a_wait_with_its_own_reason_keeps_it():
@@ -1453,6 +1470,11 @@ def test_serve_kill_9_kills_the_orphan_and_resumes_the_job(fakes, monkeypatch, t
         pid = int(fakes.codex_pidfile.read_text())
         state = Store(state_dir(gateway.job_name(SESSION)))
         assert wait_for(lambda: state.load_state().get("group") == pid)
+        # The group is saved at spawn, the session id only once the agent's first line is read: a
+        # kill between the two leaves nothing to resume. Its last line being in means the id is
+        # saved and the agent writes nothing more, which a closed pipe would end it for.
+        assert wait_for(lambda: any(e["kind"] == "output" for e in state.events()))
+        assert state.load_state()["sessions"] == {"codex": "thread-1"}
         first.kill()
         first.wait()
         assert _alive(pid), "the agent should outlive a server killed with SIGKILL"

@@ -11,6 +11,7 @@ from baton.adapters.base import (
     COMPLETED,
     CREDIT_GUARD,
     LIMIT,
+    PREEMPTED,
     TIMEOUT,
     TRANSIENT,
     Availability,
@@ -49,8 +50,9 @@ class World:
 class Fake:
     """Scripted adapter. Each script step is `fn(agent, prompt, ctx) -> RoundResult`."""
 
-    def __init__(self, name):
+    def __init__(self, name, metered=False):
         self.name = name
+        self.metered = metered
         self.avail = Availability(True)
         self.script = []
         self.prompts = []
@@ -121,13 +123,20 @@ def store(tmp_path):
     return Store(tmp_path / "state")
 
 
-def make_goal(tmp_path, work, verify="test -f DONE", snapshot=False, verify_extra=""):
+def make_goal(
+    tmp_path,
+    work,
+    verify="test -f DONE",
+    snapshot=False,
+    verify_extra="",
+    order='"codex", "antigravity"',
+):
     lines = [
         'name = "demo"',
         f'workdir = "{work}"',
         f'objective = "{OBJECTIVE}"',
         f"snapshot = {str(snapshot).lower()}",
-        'order = ["codex", "antigravity"]',
+        f"order = [{order}]",
     ]
     if verify:
         lines += ["[verify]", f'command = "{verify}"', verify_extra]
@@ -1722,3 +1731,567 @@ def test_a_restart_does_not_repeat_the_warning(go, tmp_path, agents, work, store
     assert len(warnings(store)) == 1
     go(goal)
     assert len(warnings(store)) == 1
+
+
+# a metered round gives way to a plan agent that comes back
+
+FALLBACK = '"codex", "antigravity", "claude_api"'
+
+
+@pytest.fixture
+def fallback(tmp_path, work, store, agents, world, monkeypatch):
+    """Codex and Antigravity are out until t0 + 3600; claude_api (metered) is next to run."""
+    monkeypatch.setattr(runner, "PREEMPT_POLL_S", 0.02)
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    for name in ("codex", "antigravity"):
+        agents[name].avail = Availability(False, until=world.now + 3600, reason="used up")
+    goal = make_goal(tmp_path, work, order=FALLBACK)
+
+    class Setup:
+        pass
+
+    setup = Setup()
+    setup.goal, setup.agents, setup.world, setup.work, setup.store = (
+        goal,
+        agents,
+        world,
+        work,
+        store,
+    )
+    setup.run = lambda: run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep)  # noqa: E501
+    return setup
+
+
+def comes_back(f, name="codex"):
+    """Make `name` read as available, the way time passing would."""
+    f.agents[name].avail = Availability(True)
+    f.world.now += 4000
+
+
+def until_true(ctx, seconds=3.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if ctx.should_kill():
+            return True
+        time.sleep(0.005)
+    raise AssertionError("the round was never ended")
+
+
+def test_a_metered_round_is_ended_when_a_plan_agent_reads_available(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        comes_back(f)
+        until_true(ctx)
+        return RoundResult(TRANSIENT, reason="killed")  # whatever Claude makes of its own kill
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert [(e["agent"], e["outcome"]) for e in ends] == [
+        ("claude_api", PREEMPTED),
+        ("codex", COMPLETED),
+    ]
+    assert "codex" in ends[0]["reason"] and ends[0]["back"] == "codex"
+    state = store.load_state()["agents"]["claude_api"]
+    assert state["until"] == 0 and state["transient_n"] == 0 and state["limit_n"] == 0
+    assert state["reason"] == ""
+    assert f.world.sleeps == []  # no backoff, no pause
+
+
+@pytest.mark.parametrize("outcome", [LIMIT, AUTH, CREDIT_GUARD])
+def test_a_refusal_that_came_with_the_kill_is_not_turned_into_a_preemption(
+    fallback, store, outcome
+):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        comes_back(f)
+        until_true(ctx)  # the kill lands, and the adapter had already seen the API refuse
+        return RoundResult(outcome, until=f.world.now + 7200, reason="Credit balance is too low")
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    first = [e for e in store.events() if e["kind"] == "round_end"][0]
+    assert first["agent"] == "claude_api" and first["outcome"] == outcome
+    assert first["back"] is None
+    assert store.load_state()["agents"]["claude_api"]["until"] > f.world.now
+
+
+def test_the_next_pick_after_a_preemption_is_the_plan_agent(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        comes_back(f, "antigravity")
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["antigravity"].script = [done(f.work)]
+    assert f.run() == 0
+    starts = [e["agent"] for e in store.events() if e["kind"] == "round_start"]
+    assert starts == ["claude_api", "antigravity"]
+    assert len(f.agents["codex"].prompts) == 0
+    first = [e for e in store.events() if e["kind"] == "round_end"][0]
+    assert first["outcome"] == PREEMPTED and first["back"] == "antigravity"
+
+
+def test_a_preempted_round_is_followed_by_the_gate_and_a_snapshot(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("half done")
+        (f.work / "PARTIAL").write_text("x")
+        comes_back(f)
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    kinds_seen = kinds(store)
+    first_end = kinds_seen.index("round_end")
+    assert [e["outcome"] for e in store.events() if e["kind"] == "round_end"][0] == PREEMPTED
+    assert kinds_seen[first_end + 1] == "gate"  # the gate runs as after any round that worked
+    assert "half done" in f.agents["codex"].prompts[0]  # the tail reaches the next agent
+
+
+def test_no_availability_read_of_a_plan_agent_before_its_until(fallback):
+    f = fallback
+    calls, during = [], []
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working")
+        for name in ("codex", "antigravity"):
+            f.agents[name].availability = lambda n=name: (calls.append(n), Availability(True))[1]
+        time.sleep(0.3)  # many polls, but the cooldowns have not passed
+        during.extend(calls)
+        assert ctx.should_kill() is False
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    f.run()
+    assert during == []
+
+
+def test_reads_at_most_once_per_poll_and_a_no_refreshes_until(fallback, store, monkeypatch):
+    f = fallback
+    monkeypatch.setattr(runner, "PREEMPT_POLL_S", 0.1)
+    calls, during = [], []
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working")
+        f.world.now += 4000  # both cooldowns are over
+
+        def no(n):
+            calls.append(n)
+            return Availability(False, until=f.world.now + 3600, reason="still full")
+
+        for name in ("codex", "antigravity"):
+            f.agents[name].availability = lambda n=name: no(n)
+        time.sleep(0.55)
+        during.extend(calls)
+        assert ctx.should_kill() is False
+        for name in ("codex", "antigravity"):  # let the loop move on to codex
+            f.agents[name].availability = lambda: Availability(True)
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    f.run()
+    # one read each at the first poll; the answer pushed `until` out, so no more after that
+    assert sorted(during) == ["antigravity", "codex"]
+
+
+def test_a_read_that_raises_leaves_the_round_running_and_refreshes_until(fallback):
+    f = fallback
+    calls, during = [], []
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working")
+        f.world.now += 4000
+
+        def boom():
+            calls.append(1)
+            raise RuntimeError("cannot read")
+
+        f.agents["codex"].availability = boom
+        f.agents["antigravity"].availability = lambda: Availability(
+            False, until=f.world.now + 3600, reason="full"
+        )
+        time.sleep(0.4)
+        during.extend(calls)
+        assert ctx.should_kill() is False
+        for name in ("codex", "antigravity"):  # let the loop move on to codex
+            f.agents[name].availability = lambda: Availability(True)
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    f.run()
+    assert len(during) == 1  # asked again only after the refreshed until
+
+
+def test_a_slow_read_never_blocks_the_stream(fallback, store):
+    f = fallback
+    release, entered = threading.Event(), threading.Event()
+    lines_seen = []
+
+    def claude(agent, prompt, ctx):
+        f.world.now += 4000
+
+        def slow():
+            entered.set()
+            release.wait(10)
+            return Availability(False, until=f.world.now + 3600)
+
+        f.agents["codex"].availability = slow
+        f.agents["antigravity"].availability = slow
+        time.sleep(0.15)  # the watcher is now stuck inside the read
+        for i in range(20):
+            ctx.on_output(f"line {i}")
+            lines_seen.append(i)
+            assert ctx.should_kill() is False
+        for name in ("codex", "antigravity"):  # let the loop move on to codex
+            f.agents[name].availability = lambda: Availability(True)
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    started = time.monotonic()
+    try:
+        f.run()
+    finally:
+        release.set()
+    assert entered.is_set()  # the watcher really was inside the read
+    assert len(lines_seen) == 20
+    assert time.monotonic() - started < 8  # the stuck read did not hold the end of the round
+
+
+def test_the_watcher_thread_is_gone_after_the_round_even_when_it_raises(fallback, store):
+    f = fallback
+    before = {t.ident for t in threading.enumerate()}
+
+    def claude(agent, prompt, ctx):
+        f.world.now += 4000
+        time.sleep(0.1)
+        raise KeyboardInterrupt
+
+    f.agents["claude_api"].script = [claude]
+    with pytest.raises(KeyboardInterrupt):
+        f.run()
+    time.sleep(0.2)
+    assert {t.ident for t in threading.enumerate()} <= before
+
+
+def test_a_plan_round_is_never_preempted(go, agents, work, store, monkeypatch):
+    monkeypatch.setattr(runner, "PREEMPT_POLL_S", 0.01)
+    calls = []
+    agents["antigravity"].availability = lambda: (calls.append(1), Availability(True))[1]
+
+    def codex(agent, prompt, ctx):
+        ctx.on_output("working")
+        time.sleep(0.2)
+        assert ctx.should_kill() is False
+        (work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [codex]
+    assert go() == 0
+    assert calls == []
+    assert [e["outcome"] for e in store.events() if e["kind"] == "round_end"] == [COMPLETED]
+
+
+def test_a_stop_request_wins_over_preemption(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working")
+        store.request_stop("now")
+        comes_back(f)
+        time.sleep(0.2)  # the watcher has found codex by now
+        assert ctx.should_kill() is True
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    f.agents["claude_api"].script = [claude]
+    assert f.run() == 0
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert [e["outcome"] for e in ends] == [COMPLETED]  # not preempted
+    assert kinds(store)[-1] == "stopped"
+
+
+def test_a_note_wins_over_preemption(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working")
+        store.say("change of plan")
+        store.request_interrupt()
+        comes_back(f)
+        time.sleep(0.2)
+        assert ctx.should_kill() is True
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    first = [e for e in store.events() if e["kind"] == "round_end"][0]
+    assert first["interrupted"] is True and first["outcome"] == COMPLETED
+    assert "change of plan" in f.agents["codex"].prompts[0]
+
+
+def test_notes_survive_a_preemption_by_the_kept_notes_rule(fallback, store):
+    f = fallback
+
+    def silent(agent, prompt, ctx):  # killed before it said anything: the notes are kept
+        comes_back(f)
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    store.say("the first note")
+    f.agents["claude_api"].script = [silent]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    assert "the first note" in f.agents["codex"].prompts[0]
+
+
+def test_notes_a_preempted_round_that_worked_has_read_are_spent(fallback, store):
+    f = fallback
+
+    def worked(agent, prompt, ctx):
+        ctx.on_output("on it")
+        comes_back(f)
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    store.say("the first note")
+    f.agents["claude_api"].script = [worked]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    assert "the first note" not in f.agents["codex"].prompts[0]
+
+
+# a plan agent that reads ok but cannot hold a round stops being allowed to kill Claude
+
+
+def fails_at_once(agent, prompt, ctx):
+    return RoundResult(TRANSIENT, reason="exited at once")
+
+
+def test_a_plan_agent_that_fails_at_once_after_a_preemption_costs_one_kill(fallback, store):
+    f = fallback
+    kills = []
+
+    def claude_killed(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000  # every cooldown is over
+        for name in ("codex", "antigravity"):
+            f.agents[name].avail = Availability(True)  # and both read ok again
+        until_true(ctx)
+        kills.append(1)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    def claude_left_alone(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        time.sleep(0.3)  # many polls: both plan agents read ok, neither may kill
+        assert ctx.should_kill() is False
+        (f.work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    def runaway_stop(agent, prompt, ctx):  # only reached when the loop does not end by itself
+        (f.work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude_killed, claude_killed, claude_left_alone, runaway_stop]
+    f.agents["codex"].script = [fails_at_once, fails_at_once, runaway_stop]
+    f.agents["antigravity"].script = [fails_at_once, fails_at_once, runaway_stop]
+    assert f.run() == 0
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    preempted = [e["back"] for e in ends if e["outcome"] == PREEMPTED]
+    assert sorted(preempted) == ["antigravity", "codex"]  # one kill each, not one per attempt
+    assert len(kills) == 2
+    agents = store.load_state()["agents"]
+    assert agents["codex"]["blocked"] and agents["antigravity"]["blocked"]
+
+
+def test_a_blocked_plan_agent_is_still_run_at_a_round_boundary(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        f.agents["codex"].avail = Availability(True)
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    def claude_again(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000  # codex's cooldown is over, it reads ok, and it is blocked
+        time.sleep(0.3)
+        assert ctx.should_kill() is False
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude, claude_again]
+    f.agents["codex"].script = [fails_at_once, done(f.work)]
+    assert f.run() == 0
+    starts = [e["agent"] for e in store.events() if e["kind"] == "round_start"]
+    assert starts == ["claude_api", "codex", "claude_api", "codex"]  # picked at the boundary
+    state = store.load_state()["agents"]["codex"]
+    assert state["blocked"] is False  # its completed round cleared the block
+
+
+def test_a_limit_after_a_long_round_following_a_preemption_does_not_block(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        f.agents["codex"].avail = Availability(True)
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    def codex_works_then_hits_its_limit(agent, prompt, ctx):
+        ctx.on_output("working")
+        f.world.now += 600
+        f.agents["codex"].avail = Availability(False, until=f.world.now + 3600, reason="full")
+        return RoundResult(LIMIT, until=f.world.now + 3600, reason="usage limit")
+
+    f.agents["claude_api"].script = [claude, done(f.work)]
+    f.agents["codex"].script = [codex_works_then_hits_its_limit]
+    assert f.run() == 0
+    assert store.load_state()["agents"]["codex"]["blocked"] is False
+
+
+# the watcher's read and the read in `pick` disagree: one kill per agent, and a day's cap
+
+DISAGREE_NAME = "baton-preempt"
+
+
+def flapping(adapter):
+    """Reads ok to the watcher thread and not available to anyone else (`pick`)."""
+
+    def availability():
+        if threading.current_thread().name == DISAGREE_NAME:
+            return Availability(True)
+        return Availability(False, reason="not really")
+
+    adapter.availability = availability
+
+
+def killed_then_back(f, kills=None):
+    """A Claude round that runs until the watcher ends it, with every cooldown over."""
+
+    def step(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        until_true(ctx)
+        if kills is not None:
+            kills.append(1)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    return step
+
+
+def left_alone(f, seen):
+    """A Claude round that the watcher must not end, whatever it reads, and then finishes. Whether
+    it was left alone goes into `seen` (an assert here would be swallowed as an adapter error)."""
+
+    def step(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        time.sleep(0.3)  # many polls
+        seen.append(ctx.should_kill() is False)
+        (f.work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    return step
+
+
+def test_a_flapping_read_costs_one_kill_per_agent_and_blocks_it(fallback, store):
+    f = fallback
+    for name in ("codex", "antigravity"):
+        flapping(f.agents[name])
+    seen = []
+    f.agents["claude_api"].script = [killed_then_back(f), killed_then_back(f), left_alone(f, seen)]
+    assert f.run() == 0
+    assert seen == [True]
+    events = store.events()
+    backs = [e["back"] for e in events if e["kind"] == "round_end" and e["outcome"] == PREEMPTED]
+    assert sorted(backs) == ["antigravity", "codex"]
+    assert {e["agent"] for e in events if e["kind"] == "round_start"} == {"claude_api"}
+    agents = store.load_state()["agents"]
+    assert agents["codex"]["blocked"] and agents["antigravity"]["blocked"]
+    assert not agents["codex"]["after_preempt"] and not agents["antigravity"]["after_preempt"]
+
+
+def test_a_block_set_by_a_flapping_read_clears_when_the_agent_completes_a_round(fallback, store):
+    f = fallback
+    flapping(f.agents["codex"])
+
+    def claude_then_codex_is_steady(agent, prompt, ctx):
+        f.world.now += 4000
+        del f.agents["codex"].availability  # back to the plain `avail` attribute
+        f.agents["codex"].avail = Availability(True)
+        time.sleep(0.3)
+        assert ctx.should_kill() is False  # blocked: the watcher does not look
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [killed_then_back(f), claude_then_codex_is_steady]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    starts = [e["agent"] for e in store.events() if e["kind"] == "round_start"]
+    assert starts == ["claude_api", "claude_api", "codex"]
+    assert store.load_state()["agents"]["codex"]["blocked"] is False
+
+
+def test_the_daily_cap_stops_the_seventh_kill_when_the_blocks_do_not_hold(
+    fallback, store, monkeypatch
+):
+    from baton.scheduler import MAX_PREEMPTS_PER_DAY, Scheduler
+
+    monkeypatch.setattr(Scheduler, "_block_unproven", lambda self, agent: None)
+    f = fallback
+    flapping(f.agents["codex"])
+    kills, seen = [], []
+    f.agents["claude_api"].script = [killed_then_back(f, kills) for _ in range(6)] + [
+        left_alone(f, seen)
+    ]
+    assert f.run() == 0
+    assert seen == [True]
+    assert MAX_PREEMPTS_PER_DAY == len(kills) == 6
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert [e["outcome"] for e in ends].count(PREEMPTED) == 6
+    assert len(store.load_state()["preempts"]) == 6
+
+
+def test_the_daily_cap_stops_the_seventh_kill_when_the_plan_agent_never_blocks(fallback, store):
+    f = fallback
+    kills, seen = [], []
+
+    def claude_killed(agent, prompt, ctx):
+        f.agents["codex"].avail = Availability(True)
+        return killed_then_back(f, kills)(agent, prompt, ctx)
+
+    def codex_idles_a_round(agent, prompt, ctx):
+        # it completes, so no block ever sets; then it is used up again
+        f.agents["codex"].avail = Availability(False, until=f.world.now + 3600, reason="full")
+        return RoundResult(COMPLETED)
+
+    def last_claude(agent, prompt, ctx):
+        f.agents["codex"].avail = Availability(True)
+        return left_alone(f, seen)(agent, prompt, ctx)
+
+    f.agents["claude_api"].script = [claude_killed] * 6 + [last_claude]
+    f.agents["codex"].script = [codex_idles_a_round] * 6
+    assert f.run() == 0
+    assert seen == [True]
+    assert len(kills) == 6
+    assert len(f.agents["codex"].prompts) == 6
+    assert len(store.load_state()["preempts"]) == 6

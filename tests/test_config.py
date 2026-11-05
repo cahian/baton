@@ -209,7 +209,7 @@ def test_claude_api_defaults_match_spec(tmp_path):
     assert (cfg.model, cfg.effort, cfg.bin) == ("claude-opus-5-5", "medium", "claude")
     assert cfg.monthly_budget_usd == Decimal("200") and isinstance(cfg.monthly_budget_usd, Decimal)
     assert cfg.reserve_pct == 10
-    assert cfg.round_budget_usd == Decimal("10") and isinstance(cfg.round_budget_usd, Decimal)
+    assert cfg.round_budget_usd == Decimal("5") and isinstance(cfg.round_budget_usd, Decimal)
     assert cfg.budget_reset_day == 1
     assert cfg.key_file == "~/.config/baton/anthropic.key"
     assert cfg.admin_key_file == ""
