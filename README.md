@@ -16,9 +16,9 @@ is resumed when its turn comes again.
 
 The default order, all at medium effort:
 
-1. **Claude Opus 5.5**, through a Console API key (never a subscription login).
+1. **GPT-6.1 Sol**, through Codex.
 2. **Gemini 4 Argon**, through Antigravity (`agy`).
-3. **GPT-6.1 Sol**, through Codex.
+3. **Claude Opus 5.5**, through a Console API key (never a subscription login).
 
 The first agent in `order` starts. The current agent keeps working until it is unavailable, then
 the rotation moves on. When the last agent runs out it wraps to the first one that is available.

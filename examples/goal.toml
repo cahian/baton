@@ -6,7 +6,7 @@ workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
 
 # Rotation order. The first entry starts; when the last runs out it wraps to the first available.
-order = ["claude_api", "antigravity", "codex"]
+order = ["codex", "antigravity", "claude_api"]
 round_max_s = 3600   # one round may not run longer than this
 idle_s = 1200        # nor stay silent longer than this
 snapshot = true      # commit uncommitted work locally after each round (never pushes)

@@ -27,7 +27,7 @@ def minimal(skip: str | None = None) -> str:
 
 def test_defaults_match_spec(tmp_path):
     goal = load_goal(write(tmp_path, minimal()))
-    assert goal.order == ("claude_api", "antigravity", "codex")
+    assert goal.order == ("codex", "antigravity", "claude_api")
     assert set(goal.agents) == {"claude_api", "antigravity", "codex"}
     assert goal.workdir == Path("/work/demo")
     assert (goal.round_max_s, goal.idle_s, goal.snapshot) == (3600, 1200, True)

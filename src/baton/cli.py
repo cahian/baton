@@ -429,7 +429,7 @@ def cmd_opencode_config(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="baton", description="Relay one coding goal between Claude, Antigravity and Codex."
+        prog="baton", description="Relay one coding goal between Codex, Antigravity and Claude."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
