@@ -18,6 +18,8 @@ is resumed when its turn comes again.
 Inside a goal the work follows a cycle of plan, build and review, with a strong and a working
 model per provider (see [Phases](#phases-plan-build-review)).
 
+![How baton works: Codex and Antigravity rotate, Claude is the backup, and every goal runs plan, build, review and verify.](docs/assets/baton-diagram.png)
+
 ## What you need
 
 baton does not bring its own AI or its own methods. It drives tools you install, and works with
