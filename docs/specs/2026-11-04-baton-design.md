@@ -52,7 +52,14 @@ snapshot uncommitted work
 run gate
 ```
 
-The current agent keeps working until it becomes unavailable, then the rotation moves to the other agent. With a limited reset time known for both, the wait ends at the earliest one, and that agent continues. Rotation is sticky and cyclic through `order`: an agent coming back does not preempt the one working. The initial agent is the first in `order`, and when the last agent in `order` runs out the rotation wraps to the first available one.
+Agents come in two kinds. Plan agents (`codex`, `antigravity`) have included usage that comes back at a reset; a metered agent (`claude_api`) is paid by use and has no reset that would ever stop it, so it would run until the credit is gone. The rotation therefore treats a metered agent as a fallback, wherever it appears in `order`:
+
+- The current plan agent keeps working until it becomes unavailable, then the rotation moves to the next plan agent in `order`, wrapping around. A plan agent that comes back does not preempt another plan agent that is working.
+- A metered agent runs only while no plan agent is available.
+- While a metered agent runs, the plan agents are read (without a model call) from their reset time onward. As soon as one reads available, the metered round is killed and that agent takes over. If both are available, the first in `order` goes first. This preemption is not a failure and gives the metered agent no cooldown.
+- With no agent available, the wait ends at the earliest known reset.
+
+A preempted Claude round has no `result` event, so its whole reservation stays counted. That overcounts and never overspends; `round_budget_usd` defaults to 5 USD to keep it small.
 
 Exceptions in the loop are logged, followed by a 60 s sleep, then the loop continues. Only a passing gate, a stop request or a termination signal ends the process.
 
@@ -157,7 +164,7 @@ Spend tracking is a ledger shared across all goals at `~/.local/state/baton/clau
 
 - Spend comes from `total_cost_usd` in the `result` event. It is a local estimate, so `reserve_pct` also absorbs its error.
 - A period starts on `budget_reset_day` (default 1) at 00:00 UTC.
-- Before a round, atomically reserve `round_budget_usd` (default 10). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 5 USD the agent is unavailable until the next period.
+- Before a round, atomically reserve `round_budget_usd` (default 5). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 5 USD the agent is unavailable until the next period.
 - After a round, replace the reservation with the actual cost. If a round ends with no `result` event, the full reservation stays counted. Crashes therefore overcount and never undercount.
 - An unreadable or corrupt ledger means unavailable. Never recreate it silently.
 
@@ -259,7 +266,7 @@ model = "claude-opus-5-5"
 effort = "medium"
 monthly_budget_usd = 200
 reserve_pct = 10
-round_budget_usd = 10
+round_budget_usd = 5
 budget_reset_day = 1
 key_file = "~/.config/baton/anthropic.key"
 admin_key_file = ""
