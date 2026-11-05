@@ -1453,6 +1453,11 @@ def test_serve_kill_9_kills_the_orphan_and_resumes_the_job(fakes, monkeypatch, t
         pid = int(fakes.codex_pidfile.read_text())
         state = Store(state_dir(gateway.job_name(SESSION)))
         assert wait_for(lambda: state.load_state().get("group") == pid)
+        # The group is saved at spawn, the session id only once the agent's first line is read: a
+        # kill between the two leaves nothing to resume. Its last line being in means the id is
+        # saved and the agent writes nothing more, which a closed pipe would end it for.
+        assert wait_for(lambda: any(e["kind"] == "output" for e in state.events()))
+        assert state.load_state()["sessions"] == {"codex": "thread-1"}
         first.kill()
         first.wait()
         assert _alive(pid), "the agent should outlive a server killed with SIGKILL"
