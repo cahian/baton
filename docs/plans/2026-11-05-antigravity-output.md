@@ -5,7 +5,7 @@
 Raw round logs show two defects in how baton shows an `agy` round.
 
 1. `step_update.text_delta` is a fragment that can end mid-word
-   (`'... (file'`, `':///Users/cahian/workspaces/cahian/L'`, `'ichii/.baton/PLAN.md'`), but the
+   (`'... (file'`, `':///path/to/L'`, `'ichii/.baton/PLAN.md'`), but the
    runner and the gateway treat it as a whole line and add `\n` after each one. The same broken
    text also lands in `round_tail`, which later rounds receive.
 2. Tool steps are dropped by `render()`, so a round of hundreds of tool steps shows nothing until
