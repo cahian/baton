@@ -2,7 +2,7 @@
 
 ## Intent
 
-A single long coding goal should keep moving for days across three agents, in this order: Claude Opus 5.5 through an organization API key, Antigravity (Gemini 4 Argon) and Codex (GPT-6.1 Sol), all at medium effort,, without a person restarting anything and without ever spending pay-as-you-go credits.
+A single long coding goal should keep moving for days across three agents, in this order: Codex (GPT-6.1 Sol), Antigravity (Gemini 4 Argon) and Claude Opus 5.5 through an organization API key, all at medium effort,, without a person restarting anything and without ever spending pay-as-you-go credits.
 
 The real failure this exists to prevent: at 100% of its included usage, the Codex CLI keeps working and silently debits account credits. No error is raised and no 429 reaches the client. Any design that waits for a limit error loses money first. Limits must be read and acted on before they are reached.
 
@@ -231,7 +231,7 @@ The verify command runs through the shell in the working directory with `verify.
 name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
-order = ["claude_api", "antigravity", "codex"]
+order = ["codex", "antigravity", "claude_api"]
 round_max_s = 3600
 idle_s = 1200
 snapshot = true

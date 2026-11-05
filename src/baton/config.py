@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 AGENT_NAMES = ("claude_api", "antigravity", "codex")
-DEFAULT_ORDER = ("claude_api", "antigravity", "codex")
+DEFAULT_ORDER = ("codex", "antigravity", "claude_api")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

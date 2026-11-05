@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from baton import gateway, runner
+from baton import config, gateway, runner
 from baton.adapters.base import COMPLETED, LIMIT, Availability, RoundResult
 from baton.cli import build_adapters, main
 from baton.gateway import content_text, make_server
@@ -191,6 +191,8 @@ def gw(fakes, monkeypatch, tmp_path):
     db = tmp_path / "opencode.db"
     make_db(db, [(SESSION, str(fakes.work)), ("ses_other", str(fakes.work))])
     monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
+    # These tests drive claude_api first; the real default now starts with codex.
+    monkeypatch.setattr(config, "DEFAULT_ORDER", ("claude_api", "antigravity", "codex"))
     agents = {"claude_api": Fake("claude_api"), "codex": Fake("codex")}
 
     def adapters_for(goal):  # like build_adapters: only what the goal enables
