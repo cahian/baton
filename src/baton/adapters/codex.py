@@ -173,6 +173,17 @@ def _is_number(value: object) -> bool:
     return False
 
 
+def _is_percent(value: object) -> bool:
+    """A usage percentage that fits a finite float: 1e5000 or 10**400 is blind, not a number."""
+    if not _is_number(value):
+        return False
+    try:
+        as_float = float(value)  # type: ignore[arg-type]
+    except (OverflowError, ValueError):
+        return False
+    return as_float == as_float and as_float not in (float("inf"), float("-inf"))
+
+
 def _plain(value: object) -> object:
     """JSON-friendly copy of a number for the usage dict."""
     if isinstance(value, Decimal):
@@ -232,7 +243,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
             window = limits.get(name)
             if window is None and not required:
                 continue
-            if isinstance(window, dict) and _is_number(window.get("usedPercent")):
+            if isinstance(window, dict) and _is_percent(window.get("usedPercent")):
                 windows[name] = window
                 usage[f"{name}_pct"] = _plain(window["usedPercent"])
             else:
