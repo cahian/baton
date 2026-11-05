@@ -29,6 +29,9 @@ AUTH_S = 30 * 60
 # An agent that could not be checked is asked again after this long.
 UNAVAILABLE_RETRY_S = 5 * 60
 MIN_WAIT_S = 30
+# A plan agent whose round, right after it ended a metered one, fails in less than this long
+# without having worked is blocked from preempting again: it read ok but cannot hold a round.
+PREEMPT_PROOF_S = 300
 # A reset further out than this is a bad reading (milliseconds for seconds, say), not a reset,
 # and counts as unknown.
 MAX_COOLDOWN_S = 8 * 24 * 3600
@@ -57,8 +60,12 @@ class Scheduler:
     metered agent (paid by use, nothing that would ever stop it) is a fallback wherever it stands
     in `order`: it is picked only while no plan agent is available. While one runs, the runner
     reads the plan agents with `plan_ready_to_check` and `record_read`, and ends the metered round
-    when one is back; `record` gives that round (`preempted`) no cooldown. With everyone
-    exhausted `pick` returns None and `next_wake` says when to look again.
+    when one is back; `record` gives that round (`preempted`) no cooldown. A plan agent that
+    reads ok but whose next round fails within `PREEMPT_PROOF_S` (and not as completed or
+    timeout) is blocked: `plan_ready_to_check` leaves it out, so it stops costing a metered round
+    per attempt, until a round of it completes, times out or lasts that long. `pick` still tries
+    it at a round boundary. With everyone exhausted `pick` returns None and `next_wake` says when
+    to look again.
 
     Cooldowns live in memory first. They are written to the store when `save` is called and
     after `record`, and a store that cannot be read or written never resets them. The runner's
@@ -93,7 +100,15 @@ class Scheduler:
 
     @staticmethod
     def _blank() -> dict:
-        return {"until": 0.0, "limit_n": 0, "transient_n": 0, "reason": "", "usage": {}}
+        return {
+            "until": 0.0,
+            "limit_n": 0,
+            "transient_n": 0,
+            "reason": "",
+            "usage": {},
+            "blocked": False,
+            "after_preempt": False,
+        }
 
     @staticmethod
     def _restore(agent: dict, raw: dict) -> None:
@@ -106,6 +121,8 @@ class Scheduler:
             agent["reason"] = raw["reason"]
         if isinstance(raw.get("usage"), dict):
             agent["usage"] = raw["usage"]
+        agent["blocked"] = raw.get("blocked") is True
+        agent["after_preempt"] = raw.get("after_preempt") is True
 
     def _known(self, until: Any, now: float) -> float | None:
         """`until` as a usable reset time, or None when it is missing, past or nonsense."""
@@ -157,11 +174,15 @@ class Scheduler:
             return None
 
     def plan_ready_to_check(self) -> list[str]:
-        """The plan agents whose cooldown has passed, in `order`: the ones worth reading while a
-        metered agent runs. Moves nothing."""
+        """The plan agents whose cooldown has passed and that are not blocked, in `order`: the
+        ones worth reading while a metered agent runs. Moves nothing."""
         with self._lock:
             now = self._clock()
-            return [n for n in self._plan_names() if self._agents[n]["until"] <= now]
+            return [
+                n
+                for n in self._plan_names()
+                if self._agents[n]["until"] <= now and not self._agents[n]["blocked"]
+            ]
 
     def record_read(self, name: str, avail: Availability) -> None:
         """Write down a read made outside `pick`, with the same rules. Never moves `current`."""
@@ -178,12 +199,14 @@ class Scheduler:
 
     # outcomes
 
-    def record(self, agent: str, result: RoundResult) -> None:
-        """Apply the outcome table to `agent`, then write it down if the store allows."""
-        with self._lock:
-            self._record(agent, result)
+    def record(self, agent: str, result: RoundResult, seconds: float | None = None) -> None:
+        """Apply the outcome table to `agent`, then write it down if the store allows.
 
-    def _record(self, agent: str, result: RoundResult) -> None:
+        `seconds` is how long the round ran; without it no block on preempting is set."""
+        with self._lock:
+            self._record(agent, result, seconds)
+
+    def _record(self, agent: str, result: RoundResult, seconds: float | None) -> None:
         if agent not in self._agents:
             return
         state = self._agents[agent]
@@ -192,7 +215,14 @@ class Scheduler:
         if result.resume_failed:
             return  # the round never really ran; it is retried fresh and is not the agent's fault
         if outcome == PREEMPTED:
-            return  # ended by baton because a plan agent is back: nobody's failure, no cooldown
+            # ended by baton because a plan agent is back: nobody's failure, no cooldown. The
+            # agent that was back has a round to prove itself with, the next one it runs.
+            if result.back in self._agents:
+                self._agents[result.back]["after_preempt"] = True
+            self._save_quietly()
+            return
+        if not self._adapters[agent].metered:
+            self._judge_preempt(state, outcome, seconds)
         if outcome in (COMPLETED, TIMEOUT):
             state.update(until=0.0, limit_n=0, transient_n=0, reason="")
         elif outcome == LIMIT:
@@ -209,10 +239,23 @@ class Scheduler:
             state["until"] = now + self._backoff(state, "transient_n", TRANSIENT_BACKOFF)
         if outcome not in (COMPLETED, TIMEOUT):
             state["reason"] = result.reason
+        self._save_quietly()
+
+    def _save_quietly(self) -> None:
         try:
             self.save()
         except (StateError, OSError):
             pass  # memory is authoritative; the next save() writes all of it
+
+    @staticmethod
+    def _judge_preempt(state: dict, outcome: str, seconds: float | None) -> None:
+        """Block or unblock a plan agent for preempting, from a round of its own. The round that
+        follows a preemption it caused is the one that counts against it."""
+        followed, state["after_preempt"] = state["after_preempt"], False
+        if outcome in (COMPLETED, TIMEOUT) or (seconds is not None and seconds >= PREEMPT_PROOF_S):
+            state["blocked"] = False
+        elif followed and seconds is not None:
+            state["blocked"] = True
 
     @staticmethod
     def _backoff(state: dict, counter: str, bounds: tuple[int, int]) -> float:
@@ -236,6 +279,8 @@ class Scheduler:
                     "transient_n": raw["transient_n"],
                     "reason": raw["reason"],
                     "usage": dict(raw["usage"]),
+                    "blocked": raw["blocked"],
+                    "after_preempt": raw["after_preempt"],
                 }
             return {"current": self.current, "agents": agents}
 

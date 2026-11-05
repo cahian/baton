@@ -26,6 +26,7 @@ class RoundResult:
     until: float | None = None
     reason: str = ""
     resume_failed: bool = False
+    back: str = ""  # PREEMPTED only: the plan agent whose return ended the round
 
 
 @dataclass(frozen=True)

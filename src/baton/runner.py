@@ -797,12 +797,14 @@ class _Run:
         if preempted and watch is not None and result.outcome in (COMPLETED, TIMEOUT, TRANSIENT):
             # What the adapter made of being killed (a stop, a crash) is not the round's story.
             # A credit_guard, limit or auth that came with it is real and stays.
-            result = RoundResult(PREEMPTED, reason=f"{watch.back} is available again")
+            result = RoundResult(
+                PREEMPTED, reason=f"{watch.back} is available again", back=watch.back
+            )
 
         self.group = None
         ended = self.clock()
         # Record first: nothing after this can lose a credit_guard or limit outcome.
-        self.sched.record(agent, result)
+        self.sched.record(agent, result, seconds=ended - started)
         if result.outcome in (CREDIT_GUARD, AUTH):
             self.emit("alert", agent=agent, outcome=result.outcome, reason=result.reason)
         snapshotted = snapshot_work(goal, n, agent)

@@ -57,6 +57,7 @@ Agents come in two kinds. Plan agents (`codex`, `antigravity`) have included usa
 - The current plan agent keeps working until it becomes unavailable, then the rotation moves to the next plan agent in `order`, wrapping around. A plan agent that comes back does not preempt another plan agent that is working.
 - A metered agent runs only while no plan agent is available.
 - While a metered agent runs, the plan agents are read (without a model call) from their reset time onward. As soon as one reads available, the metered round is killed and that agent takes over. If both are available, the first in `order` goes first. This preemption is not a failure and gives the metered agent no cooldown.
+- A plan agent that reads available but whose round, right after such a preemption, fails (anything but `completed` or `timeout`) within 300 s is blocked from preempting: it is no longer read while a metered agent runs, so one bad agent cannot cost a metered round per attempt. The block is kept in `state.json`. It ends when a round of that agent completes, times out or lasts at least 300 s. At a round boundary the agent is still picked as usual.
 - With no agent available, the wait ends at the earliest known reset.
 
 A preempted Claude round has no `result` event, so its whole reservation stays counted. That overcounts and never overspends; `round_budget_usd` defaults to 5 USD to keep it small.
@@ -105,7 +106,7 @@ Start a round only if all hold, otherwise the agent is unavailable:
 
 While a round runs, read limits every `poll_s` (default 15). Stop the round, with `limit`, when any start condition fails. Stop it, with `credit_guard`, as soon as the balance is below the balance read immediately before the round. Compare with `Decimal`. Two consecutive failed reads stop the round with `credit_guard`: being blind is treated as danger.
 
-`resetsAt` of the saturated window, or the latest one if several, sets the cooldown.
+`resetsAt` of the saturated window, or the latest one if several, sets the cooldown. When `ordinaryUsageAllowed` is false and no window is at the threshold, the cause is unknown and the agent is read again after 5 min.
 
 Command:
 

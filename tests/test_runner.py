@@ -2075,3 +2075,95 @@ def test_notes_a_preempted_round_that_worked_has_read_are_spent(fallback, store)
     f.agents["codex"].script = [done(f.work)]
     assert f.run() == 0
     assert "the first note" not in f.agents["codex"].prompts[0]
+
+
+# a plan agent that reads ok but cannot hold a round stops being allowed to kill Claude
+
+
+def fails_at_once(agent, prompt, ctx):
+    return RoundResult(TRANSIENT, reason="exited at once")
+
+
+def test_a_plan_agent_that_fails_at_once_after_a_preemption_costs_one_kill(fallback, store):
+    f = fallback
+    kills = []
+
+    def claude_killed(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000  # every cooldown is over
+        for name in ("codex", "antigravity"):
+            f.agents[name].avail = Availability(True)  # and both read ok again
+        until_true(ctx)
+        kills.append(1)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    def claude_left_alone(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        time.sleep(0.3)  # many polls: both plan agents read ok, neither may kill
+        assert ctx.should_kill() is False
+        (f.work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    def runaway_stop(agent, prompt, ctx):  # only reached when the loop does not end by itself
+        (f.work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude_killed, claude_killed, claude_left_alone, runaway_stop]
+    f.agents["codex"].script = [fails_at_once, fails_at_once, runaway_stop]
+    f.agents["antigravity"].script = [fails_at_once, fails_at_once, runaway_stop]
+    assert f.run() == 0
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    preempted = [e["back"] for e in ends if e["outcome"] == PREEMPTED]
+    assert sorted(preempted) == ["antigravity", "codex"]  # one kill each, not one per attempt
+    assert len(kills) == 2
+    agents = store.load_state()["agents"]
+    assert agents["codex"]["blocked"] and agents["antigravity"]["blocked"]
+
+
+def test_a_blocked_plan_agent_is_still_run_at_a_round_boundary(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        f.agents["codex"].avail = Availability(True)
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    def claude_again(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000  # codex's cooldown is over, it reads ok, and it is blocked
+        time.sleep(0.3)
+        assert ctx.should_kill() is False
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [claude, claude_again]
+    f.agents["codex"].script = [fails_at_once, done(f.work)]
+    assert f.run() == 0
+    starts = [e["agent"] for e in store.events() if e["kind"] == "round_start"]
+    assert starts == ["claude_api", "codex", "claude_api", "codex"]  # picked at the boundary
+    state = store.load_state()["agents"]["codex"]
+    assert state["blocked"] is False  # its completed round cleared the block
+
+
+def test_a_limit_after_a_long_round_following_a_preemption_does_not_block(fallback, store):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        f.agents["codex"].avail = Availability(True)
+        until_true(ctx)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    def codex_works_then_hits_its_limit(agent, prompt, ctx):
+        ctx.on_output("working")
+        f.world.now += 600
+        f.agents["codex"].avail = Availability(False, until=f.world.now + 3600, reason="full")
+        return RoundResult(LIMIT, until=f.world.now + 3600, reason="usage limit")
+
+    f.agents["claude_api"].script = [claude, done(f.work)]
+    f.agents["codex"].script = [codex_works_then_hits_its_limit]
+    assert f.run() == 0
+    assert store.load_state()["agents"]["codex"]["blocked"] is False

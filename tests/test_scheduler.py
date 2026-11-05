@@ -422,3 +422,138 @@ def test_record_read_refreshes_until_like_pick_and_never_moves_current(tmp_path)
 def test_record_read_ignores_an_unknown_agent(tmp_path):
     _, _, s = trio(tmp_path)
     s.record_read("nope", Availability(True))
+
+
+# a plan agent whose round fails at once after a preemption cannot preempt again
+
+
+def preempt_then(s, agent, outcome, seconds, **kw):
+    """Claude is ended because `agent` is back; then `agent` runs a round that ends as given."""
+    s.record("claude_api", RoundResult(PREEMPTED, reason=f"{agent} is back", back=agent))
+    s.record(agent, RoundResult(outcome, **kw), seconds=seconds)
+
+
+def test_a_round_that_fails_at_once_after_a_preemption_blocks_that_agent(tmp_path):
+    clock, agents, s = trio(tmp_path)
+    preempt_then(s, "codex", TRANSIENT, 5, reason="boom")
+    clock.now += 100_000
+    assert s.plan_ready_to_check() == ["antigravity"]  # codex is out of the watcher's reach
+    assert s.snapshot()["agents"]["codex"]["blocked"] is True
+
+
+@pytest.mark.parametrize("outcome", [TRANSIENT, LIMIT, AUTH, CREDIT_GUARD])
+def test_every_failure_other_than_completed_or_timeout_blocks(tmp_path, outcome):
+    clock, _, s = trio(tmp_path)
+    preempt_then(s, "codex", outcome, 5)
+    clock.now += 100_000
+    assert s.plan_ready_to_check() == ["antigravity"]
+
+
+def test_a_blocked_agent_is_still_picked_at_a_round_boundary(tmp_path):
+    clock, agents, s = trio(tmp_path)
+    s.pick()
+    preempt_then(s, "codex", TRANSIENT, 5)
+    clock.now += 100_000
+    assert s.pick().name == "codex"  # blocking stops kills, never normal selection
+
+
+def test_a_completed_round_clears_the_block(tmp_path):
+    clock, _, s = trio(tmp_path)
+    preempt_then(s, "codex", TRANSIENT, 5)
+    s.record("codex", RoundResult(COMPLETED), seconds=2)
+    clock.now += 100_000
+    assert s.plan_ready_to_check() == ["codex", "antigravity"]
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+
+
+def test_a_timeout_clears_the_block(tmp_path):
+    clock, _, s = trio(tmp_path)
+    preempt_then(s, "codex", TRANSIENT, 5)
+    s.record("codex", RoundResult(TIMEOUT), seconds=2)
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+
+
+def test_a_long_round_clears_the_block_whatever_its_outcome(tmp_path):
+    clock, _, s = trio(tmp_path)
+    preempt_then(s, "codex", TRANSIENT, 5)
+    s.record("codex", RoundResult(LIMIT, until=clock.now + 900), seconds=300)
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+
+
+def test_a_limit_after_ten_minutes_of_work_following_a_preemption_does_not_block(tmp_path):
+    clock, _, s = trio(tmp_path)
+    preempt_then(s, "codex", LIMIT, 600, until=clock.now + 3600)
+    clock.now += 3601
+    assert s.plan_ready_to_check() == ["codex", "antigravity"]
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+
+
+def test_a_round_just_under_the_proof_time_blocks(tmp_path):
+    _, _, s = trio(tmp_path)
+    preempt_then(s, "codex", TRANSIENT, 299.9)
+    assert s.snapshot()["agents"]["codex"]["blocked"] is True
+
+
+def test_a_failure_that_did_not_follow_a_preemption_does_not_block(tmp_path):
+    clock, _, s = trio(tmp_path)
+    s.record("codex", RoundResult(TRANSIENT, reason="boom"), seconds=5)
+    clock.now += 100_000
+    assert s.plan_ready_to_check() == ["codex", "antigravity"]
+
+
+def test_the_mark_belongs_to_the_agent_that_was_back(tmp_path):
+    _, _, s = trio(tmp_path)
+    s.record("claude_api", RoundResult(PREEMPTED, back="antigravity"))
+    s.record("codex", RoundResult(TRANSIENT), seconds=5)  # picked at the boundary instead
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+    s.record("antigravity", RoundResult(TRANSIENT), seconds=5)
+    assert s.snapshot()["agents"]["antigravity"]["blocked"] is True
+
+
+def test_only_the_round_right_after_the_preemption_is_judged(tmp_path):
+    _, _, s = trio(tmp_path)
+    preempt_then(s, "codex", COMPLETED, 5)
+    s.record("codex", RoundResult(TRANSIENT), seconds=5)
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+
+
+def test_a_round_that_never_ran_does_not_use_up_the_mark(tmp_path):
+    _, _, s = trio(tmp_path)
+    s.record("claude_api", RoundResult(PREEMPTED, back="codex"))
+    s.record("codex", RoundResult(TRANSIENT, resume_failed=True), seconds=1)
+    s.record("codex", RoundResult(TRANSIENT), seconds=5)
+    assert s.snapshot()["agents"]["codex"]["blocked"] is True
+
+
+def test_without_a_duration_nothing_new_is_blocked(tmp_path):
+    _, _, s = trio(tmp_path)
+    s.record("claude_api", RoundResult(PREEMPTED, back="codex"))
+    s.record("codex", RoundResult(TRANSIENT))  # an old caller
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+
+
+def test_the_block_survives_a_restart(tmp_path):
+    clock, agents, s = trio(tmp_path)
+    preempt_then(s, "codex", TRANSIENT, 5)
+    saved = s._store.load_state()
+    clock2, agents2, s2 = trio(tmp_path / "again", saved=saved)
+    clock2.now += 100_000
+    assert s2.plan_ready_to_check() == ["antigravity"]
+    assert s2.snapshot()["agents"]["codex"]["blocked"] is True
+
+
+def test_the_mark_survives_a_restart(tmp_path):
+    _, _, s = trio(tmp_path)
+    s.record("claude_api", RoundResult(PREEMPTED, reason="codex is back", back="codex"))
+    saved = s._store.load_state()  # the preemption was written as soon as it was recorded
+    _, _, s2 = trio(tmp_path / "again", saved=saved)
+    s2.record("codex", RoundResult(TRANSIENT), seconds=5)
+    assert s2.snapshot()["agents"]["codex"]["blocked"] is True
+
+
+def test_a_block_in_a_damaged_state_file_is_ignored(tmp_path):
+    saved = {"agents": {"codex": {"blocked": "yes", "after_preempt": "yes"}}}
+    _, _, s = trio(tmp_path, saved=saved)
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
+    s.record("codex", RoundResult(TRANSIENT), seconds=5)
+    assert s.snapshot()["agents"]["codex"]["blocked"] is False
