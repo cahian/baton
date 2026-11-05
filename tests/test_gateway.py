@@ -312,7 +312,7 @@ def test_no_gate_finishes_on_completed_round(gw):
 def test_baton_toml_gate_holds_stream_open_until_pass(gw):
     (gw.work / "baton.toml").write_text(
         'name = "ignored"\nworkdir = "/nowhere"\nobjective = "ignored"\n'
-        'order = ["codex"]\nsnapshot = false\n'
+        'order = ["codex"]\nsnapshot = false\nphases = false\n'
         '[verify]\ncommand = "test -f DONE"\n'
     )
 
@@ -1446,7 +1446,7 @@ def test_serve_kill_9_kills_the_orphan_and_resumes_the_job(fakes, monkeypatch, t
     make_db(db, [(SESSION, str(fakes.work))])
     monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
     (fakes.work / "baton.toml").write_text(
-        'order = ["codex"]\nsnapshot = false\n'
+        'order = ["codex"]\nsnapshot = false\nphases = false\n'
         "[agents.antigravity]\nenabled = false\n[agents.claude_api]\nenabled = false\n"
     )
 
@@ -1505,7 +1505,7 @@ def test_serve_stops_the_agent_group_on_sigterm(fakes, monkeypatch, tmp_path):
     monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
     monkeypatch.setenv("FAKE_CODEX_EXEC_SLEEP", "60")
     (fakes.work / "baton.toml").write_text(
-        'order = ["codex"]\nsnapshot = false\n'
+        'order = ["codex"]\nsnapshot = false\nphases = false\n'
         "[agents.antigravity]\nenabled = false\n[agents.claude_api]\nenabled = false\n"
     )
     proc = subprocess.Popen(

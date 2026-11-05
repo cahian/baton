@@ -41,11 +41,16 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    check_subagent,
+    claude_allowed_models,
+    subagent_guard_command,
+    tier_config,
 )
 from baton.adapters.guard import RETRY_S
 from baton.config import AgentConfig
 from baton.ledger import MIN_GRANT_USD, Ledger, LedgerError, ceiling_for, default_path
 from baton.proc import Exit, run_streaming
+from baton.store import state_base
 
 __all__ = [
     "ClaudeApiAdapter",
@@ -74,7 +79,23 @@ EXPIRY_MARGIN_S = 3600
 SHORT_ERROR_LINE = 300
 # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB forces Claude Code's permission mode to default, so
 # --dangerously-skip-permissions is ignored and, without this list, every write is denied.
-ALLOWED_TOOLS = "Bash,Edit,Read,Write"
+# `--tools` limits what exists (without --bare the CLI would offer far more), `--allowedTools` is
+# what lets these write. Agent is there on purpose: subagents are allowed, on baton's two models
+# only: CLAUDE_CODE_SUBAGENT_MODEL_FORCE makes every one run on the working model, and the
+# PreToolUse hook (subagent_guard.py) is a second check; the stream only logs them.
+# What the round's environment must not carry in: every way for the CLI to find a credential or a
+# provider other than the key baton accounts for (a subscription token, Bedrock, Vertex, a
+# gateway, a file descriptor to read a token from). Dropped before the key is added.
+CREDENTIAL_ENV = (
+    "ANTHROPIC_*",
+    "CLAUDE_CODE_USE_*",
+    "CLAUDE_CODE_OAUTH_*",
+    "CLAUDE_CODE_*_FILE_DESCRIPTOR",
+    "AWS_BEARER_TOKEN_BEDROCK",
+)
+TOOLS = "Bash,Edit,Read,Write,Agent"
+ALLOWED_TOOLS = TOOLS
+SUBAGENT_TOOL_NAMES = ("Agent", "Task")
 
 API_BASE = "https://api.anthropic.com"
 REPORT_PAGES = 12  # a period is at most 31 daily buckets, which is one page of 31
@@ -181,10 +202,30 @@ def evaluate_line(line: str) -> RoundResult | None:
     if source == KEY_VARIABLE:
         return None
     shown = source if isinstance(source, str) and len(source) <= 40 else type(source).__name__
+    # Without --bare the CLI could use a subscription login: that is refused at once, before any
+    # model call, and counts as an authentication problem.
     return RoundResult(
-        CREDIT_GUARD,
+        AUTH,
         reason=f"apiKeySource is {shown!r}, not {KEY_VARIABLE!r}: the round is not on the key",
     )
+
+
+def claude_config_dir() -> Path:
+    """`<state base>/.claude-config`, mode 700, made when it is missing. Raises OSError."""
+    path = state_base() / ".claude-config"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+def guard_settings() -> str:
+    """The `--settings` document: a PreToolUse hook on `Agent` and `Task` that runs the guard, and
+    blocks the call if the hook itself fails."""
+    hook = {
+        "matcher": "Agent|Task",
+        "hooks": [{"type": "command", "command": subagent_guard_command(), "onFailure": "block"}],
+    }
+    return json.dumps({"hooks": {"PreToolUse": [hook]}}, separators=(",", ":"))
 
 
 def _cost(value: object) -> Decimal | None:
@@ -217,6 +258,7 @@ class _Stream:
         self.cost: Decimal | None = None
         self.result_text = ""
         self.kinds: set[str] = set()
+        self.subagents: set[str] = set()  # tool uses whose model was seen
         self.problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
 
     def structured_text(self) -> str:
@@ -435,20 +477,28 @@ class ClaudeApiAdapter:
 
     # the round
 
-    def argv(self, granted: Decimal, session_id: str | None) -> list[str]:
+    def argv(self, granted: Decimal, session_id: str | None, tier: str = "strong") -> list[str]:
+        cfg = tier_config(self.cfg, tier)
         argv = [
-            self.cfg.bin,
+            cfg.bin,
             "-p",
             "--output-format",
             "stream-json",
             "--verbose",
-            "--bare",
+            # Not --bare: it would stop --tools and --settings from working. What it did, these do:
+            # no user, project or local settings, no MCP servers but our own (none), and the key
+            # source is checked on the init event (a login is refused).
+            "--setting-sources=",
+            "--strict-mcp-config",
             "--model",
-            self.cfg.model,
+            cfg.model,
             "--effort",
-            self.cfg.effort,
+            cfg.effort,
             "--dangerously-skip-permissions",
-            f"--allowedTools={ALLOWED_TOOLS}",  # `=` form: the flag is variadic and would eat args
+            # `=` form: these flags are variadic and would eat the arguments after them
+            f"--tools={TOOLS}",
+            f"--allowedTools={ALLOWED_TOOLS}",
+            f"--settings={guard_settings()}",
             "--max-budget-usd",
             format(granted, "f"),
         ]
@@ -464,6 +514,12 @@ class ClaudeApiAdapter:
             key = read_key(Path(self.cfg.key_file))
         except KeyFileError as exc:
             return RoundResult(AUTH, reason=str(exc))
+        try:
+            config_dir = claude_config_dir()
+        except OSError as exc:
+            return RoundResult(
+                TRANSIENT, reason=f"cannot make baton's Claude config directory: {exc.strerror}"
+            )
         try:
             floor = self._floor()
             reservation = self.ledger.reserve(
@@ -494,7 +550,7 @@ class ClaudeApiAdapter:
             return self._on_line(line, stream, ctx)
 
         run_ctx = replace(ctx, on_spawn=on_spawn)
-        argv = self.argv(granted, ctx.session_id)
+        argv = self.argv(granted, ctx.session_id, ctx.tier)
         # Whatever happens from here on (an exception, a signal) leaves the reservation in the
         # ledger: it is only replaced when the stream really reported a cost, or released when
         # nothing was ever started.
@@ -507,7 +563,21 @@ class ClaudeApiAdapter:
                 on_line,
                 lambda: None,
                 tick_s=self.tick_s,
+                scrub=CREDENTIAL_ENV,
                 extra_env={KEY_VARIABLE: key, "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"},
+                # Not secrets, so the stream may show them. The hook reads the allowed names, and
+                # every subagent runs on the working model, whatever it names. The CLI's own
+                # memory is off: baton's handoff and ai-memory are what carry what was learned.
+                plain_env={
+                    "BATON_ALLOWED_MODELS": ",".join(claude_allowed_models(self.cfg)),
+                    "CLAUDE_CODE_SUBAGENT_MODEL": self.cfg.build_model,
+                    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+                    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+                    # A directory of baton's own: the user's ~/.claude.json has an `env` map that
+                    # could replace the key or the base URL. Every round uses this one, so a
+                    # session started in one round can be resumed in the next.
+                    "CLAUDE_CONFIG_DIR": str(config_dir),
+                },
             )
         except OSError as exc:
             if spawned:
@@ -572,6 +642,7 @@ class ClaudeApiAdapter:
             error = event.get("error")
             if isinstance(error, str) and error in _ERROR_KINDS:
                 stream.kinds.add(error)
+            return self._subagents(event, stream, ctx)
         elif kind == "result":
             stream.has_result = True
             stream.is_error = event.get("is_error") is True
@@ -587,6 +658,30 @@ class ClaudeApiAdapter:
             if isinstance(errors, list):
                 texts.extend(e for e in errors if isinstance(e, str))
             stream.result_text = "\n".join(texts)[-2000:]
+        return None
+
+    def _subagents(self, event: dict, stream: _Stream, ctx: RoundContext) -> RoundResult | None:
+        """Every subagent the stream shows, reported as an event. It never ends a round: the hook
+        denies a third model before the subagent exists."""
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool = block.get("name")
+            if tool not in SUBAGENT_TOOL_NAMES:
+                continue
+            ident = block.get("id") if isinstance(block.get("id"), str) else None
+            if ident is not None and ident in stream.subagents:
+                continue
+            tool_input = block.get("input")
+            model = tool_input.get("model") if isinstance(tool_input, dict) else None
+            model = model if isinstance(model, str) and model.strip() else None
+            if ident is not None and model is not None:
+                stream.subagents.add(ident)
+            refused = check_subagent(self.cfg, ctx, tool, model)
+            if refused is not None:
+                return refused
         return None
 
     def _release(self, reservation_id: str) -> None:
@@ -683,7 +778,11 @@ class ClaudeApiAdapter:
         if stream.has_result and not stream.is_error:
             return RoundResult(COMPLETED)
         if stream.has_result and stream.subtype in _BOUNDED_SUBTYPES:
-            return RoundResult(COMPLETED, reason=_summary(stream.result_text) or stream.subtype)
+            # Cut off by its own cap: the scheduler still sees a completed round, but the work was
+            # not finished, so it must not advance a phase or finish a goal.
+            return RoundResult(
+                COMPLETED, reason=_summary(stream.result_text) or stream.subtype, bounded=True
+            )
         text = stream.error_text()
         refusal = self._refusal(stream)
         if refusal is not None:

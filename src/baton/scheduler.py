@@ -14,6 +14,7 @@ from baton.adapters.base import (
     CREDIT_GUARD,
     LIMIT,
     PREEMPTED,
+    SUBAGENT,
     TIMEOUT,
     Adapter,
     Availability,
@@ -41,6 +42,9 @@ PREEMPT_SKEW_S = 3600
 # A reset further out than this is a bad reading (milliseconds for seconds, say), not a reset,
 # and counts as unknown.
 MAX_COOLDOWN_S = 8 * 24 * 3600
+# A round ended for a subagent on a model outside the pair leaves the agent available, but this
+# many in a row (in one run) rest it, with the backoff of a failing agent, until it completes one.
+SUBAGENT_STRIKES = 3
 
 
 def _num(value: Any) -> float | None:
@@ -142,6 +146,7 @@ class Scheduler:
             "usage": {},
             "blocked": False,
             "after_preempt": False,
+            "subagent_n": 0,  # in a row, in this run: not written to state.json
         }
 
     @staticmethod
@@ -192,21 +197,45 @@ class Scheduler:
         agent["until"] = known if known is not None else now + UNAVAILABLE_RETRY_S
         agent["reason"] = avail.reason
 
-    def pick(self) -> Adapter | None:
-        """The adapter to run now, or None when every agent is cooling down or unavailable."""
+    def pick(self, avoid: str | None = None) -> Adapter | None:
+        """The adapter to run now, or None when every agent is cooling down or unavailable.
+
+        `avoid` names the agent a round should not go to, if another plan agent can take it (a
+        review is better done by someone other than the builder). When it is the agent that would
+        be returned and another plan agent reads available, that one is returned for this round
+        only: `current` stays where it was, so the next ordinary round continues as before. A
+        metered agent is never returned because of `avoid`."""
         with self._lock:
             for name in self._candidates():
-                agent = self._agents[name]
-                if agent["until"] > self._clock():
+                found = self._try(name)
+                if found is None:
                     continue
-                adapter = self._adapters[name]
-                avail = read_availability(adapter)
-                self._apply(agent, avail)
-                if avail.ok:
+                if avoid is None or name != avoid or self._adapters[name].metered:
                     self.current = name
-                    return adapter
-                self._block_unproven(agent)
+                    return found
+                # The agent to avoid is the one that would run: look for another plan agent.
+                for other in self._candidates():
+                    if other == name or self._adapters[other].metered:
+                        continue
+                    alternative = self._try(other)
+                    if alternative is not None:
+                        return alternative
+                self.current = name
+                return found
             return None
+
+    def _try(self, name: str) -> Adapter | None:
+        """Read `name` if it is not cooling down: its adapter when it is available."""
+        agent = self._agents[name]
+        if agent["until"] > self._clock():
+            return None
+        adapter = self._adapters[name]
+        avail = read_availability(adapter)
+        self._apply(agent, avail)
+        if avail.ok:
+            return adapter
+        self._block_unproven(agent)
+        return None
 
     def _block_unproven(self, agent: dict) -> None:
         """An agent whose preemption it caused and that now reads not available: the watcher saw
@@ -271,7 +300,11 @@ class Scheduler:
         if not self._adapters[agent].metered:
             self._judge_preempt(state, outcome, seconds)
         if outcome in (COMPLETED, TIMEOUT):
-            state.update(until=0.0, limit_n=0, transient_n=0, reason="")
+            state.update(until=0.0, limit_n=0, transient_n=0, reason="", subagent_n=0)
+        elif outcome == SUBAGENT:
+            state["subagent_n"] += 1
+            if state["subagent_n"] >= SUBAGENT_STRIKES:
+                state["until"] = now + self._backoff(state, "transient_n", TRANSIENT_BACKOFF)
         elif outcome == LIMIT:
             known = self._known(result.until, now)
             if known is None:

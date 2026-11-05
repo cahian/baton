@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import signal
@@ -9,23 +10,42 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
+from baton import superpowers
 from baton.adapters.base import (
     AUTH,
     COMPLETED,
     CREDIT_GUARD,
     PREEMPTED,
+    SUBAGENT,
     TIMEOUT,
     TRANSIENT,
     Adapter,
     RoundContext,
     RoundResult,
 )
-from baton.config import Goal, GoalError, load_memory
+from baton.config import Goal, GoalError, load_memory, load_superpowers
 from baton.memory import Memory, RoundEntry
+from baton.phases import (
+    BUILD,
+    PLAN,
+    REVIEW,
+    TIER,
+    PhaseState,
+    add_review_task,
+    advance,
+    archive_plan,
+    clear_review,
+    open_tasks,
+    phase_prompt,
+    read_plan,
+    read_review,
+    reason_for,
+)
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, clean_env, kill_group, process_start
 from baton.scheduler import Scheduler, read_availability
 from baton.store import Store, workdir_lock
@@ -41,6 +61,14 @@ COMMITS_MAX_CHARS = 2000
 # A round that completes sooner than this, without the goal being met, is followed by a pause of
 # this length, so an agent that exits at once cannot burn quota in a tight loop.
 MIN_ROUND_S = 30
+# Phases: a phase that never completes still reaches the gate, and a builder that closes no task
+# cannot stay in build for ever.
+GATE_EVERY_ROUNDS = 3
+BUILD_IDLE_ROUNDS = 8
+BUILD_ROUNDS_PER_TASK = 3
+BUILD_ROUNDS_EXTRA = 5
+# How long a job waits before it looks for Superpowers again.
+SKILLS_RETRY_S = 300
 GATE_POLL_S = 0.5
 # While a metered agent runs, the plan agents are read at most this often (seconds), and the
 # watcher is given this long to finish when the round ends.
@@ -77,6 +105,8 @@ def build_prompt(
     resumed: bool,
     since_commits: str = "",
     memory: str = "",
+    phase_block: str = "",
+    skills: str = "",
 ) -> str:
     """The prompt for one round.
 
@@ -117,6 +147,13 @@ def build_prompt(
         parts.append(memory)
     if not resumed:
         parts.append(RULES)
+    # The skills come first and the phase block last, so what baton asks of this round is read last.
+    skills = skills.strip()
+    if skills:
+        parts.append(skills)
+    phase_block = phase_block.strip()
+    if phase_block:
+        parts.append(phase_block)
     return "\n\n".join(parts) + "\n"
 
 
@@ -282,6 +319,15 @@ def snapshot_work(goal: Goal, n: int, agent: str) -> bool:
 _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 
 
+def _is_repo(workdir: Path) -> bool:
+    """True when the workdir is inside a git work tree."""
+    try:
+        found = _git(workdir, "rev-parse", "--is-inside-work-tree")
+    except Exception:
+        return False
+    return found.returncode == 0 and found.stdout.strip() == "true"
+
+
 def _head(workdir: Path) -> str:
     """The checked-out commit, or "" when the workdir is not in a repository with commits."""
     try:
@@ -306,6 +352,58 @@ def commits_since(workdir: Path, sha: str) -> str:
     if len(text) > COMMITS_MAX_CHARS:
         text = text[:COMMITS_MAX_CHARS].rsplit("\n", 1)[0] + "\n..."
     return text
+
+
+def _file_digest(path: Path) -> str:
+    """What a path holds, for comparing the tree before and after a round."""
+    try:
+        if path.is_symlink():
+            return "link:" + os.readlink(path)
+        if not path.is_file():
+            return "absent" if not path.exists() else "dir"
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return "unreadable"
+
+
+def tree_fingerprint(workdir: Path) -> str | None:
+    """HEAD, plus the status and the content of every changed or new file under the workdir,
+    leaving out `.baton/`: two equal fingerprints mean nothing outside `.baton/` changed in
+    between. None when git cannot say (not a repository, a failing call): the caller then cannot
+    tell, and must not trust what it was about to rely on."""
+    try:
+        inside = _git(workdir, "rev-parse", "--is-inside-work-tree")
+        top = _git(workdir, "rev-parse", "--show-toplevel")
+        status = _git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", "--", ".")
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        if top.returncode != 0 or status.returncode != 0:
+            return None
+        root = Path(top.stdout.strip())
+        entries = status.stdout.split("\0")
+        found: list[tuple[str, str]] = []
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            code, path = entry[:2], entry[3:]
+            if "R" in code or "C" in code:
+                i += 1  # the path it came from follows
+            if path == ".baton" or path.startswith(".baton/"):
+                continue
+            found.append((code, path))
+        digest = hashlib.sha256(_head(workdir).encode())
+        for code, path in sorted(found):
+            digest.update(f"\0{code}\0{path}\0{_file_digest(root / path)}".encode())
+        return digest.hexdigest()
+    except Exception:
+        return None
 
 
 # preemption
@@ -431,6 +529,23 @@ class _Run:
         self.mem_checked = False
         self.pending: RoundEntry | None = None
         self.pending_saved = False  # its page is already stored, with gate "none"
+        # Phases: the state of the cycle, who built last (a review goes to someone else), and
+        # whether the gate about to run is the one at the end of a cycle.
+        self.phases = goal.phases
+        self.ps = PhaseState()
+        self.builder = ""
+        self.cycle_gate = False
+        self.from_gate = False  # the cycle at plan began with a failed gate
+        self.idle_rounds = 0  # rounds since the phase last changed, whatever their outcome
+        self.build_idle = 0  # rounds in build in a row that closed no task
+        self.build_rounds = 0  # rounds in build in this cycle
+        self.build_limit = 0  # their cap: set when the cycle's build begins
+        self.seen_open: list[str] = []  # the open tasks after the last round in build
+        self.archive_next = False  # the next round begins a cycle: PLAN.md and REVIEW.md go away
+        self.warned_no_repo = False
+        self.skills_why = ""
+        # Superpowers, read once; until it is found the job waits and runs no round.
+        self.skills: superpowers.Skills | None = None
 
     # plumbing
 
@@ -494,6 +609,24 @@ class _Run:
             "collected_inbox": self.collected_inbox,
             "owes_round": self.owes_round,
             "verify_warning": self.verify_warning,
+            **(
+                {
+                    "phase": self.ps.to_json(),
+                    "builder": self.builder,
+                    "from_gate": self.from_gate,
+                    "cycle_gate": self.cycle_gate,
+                    "archive_next": self.archive_next,
+                    "counters": {
+                        "idle_rounds": self.idle_rounds,
+                        "build_idle": self.build_idle,
+                        "build_rounds": self.build_rounds,
+                        "build_limit": self.build_limit,
+                        "seen_open": list(self.seen_open),
+                    },
+                }
+                if self.phases
+                else {}
+            ),
         }
 
     @staticmethod
@@ -511,6 +644,9 @@ class _Run:
         """Write the runner's part of state.json. Raises StateError when it cannot be read."""
         state = self.store.load_state()
         state.update(self.runner_state())
+        if not self.phases:
+            for key in ("phase", "builder", "from_gate", "cycle_gate", "archive_next", "counters"):
+                state.pop(key, None)  # nothing left over from an earlier run with phases on
         self.store.save_state(state)
 
     def persist_softly(self) -> bool:
@@ -645,16 +781,27 @@ class _Run:
         same_dir = state.get("workdir") == str(goal.workdir)
         saved = state.get("sessions")
         heads = state.get("heads")
+        # Sessions are kept per agent, or per agent and role with phases: a key this run does not
+        # use (an old one, or one from the other mode) is ignored and its agent starts fresh.
+        keys = (
+            {f"{a}:{role}" for a in goal.agents for role in (PLAN, BUILD)}
+            if self.phases
+            else set(goal.agents)
+        )
         if same_dir and isinstance(saved, dict):
             self.sessions = {
-                a: s for a, s in saved.items() if isinstance(s, str) and s and a in goal.agents
+                k: s for k, s in saved.items() if isinstance(s, str) and s and k in keys
             }
         else:
             self.sessions = {}
             if saved:
                 self.emit("alert", message="working directory changed: session ids cleared")
         self.heads = (
-            {a: h for a, h in heads.items() if isinstance(h, str) and a in goal.agents}
+            {
+                k: h
+                for k, h in heads.items()
+                if isinstance(k, str) and isinstance(h, str) and k.split(":")[0] in goal.agents
+            }
             if same_dir and isinstance(heads, dict)
             else {}
         )
@@ -670,9 +817,49 @@ class _Run:
         warning = state.get("verify_warning")
         self.verify_warning = warning if isinstance(warning, str) else ""
         prepare_workdir(goal)
+        if self.phases:
+            self.start_phases(state, same_dir)
         self.sched = sched
         self.persist()
         self.ready = True
+
+    def start_phases(self, state: dict, same_dir: bool) -> None:
+        """Resume the cycle from state.json. A fresh job, a job from before phases, a state that
+        cannot be read and a message that owes a round all start a cycle at plan, based on the
+        commit the workdir is at now."""
+        stored = PhaseState.parse(state.get("phase") if same_dir else None)
+        # A job is fresh when no valid phase was stored (a stored start state, with an empty base,
+        # is a state like any other), or when a message owes a round.
+        if stored is None or self.owes_round:
+            stored = PhaseState(PLAN, base=_head(self.goal.workdir))
+            # A plan and a review from an earlier goal are not this one's.
+            self.archive_cycle_files()
+        self.ps = stored
+        if same_dir and not self.owes_round:
+            # A cycle that ended before the runner was killed: the gate that starts this run is
+            # that cycle's gate; and a new cycle's plan files may still be waiting to move.
+            self.cycle_gate = state.get("cycle_gate") is True
+            self.archive_next = state.get("archive_next") is True
+        counters = state.get("counters") if same_dir else None
+        if isinstance(counters, dict) and stored.phase != PLAN:
+            for name in ("idle_rounds", "build_idle", "build_rounds", "build_limit"):
+                value = counters.get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    setattr(self, name, value)
+            seen = counters.get("seen_open")
+            if isinstance(seen, list) and all(isinstance(t, str) for t in seen):
+                self.seen_open = seen
+        builder = state.get("builder")
+        self.builder = builder if isinstance(builder, str) and builder in self.goal.agents else ""
+        self.from_gate = state.get("from_gate") is True and not self.owes_round
+
+    def archive_cycle_files(self) -> None:
+        """Move PLAN.md and REVIEW.md out of the way when a new cycle begins (not when a failed
+        gate sends the same cycle back to plan)."""
+        try:
+            archive_plan(self.goal.workdir, self.clock())
+        except OSError as exc:
+            self.emit("error", error=f"could not archive the plan: {exc}")
 
     def step(self) -> int | None:
         if not self.ready:
@@ -681,12 +868,17 @@ class _Run:
         if self.need_gate and goal.verify_command:
             passed, self.gate_tail = run_gate(goal, should_kill=self.stop_now)
             self.need_gate = False
+            cycle_gate = self.cycle_gate
             self.emit("gate", passed=passed, tail=self.gate_tail)
             self.check_gate_ran()
             stopped = self.gate_tail.rstrip().endswith("[verify stopped]")
             self.record_pending(
                 "none" if stopped else "passed" if passed else "failed", self.gate_tail
             )
+            self.idle_rounds = 0  # whatever the reason it ran, the count starts again
+            if cycle_gate and not stopped:
+                self.cycle_gate = False  # only once the gate has finished: a stopped one is redone
+                self.after_cycle_gate(passed)
             if passed and not self.owes_round and not self.unread_notes():
                 return self.finish("verify passed")
         self.need_gate = False
@@ -702,8 +894,24 @@ class _Run:
             self.nap_until(until)
         if self.honour_stop():
             return 0
+        if self.skills is None and not self.load_skills():
+            # Superpowers is mandatory: no round runs without it, and the job waits, running,
+            # and looks again, so installing it is all that is needed.
+            until = self.clock() + SKILLS_RETRY_S
+            self.emit(
+                "wait",
+                reason=f"{self.skills_why}: no round runs without Superpowers. Install it with: "
+                f"{superpowers.INSTALL_COMMAND}",
+                until=until,
+                seconds=SKILLS_RETRY_S,
+                agents={},
+            )
+            self.nap_until(until)
+            return None
         assert self.sched is not None
-        adapter = self.sched.pick()
+        # A review goes to someone other than the agent that built, when another can take it.
+        avoid = self.builder if self.phases and self.ps.phase == REVIEW else ""
+        adapter = self.sched.pick(avoid=avoid) if avoid else self.sched.pick()
         self.sched.save()
         if adapter is None:
             until = self.sched.next_wake()
@@ -718,6 +926,19 @@ class _Run:
         if self.run_round(adapter) and not self.unread_notes():
             return self.finish("round completed")
         return None
+
+    def after_cycle_gate(self, passed: bool) -> None:
+        """The gate at the end of a cycle is the only judge. Passed: the next cycle, if one is
+        owed, starts from where the code is now. Failed: back to plan with the base kept, so the
+        strong model diagnoses the output and adds tasks."""
+        if passed:
+            self.ps = replace(self.ps, base=_head(self.goal.workdir))
+            self.archive_next = True
+        else:
+            self.ps = replace(self.ps, phase=PLAN, cycles=0, stuck=0, last_open=[])
+            self.from_gate = True
+            self.emit("phase", phase=PLAN, cycle=0, reason="verify failed: back to plan")
+        self.persist_softly()
 
     def check_gate_ran(self) -> None:
         """Warn once per run of gates that could not run; `baton status` shows the warning until
@@ -775,8 +996,13 @@ class _Run:
         assert self.sched is not None
         goal, store = self.goal, self.store
         agent = adapter.name
+        if self.archive_next:
+            self.archive_next = False
+            self.archive_cycle_files()
         gate_was_due = self.need_gate
-        self.need_gate = True
+        # With phases the gate waits for the end of a cycle; without them it follows every round.
+        self.need_gate = not self.phases
+        phase = self.ps.phase if self.phases else ""
         n = self.round_no + 1
         self.round_no = n
         try:
@@ -791,8 +1017,14 @@ class _Run:
         self.collect_notes()
         notes = self.carried_notes
         handoff = self.read_handoff()
-        sid = self.sessions.get(agent)
-        since = commits_since(goal.workdir, self.heads.get(agent, ""))
+        # The conversation of an agent is tied to its model: per role with phases, and a review
+        # is always a fresh one.
+        key = agent if not self.phases else (f"{agent}:{phase}" if phase != REVIEW else "")
+        sid = self.sessions.get(key) if key else None
+        # What changed since this agent's last round in this role: kept per session key, with the
+        # review (which has no session) under its own.
+        head_key = key or f"{agent}:{phase}"
+        since = commits_since(goal.workdir, self.heads.get(head_key, ""))
         head_before = _head(goal.workdir) if self.memory() is not None else ""
         recalled = self.recall(n)
         if self.mem is not None and self.stop_requested():
@@ -802,6 +1034,14 @@ class _Run:
             self.need_gate = gate_was_due
             self.persist_softly()
             return False
+
+        review_trusted, tree_before = True, None
+        if phase == REVIEW:
+            # Immediately before the round: no earlier verdict, an old APPROVED or one a builder
+            # wrote, can be read afterwards. And what the tree holds now, to see whether the
+            # reviewer changes the code.
+            review_trusted = clear_review(goal.workdir)
+            tree_before = tree_fingerprint(goal.workdir)
 
         buf = ""
         worked = False
@@ -851,8 +1091,13 @@ class _Run:
             self.group_start = self.start_time(pgid)
             self.persist_softly()
 
+        def on_subagent(tool: str, model: str | None) -> None:
+            self.emit("subagent", agent=agent, round=n, tool=tool, model=model)
+
         def on_session(session: str) -> None:
-            self.sessions[agent] = session
+            if not key:
+                return  # a review keeps no conversation
+            self.sessions[key] = session
             self.persist_softly()
 
         def attempt(session: str | None) -> RoundResult:
@@ -865,6 +1110,10 @@ class _Run:
                 resumed=session is not None,
                 since_commits=since,
                 memory=recalled,
+                phase_block=self.phase_block(phase),
+                # A resumed conversation already holds the methods from its first round, except
+                # that the plan round after a failed gate always gets systematic-debugging.
+                skills=self.skills_block(agent, phase, fresh=session is None),
             )
             ctx = RoundContext(
                 workdir=goal.workdir,
@@ -876,6 +1125,8 @@ class _Run:
                 on_spawn=on_spawn,
                 session_id=session,
                 on_session=on_session,
+                tier=TIER[phase] if phase else "strong",
+                on_subagent=on_subagent,
             )
             self.emit(
                 "round_start",
@@ -896,7 +1147,7 @@ class _Run:
         try:
             result = attempt(sid)
             if result.resume_failed and sid is not None:
-                self.sessions.pop(agent, None)
+                self.sessions.pop(key, None)
                 self.emit("alert", agent=agent, message="resume failed: running the round fresh")
                 # The failed attempt delivered nothing: the fresh one decides what was spent.
                 spawned = worked = False
@@ -912,13 +1163,26 @@ class _Run:
                 PREEMPTED, reason=f"{watch.back} is available again", back=watch.back
             )
 
+        # A round cut off by its own cap (bounded) is complete for the scheduler, not for the work.
+        completed = result.outcome == COMPLETED and not killed and not result.bounded
+        # A reviewer is not to change the code: compared before baton's own snapshot commit.
+        void = False
+        if phase == REVIEW and completed:
+            tree_after = tree_fingerprint(goal.workdir)
+            void = tree_before is None or tree_after is None or tree_before != tree_after
+
         self.group = None
         ended = self.clock()
         # Record first: nothing after this can lose a credit_guard or limit outcome.
         self.sched.record(agent, result, seconds=ended - started)
-        if result.outcome in (CREDIT_GUARD, AUTH):
+        if result.outcome in (CREDIT_GUARD, AUTH, SUBAGENT):
             self.emit("alert", agent=agent, outcome=result.outcome, reason=result.reason)
         snapshotted = snapshot_work(goal, n, agent)
+        cycle_ended = False
+        if self.phases:
+            cycle_ended = self.after_round(phase, completed, void, review_trusted, spawned)
+            if spawned and phase == BUILD:
+                self.builder = agent
         # A process that exists has not read its prompt: one that dies at once with a 429, or is
         # ended before it says anything, leaves the notes and the context for the next round.
         finished_its_turn = result.outcome in (COMPLETED, TIMEOUT) and not killed
@@ -930,12 +1194,11 @@ class _Run:
             self.prev_agent = agent
             head = _head(goal.workdir)
             if head:
-                self.heads[agent] = head
-        self.pause_until = (
-            ended + MIN_ROUND_S
-            if result.outcome == COMPLETED and not killed and ended - started < MIN_ROUND_S
-            else 0.0
-        )
+                self.heads[head_key] = head
+        # A round that ends at once, or that baton ended for a subagent on a forbidden model, is
+        # followed by a pause, so nothing can loop and burn usage.
+        quick = result.outcome == COMPLETED and not killed and ended - started < MIN_ROUND_S
+        self.pause_until = ended + MIN_ROUND_S if quick or result.outcome == SUBAGENT else 0.0
         self.emit(
             "round_end",
             round=n,
@@ -947,6 +1210,7 @@ class _Run:
             interrupted=interrupted,
             snapshot=snapshotted,
             back=watch.back if result.outcome == PREEMPTED and watch is not None else None,
+            **({"phase": phase} if self.phases else {}),
         )
         self.persist_softly()
         if spawned and self.memory() is not None:
@@ -965,12 +1229,143 @@ class _Run:
                 commits=commits_since(goal.workdir, head_before) if head_before else "",
                 handoff=self.read_handoff(limit=False),  # whole, for the lessons at its top
                 round_tail=buf,
+                phase=phase,
             )
             if goal.verify_command:
                 self.save_pending()  # the gate may never finish: see `step`
             else:
                 self.record_pending()
-        return not goal.verify_command and result.outcome == COMPLETED and not killed
+        if self.phases:
+            return cycle_ended and not goal.verify_command
+        return not goal.verify_command and completed
+
+    def skills_block(self, agent: str, phase: str, fresh: bool) -> str:
+        if self.skills is None:
+            return ""
+        debugging = self.from_gate and phase == PLAN
+        if fresh:
+            return self.skills.block(agent, phase, debugging=debugging)
+        return self.skills.debug_block() if debugging else ""
+
+    def load_skills(self) -> bool:
+        """Read the Superpowers skills, once they are there. False, with `skills_why` saying what
+        is wrong, when they are missing, unreadable or too big for a prompt."""
+        try:
+            found = superpowers.find_skills(load_superpowers())
+            if found is not None:
+                self.skills = superpowers.Skills.load(found)
+                return True
+            self.skills_why = "Superpowers was not found"
+        except superpowers.SkillsError as exc:
+            self.skills_why = f"Superpowers cannot be used: {exc}"
+        except Exception as exc:
+            self.skills_why = f"Superpowers could not be read ({exc})"
+        return False
+
+    def phase_block(self, phase: str) -> str:
+        """The instructions of the phase for this round's prompt, "" without phases."""
+        if not phase:
+            return ""
+        tasks = open_tasks(read_plan(self.goal.workdir))
+        return phase_prompt(phase, tasks[0] if tasks else "", self.ps.base)
+
+    def after_round(
+        self, phase: str, completed: bool, void: bool, trusted: bool, spawned: bool
+    ) -> bool:
+        """Move the cycle on after a round; True when the cycle ended (the gate's moment).
+
+        Only a round that completed moves the phase: a preempted, killed, limited, timed-out or
+        failed one is repeated by whoever runs next, in the same phase. But every round that ran
+        is counted, so that a phase that never completes still reaches the gate (every third round
+        without a phase change) and a build that closes nothing still reaches review."""
+        goal = self.goal
+        old = self.ps
+        open_now = open_tasks(read_plan(goal.workdir))
+        reason = ""
+        ended = False
+        review_text = ""
+        if completed:
+            if phase == REVIEW:
+                if void:
+                    # What the reviewer did to the code is left where it is; it is a task to review.
+                    self.emit(
+                        "phase",
+                        phase=REVIEW,
+                        cycle=old.cycles,
+                        reason="reviewer changed the code",
+                    )
+                    try:
+                        add_review_task(goal.workdir)
+                    except OSError as exc:
+                        self.emit("error", error=f"could not add the review task: {exc}")
+                    review_text = "CHANGES"
+                elif trusted:
+                    review_text = read_review(goal.workdir)
+            if phase == PLAN:
+                self.from_gate = False  # the strong model has had its look at the failed gate
+            if void:
+                open_now = open_tasks(read_plan(goal.workdir))
+            self.ps, ended = advance(
+                old, outcome_completed=True, open_now=open_now, review_text=review_text
+            )
+            reason = reason_for(old, self.ps, ended, open_now=open_now, review_text=review_text)
+        if spawned and phase == BUILD:
+            self.count_build_round(open_now)
+            if not ended and self.ps.phase == BUILD:
+                if self.build_idle >= BUILD_IDLE_ROUNDS:
+                    reason = f"no task closed in {BUILD_IDLE_ROUNDS} rounds in a row"
+                elif self.build_limit and self.build_rounds >= self.build_limit:
+                    reason = f"build round cap reached ({self.build_limit} rounds)"
+                if reason.startswith(("no task closed", "build round cap")):
+                    self.ps = replace(self.ps, phase=REVIEW, stuck=0, last_open=list(open_now))
+        if self.ps.phase == BUILD and old.phase != BUILD:
+            # The build of this cycle begins (or resumes after a review).
+            self.seen_open = list(open_now)
+            self.build_idle = 0
+            if old.phase == PLAN or not self.build_limit:
+                self.build_rounds = 0
+            # The cap is renewed whenever a review sends the build back: the rounds already
+            # spent, plus what the tasks open now are worth.
+            self.build_limit = (
+                self.build_rounds + len(open_now) * BUILD_ROUNDS_PER_TASK + BUILD_ROUNDS_EXTRA
+            )
+        if self.ps.phase == REVIEW and old.phase != REVIEW and not _is_repo(goal.workdir):
+            # Nothing to diff and nothing to judge a reviewer by: the review is skipped.
+            if not self.warned_no_repo:
+                self.warned_no_repo = True
+                self.emit(
+                    "alert",
+                    message="the working directory is not a git repository: the review phase is "
+                    "skipped, and the cycle ends after build",
+                )
+            self.ps = replace(self.ps, phase=PLAN, cycles=0, stuck=0, last_open=[])
+            ended = True
+            reason = "the working directory is not a git repository: review skipped"
+        if ended:
+            self.need_gate = True
+            self.cycle_gate = True
+            self.build_idle = self.build_rounds = self.build_limit = 0
+            self.seen_open = []
+            if not goal.verify_command:
+                self.ps = replace(self.ps, base=_head(goal.workdir))
+                self.archive_next = True
+        if ended or self.ps.phase != old.phase:
+            self.idle_rounds = 0
+            self.emit("phase", phase=self.ps.phase, cycle=self.ps.cycles, reason=reason)
+        elif spawned:
+            self.idle_rounds += 1
+            if self.idle_rounds >= GATE_EVERY_ROUNDS and goal.verify_command:
+                self.need_gate = (
+                    True  # not the end of a cycle: a pass finishes, a fail changes nothing
+                )
+        return ended
+
+    def count_build_round(self, open_now: list[str]) -> None:
+        """One more round in build: did it close a task, against what the round before left?"""
+        closed = bool(Counter(self.seen_open) - Counter(open_now))
+        self.build_idle = 0 if closed else self.build_idle + 1
+        self.build_rounds += 1
+        self.seen_open = list(open_now)
 
     def current_objective(self) -> str:
         try:

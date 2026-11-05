@@ -33,6 +33,9 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    check_subagent,
+    find_model,
+    tier_config,
 )
 from baton.adapters.guard import RETRY_S, Eval, Guard, LimitsError, run_guarded
 from baton.config import AgentConfig
@@ -371,6 +374,28 @@ def _parse_event(line: str) -> dict | None:
     return event if isinstance(event, dict) else None
 
 
+# The tools that start or manage a subagent, as `step_update` names them.
+SUBAGENT_TOOLS = ("define_subagent", "invoke_subagent", "manage_subagents")
+
+
+def _type_name(step: dict, depth: int = 2) -> str:
+    """The `TypeName` a subagent call asks for, wherever the step carries it, or ""."""
+    for key, value in step.items():
+        if (
+            isinstance(key, str)
+            and key.lower() in ("typename", "type_name")
+            and isinstance(value, str)
+        ):
+            return value
+    if depth > 0:
+        for value in step.values():
+            if isinstance(value, dict):
+                found = _type_name(value, depth - 1)
+                if found:
+                    return found
+    return ""
+
+
 def _payload(event: dict) -> dict:
     inner = event.get(event.get("event")) if isinstance(event.get("event"), str) else None
     return inner if isinstance(inner, dict) else {}
@@ -414,21 +439,22 @@ class AntigravityAdapter:
         except Exception as exc:
             return Availability(False, until=now + RETRY_S, reason=f"cannot read limits: {exc}")
 
-    def argv(self, prompt: str, session_id: str | None) -> list[str]:
+    def argv(self, prompt: str, session_id: str | None, tier: str = "strong") -> list[str]:
+        cfg = tier_config(self.cfg, tier)
         # A NUL byte would make exec fail; a leading slash would run a slash command instead.
         prompt = prompt.replace("\x00", "")
         if prompt.lstrip().startswith("/"):
             prompt = "Task:\n" + prompt
         argv = [
-            self.cfg.bin,
+            cfg.bin,
             "-p",
             prompt,
             "--output-format",
             "stream-json",
             "--model",
-            self.cfg.model,
+            cfg.model,
         ]
-        if self.cfg.full_access:
+        if cfg.full_access:
             argv.append("--dangerously-skip-permissions")
         if session_id is not None:
             argv += ["--conversation", session_id]
@@ -439,6 +465,7 @@ class AntigravityAdapter:
         problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
         reported = False
         final: dict | None = None
+        subagents: set[tuple] = set()
 
         def on_line(line: str) -> RoundResult | None:
             nonlocal reported, final
@@ -455,9 +482,11 @@ class AntigravityAdapter:
                     ctx.on_session(cid)
             elif kind == "result":
                 final = _payload(event)
+            elif kind == "step_update":
+                return self._subagent(event, ctx, subagents)
             return None
 
-        argv = self.argv(prompt, ctx.session_id)
+        argv = self.argv(prompt, ctx.session_id, ctx.tier)
 
         def start(run_ctx: RoundContext) -> RoundResult:
             # The prompt travels in argv; stdin stays closed (None), or agy waits on it.
@@ -469,6 +498,24 @@ class AntigravityAdapter:
             return self._outcome(exit_.timed_out, final, problems, ctx)
 
         return run_guarded(guard, ctx, self.cfg.bin, start)
+
+    def _subagent(self, event: dict, ctx: RoundContext, seen: set[tuple]) -> RoundResult | None:
+        """A step that starts or manages a subagent. `TypeName` `self` runs on the round's own
+        model and is allowed; a model the step shows must be one of the two."""
+        step = _payload(event)
+        tool = step.get("tool_name")
+        if tool not in SUBAGENT_TOOLS and step.get("step_type") != "subagent":
+            return None
+        name = tool if isinstance(tool, str) and tool else "subagent"
+        index = step.get("step_index")
+        key = (step.get("conversation_id"), index, name)
+        if index is not None and key in seen:
+            return None  # the same step reported again as it progresses
+        inherits = _type_name(step).lower() == "self"
+        model = None if inherits else find_model(step)
+        if index is not None and (inherits or model is not None):
+            seen.add(key)  # only once its model is known: an earlier report may not show it
+        return check_subagent(self.cfg, ctx, name, model, enforce=True)
 
     def _outcome(
         self, timed_out: bool, final: dict | None, problems: deque[str], ctx: RoundContext

@@ -26,6 +26,7 @@ from baton.adapters.base import (
     COMPLETED,
     CREDIT_GUARD,
     LIMIT,
+    SUBAGENT,
     TIMEOUT,
     TRANSIENT,
     RoundContext,
@@ -100,6 +101,8 @@ def make_cfg(bin_path="agy", **kw) -> AgentConfig:
         enabled=True,
         model="gemini-4-argon-medium",
         effort="medium",
+        build_model="gemini-3.8-flash-high",
+        build_effort="high",
         threshold_pct=90,
         poll_s=30,
         bin=bin_path,
@@ -491,6 +494,28 @@ def test_argv_fresh_and_resume():
     ]
     assert a.argv("do it", "conv-9")[-2:] == ["--conversation", "conv-9"]
     assert "--dangerously-skip-permissions" in a.argv("do it", "conv-9")
+
+
+def test_argv_build_tier_uses_the_build_model_and_keeps_the_rest():
+    a = AntigravityAdapter(make_cfg("/opt/agy"), read=Reads())
+    strong, build = a.argv("do it", "c1"), a.argv("do it", "c1", tier="build")
+    assert strong[strong.index("--model") + 1] == "gemini-4-argon-medium"
+    assert build[build.index("--model") + 1] == "gemini-3.8-flash-high"
+    strong[strong.index("--model") + 1] = build[build.index("--model") + 1]
+    assert strong == build  # nothing else differs
+
+
+def test_a_round_context_with_the_build_tier_reaches_argv(tmp_path):
+    seen = []
+
+    class Spy(AntigravityAdapter):
+        def argv(self, prompt, session_id, tier="strong"):
+            seen.append(tier)
+            return super().argv(prompt, session_id, tier)
+
+    a = Spy(make_cfg("/nonexistent/agy"), read=Reads())
+    a.run_round("x", make_ctx(tmp_path, tier="build"))
+    assert seen == ["build"]
 
 
 def test_argv_without_full_access_drops_the_bypass_flag():
@@ -1005,3 +1030,152 @@ def test_a_credits_answer_of_the_wrong_type_is_blind_not_a_crash():
     a = AntigravityAdapter(make_cfg(), read=reads, poll_clock=Clock())
     ev = evaluate(a._read(), 90, NOW)
     assert ev.blind and ev.balance is None and not ev.avail.ok
+
+
+# --- the subagent guard ------------------------------------------------------------------------
+
+
+def sub_step(tool="invoke_subagent", step_type="tool", index=2, **extra):
+    return {
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": "conv-1",
+            "step_index": index,
+            "state": "ACTIVE",
+            "step_type": step_type,
+            "tool_name": tool,
+            **extra,
+        },
+    }
+
+
+def agy_round(tmp_path, monkeypatch, events, **ctx_kw):
+    """A round that prints `events` and then stays alive for 30 s, so a fast return proves the
+    guard ended it."""
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps(events))
+    monkeypatch.setenv("FAKE_AGY_EXEC_SLEEP", "30")
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    seen = []
+    a = adapter(str(wrapper), Reads())
+    ctx = make_ctx(tmp_path, on_subagent=lambda t, m: seen.append((t, m)), **ctx_kw)
+    started = time.monotonic()
+    return a.run_round("go", ctx), seen, time.monotonic() - started
+
+
+@pytest.mark.parametrize("model", ["gemini-4-argon-medium", "gemini-3.8-flash-high"])
+def test_a_subagent_on_either_of_the_two_models_is_allowed(tmp_path, monkeypatch, model):
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps([sub_step(model=model)]))
+    monkeypatch.setenv("FAKE_AGY_CALLS", str(tmp_path / "calls.jsonl"))
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    seen = []
+    result = adapter(str(wrapper), Reads()).run_round(
+        "go", make_ctx(tmp_path, on_subagent=lambda t, m: seen.append((t, m)))
+    )
+    assert result.outcome == COMPLETED and seen == [("invoke_subagent", model)]
+
+
+def test_a_subagent_on_another_model_ends_the_round(tmp_path, monkeypatch):
+    result, seen, took = agy_round(tmp_path, monkeypatch, [sub_step(model="gemini-2-pro")])
+    assert result.outcome == SUBAGENT and "gemini-2-pro" in result.reason
+    assert seen == [("invoke_subagent", "gemini-2-pro")] and took < 15
+
+
+def test_a_self_typed_subagent_inherits_the_round_model_and_is_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps([sub_step(args={"TypeName": "self"})]))
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    seen = []
+    result = adapter(str(wrapper), Reads()).run_round(
+        "go", make_ctx(tmp_path, on_subagent=lambda t, m: seen.append((t, m)))
+    )
+    assert result.outcome == COMPLETED and seen == [("invoke_subagent", None)]
+
+
+def test_a_self_typed_subagent_is_allowed_even_if_a_model_is_named(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "FAKE_AGY_EXTRA", json.dumps([sub_step(TypeName="self", model="gemini-2-pro")])
+    )
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    result = adapter(str(wrapper), Reads()).run_round("go", make_ctx(tmp_path))
+    assert result.outcome == COMPLETED
+
+
+@pytest.mark.parametrize("tool", ["define_subagent", "manage_subagents"])
+def test_every_subagent_tool_is_seen(tmp_path, monkeypatch, tool):
+    result, seen, _ = agy_round(tmp_path, monkeypatch, [sub_step(tool, model="gemini-2-pro")])
+    assert result.outcome == SUBAGENT and seen[0][0] == tool
+
+
+def test_a_step_of_type_subagent_is_seen_whatever_its_tool(tmp_path, monkeypatch):
+    event = sub_step(tool="other", step_type="subagent", model="gemini-2-pro")
+    result, _, _ = agy_round(tmp_path, monkeypatch, [event])
+    assert result.outcome == SUBAGENT
+
+
+def test_a_subagent_whose_model_is_not_shown_is_logged_and_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps([sub_step()]))
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    seen = []
+    result = adapter(str(wrapper), Reads()).run_round(
+        "go", make_ctx(tmp_path, on_subagent=lambda t, m: seen.append((t, m)))
+    )
+    assert result.outcome == COMPLETED and seen == [("invoke_subagent", None)]
+
+
+def test_a_resumed_and_a_build_round_are_guarded_too(tmp_path, monkeypatch):
+    events = [sub_step(model="gemini-2-pro")]
+    result, _, took = agy_round(tmp_path, monkeypatch, events, session_id="conv-9", tier="build")
+    assert result.outcome == SUBAGENT and took < 15
+
+
+def test_ordinary_steps_are_not_subagents(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps([sub_step(tool="run_command", model="x")]))
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    seen = []
+    result = adapter(str(wrapper), Reads()).run_round(
+        "go", make_ctx(tmp_path, on_subagent=lambda t, m: seen.append((t, m)))
+    )
+    assert result.outcome == COMPLETED and seen == []
+
+
+def test_a_step_whose_model_only_shows_later_is_still_judged(tmp_path, monkeypatch):
+    events = [sub_step(), sub_step(model="gemini-2-pro")]  # the same step, reported twice
+    result, seen, _ = agy_round(tmp_path, monkeypatch, events)
+    assert result.outcome == SUBAGENT
+    assert seen == [("invoke_subagent", None), ("invoke_subagent", "gemini-2-pro")]
+
+
+def test_steps_without_an_index_are_never_deduplicated(tmp_path, monkeypatch):
+    def anonymous():
+        event = sub_step(model="gemini-3.8-flash-high")
+        del event["step_update"]["step_index"]
+        return event
+
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps([anonymous(), anonymous()]))
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    seen = []
+    adapter(str(wrapper), Reads()).run_round(
+        "go", make_ctx(tmp_path, on_subagent=lambda t, m: seen.append((t, m)))
+    )
+    assert len(seen) == 2
+
+
+def test_the_two_ids_without_their_effort_suffix_are_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_AGY_EXTRA", json.dumps([sub_step(model="gemini-3.8-flash")]))
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    assert adapter(str(wrapper), Reads()).run_round("go", make_ctx(tmp_path)).outcome == COMPLETED

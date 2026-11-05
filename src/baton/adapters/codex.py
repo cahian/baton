@@ -28,6 +28,10 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    check_subagent,
+    find_model,
+    subagent_guard_command,
+    tier_config,
 )
 from baton.adapters.guard import RETRY_S, Eval, Guard, LimitsError, run_guarded
 from baton.config import AgentConfig
@@ -329,6 +333,21 @@ def _event_message(event: dict) -> str:
     return msg if isinstance(msg, str) else ""
 
 
+def hook_config() -> str:
+    """`-c hooks.PreToolUse=[...]`: Codex prefixes the tool name (`collaborationspawn_agent`), so
+    the matcher is a pattern. The command is a TOML string."""
+    command = json.dumps(subagent_guard_command())
+    return (
+        'hooks.PreToolUse=[{matcher=".*spawn_agent",'
+        f'hooks=[{{type="command",command={command}}}]}}]'
+    )
+
+
+def codex_allowed_models(cfg: AgentConfig) -> list[str]:
+    """The pair, strong first, as `BATON_ALLOWED_MODELS` names it."""
+    return list(dict.fromkeys([cfg.model, cfg.build_model]))
+
+
 class CodexAdapter:
     name = "codex"
     metered = False
@@ -354,8 +373,8 @@ class CodexAdapter:
         except Exception as exc:
             return Availability(False, until=now + RETRY_S, reason=f"cannot read limits: {exc}")
 
-    def argv(self, session_id: str | None, workdir: str) -> list[str]:
-        cfg = self.cfg
+    def argv(self, session_id: str | None, workdir: str, tier: str = "strong") -> list[str]:
+        cfg = tier_config(self.cfg, tier)
         common = [
             "--json",
             "--skip-git-repo-check",
@@ -363,6 +382,14 @@ class CodexAdapter:
             cfg.model,
             "-c",
             f"model_reasoning_effort={cfg.effort}",
+            # The subagent guard, for this run only (nothing in ~/.codex is touched): a PreToolUse
+            # hook on spawn_agent that denies a model outside the pair before the subagent exists.
+            # features.hooks=true so that no config file can switch hooks off.
+            "-c",
+            "features.hooks=true",
+            "-c",
+            hook_config(),
+            "--dangerously-bypass-hook-trust",
         ]
         if session_id is None:
             access = (
@@ -384,6 +411,7 @@ class CodexAdapter:
         guard = Guard(self.cfg, self._read, _evaluate, self._poll_clock, self._wall_clock)
         problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
         reported = False
+        subagents: set[str] = set()
 
         def on_line(line: str) -> RoundResult | None:
             nonlocal reported
@@ -402,13 +430,36 @@ class CodexAdapter:
                 text = _event_message(event)
                 if text:
                     problems.append(text[:500])
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "collab_tool_call":
+                # Started and completed arrive as two events for one call. It is judged until its
+                # model has been seen, and then once; a call with no id is never skipped.
+                ident = item.get("id") if isinstance(item.get("id"), str) else None
+                model = find_model(item)
+                if ident is None or ident not in subagents:
+                    if ident is not None and model is not None:
+                        subagents.add(ident)
+                    tool = item.get("tool") or item.get("name")
+                    return check_subagent(
+                        self.cfg,
+                        ctx,
+                        tool if isinstance(tool, str) and tool else "collab_tool_call",
+                        model,
+                    )
             return None
 
-        argv = self.argv(ctx.session_id, str(ctx.workdir))
+        argv = self.argv(ctx.session_id, str(ctx.workdir), ctx.tier)
 
         def start(run_ctx: RoundContext) -> RoundResult:
             exit_ = run_streaming(
-                argv, ctx.workdir, prompt, run_ctx, on_line, guard.tick, tick_s=self.tick_s
+                argv,
+                ctx.workdir,
+                prompt,
+                run_ctx,
+                on_line,
+                guard.tick,
+                tick_s=self.tick_s,
+                plain_env={"BATON_ALLOWED_MODELS": ",".join(codex_allowed_models(self.cfg))},
             )
             if exit_.stopped is not None:
                 return exit_.stopped

@@ -8,6 +8,7 @@ does: "ANTHROPIC_API_KEY" when that variable is set, "none" otherwise, unless ov
   FAKE_CLAUDE_NO_INIT         no init event
   FAKE_CLAUDE_ASSISTANT_FIRST an assistant event before the init event
   FAKE_CLAUDE_NO_ASSISTANT    no assistant event at all
+  FAKE_CLAUDE_EXTRA           a JSON list of events printed after the assistant event
   FAKE_CLAUDE_TEXT            text of the assistant message (default "working on it")
   FAKE_CLAUDE_ECHO_KEY        also prints the API key inside the assistant text
   FAKE_CLAUDE_SLEEP           seconds to stay alive before the result event
@@ -54,7 +55,13 @@ def main() -> None:
             "argv": argv,
             "cwd": os.getcwd(),
             "stdin": prompt,
-            "env": {k: v for k, v in env.items() if k.startswith(("ANTHROPIC", "CLAUDE_CODE"))},
+            "env": {
+                k: v
+                for k, v in env.items()
+                if k.startswith(
+                    ("ANTHROPIC", "CLAUDE_CODE", "BATON", "AWS_BEARER", "CLAUDE_CONFIG")
+                )
+            },
         }
         with open(env["FAKE_CLAUDE_CALLS"], "a") as fh:
             fh.write(json.dumps(record) + "\n")
@@ -101,6 +108,8 @@ def main() -> None:
         )
     if not env.get("FAKE_CLAUDE_ASSISTANT_FIRST") and not env.get("FAKE_CLAUDE_NO_ASSISTANT"):
         emit(assistant)
+    for extra in json.loads(env.get("FAKE_CLAUDE_EXTRA", "[]")):
+        emit(extra)
     if env.get("FAKE_CLAUDE_BIG_CJK"):
         sys.stdout.reconfigure(encoding="utf-8")
         n = 20000

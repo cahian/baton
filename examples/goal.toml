@@ -14,6 +14,7 @@ round_max_s = 3600   # one round may not run longer than this
 idle_s = 1200        # nor stay silent longer than this
 snapshot = true      # commit uncommitted work locally after each round (never pushes)
 memory = true        # long-term memory through ai-memory; false turns it off for this goal
+phases = true        # plan, build and review with a strong and a working model; false: the plain relay
 
 # The gate. The goal is finished only when this exits 0. Without it, the goal is finished as
 # soon as one round completes.
@@ -25,6 +26,8 @@ timeout_s = 3600
 enabled = true
 model = "gpt-6.1-sol"
 effort = "medium"
+build_model = "gpt-6.1-terra"   # the working tier of the phases
+build_effort = "high"
 threshold_pct = 90   # stop at this percent used of every window
 poll_s = 15
 full_access = true   # false: --sandbox workspace-write instead of bypassing the sandbox
@@ -32,6 +35,7 @@ full_access = true   # false: --sandbox workspace-write instead of bypassing the
 [agents.antigravity]
 enabled = true
 model = "gemini-4-argon-medium"   # the effort is part of the model id
+build_model = "gemini-3.8-flash-high"
 threshold_pct = 90
 poll_s = 30
 
@@ -41,5 +45,7 @@ poll_s = 30
 enabled = true
 model = "claude-opus-5-5"
 effort = "medium"
+build_model = "claude-sonnet-5-5"
+build_effort = "high"
 round_budget_usd = 5
 key_file = "~/.config/baton/anthropic.key"

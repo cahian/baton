@@ -19,6 +19,7 @@ A prompt (`-p <text> --output-format stream-json ...`) prints JSON lines. Every 
   FAKE_AGY_NO_RESULT        when set, no result event is printed
   FAKE_AGY_RAW_LINE         a non-JSON line printed before the result
   FAKE_AGY_PIDFILE          gets the pid
+  FAKE_AGY_EXTRA            a JSON list of events printed after the first step_update
 """
 
 import json
@@ -84,6 +85,8 @@ def prompt_cmd(argv: list[str]) -> None:
             },
         }
     )
+    for extra in json.loads(os.environ.get("FAKE_AGY_EXTRA", "[]")):
+        emit(extra)
     raw = os.environ.get("FAKE_AGY_RAW_LINE")
     if raw:
         sys.stdout.write(raw + "\n")

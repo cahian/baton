@@ -6,6 +6,7 @@ import pytest
 from baton.config import (
     GoalError,
     MemoryConfig,
+    check_repo_table,
     default_agent,
     defaults_path,
     goal_from_table,
@@ -526,3 +527,60 @@ def test_a_repository_table_may_set_memory(tmp_path):
         path=tmp_path / "baton.toml",
     )
     assert goal.memory is False
+
+
+# --- phases ----------------------------------------------------------------------------------
+
+
+@pytest.mark.phases
+def test_phases_default_to_on_and_can_be_turned_off(tmp_path):
+    assert load_goal(write(tmp_path, minimal())).phases is True
+    off = minimal().replace('objective = "Ship it."', 'objective = "x"\nphases = false')
+    assert load_goal(write(tmp_path, off)).phases is False
+
+
+def test_the_test_default_is_the_plain_relay(tmp_path):
+    # the autouse fixture turns phases off for every test that is not about them
+    assert load_goal(write(tmp_path, minimal())).phases is False
+
+
+@pytest.mark.phases
+def test_phases_must_be_a_boolean(tmp_path):
+    bad = minimal().replace('objective = "Ship it."', 'objective = "x"\nphases = "yes"')
+    with pytest.raises(GoalError, match="phases"):
+        load_goal(write(tmp_path, bad))
+
+
+def test_every_agent_has_a_build_tier_by_default(tmp_path):
+    agents = load_goal(write(tmp_path, minimal())).agents
+    assert (agents["codex"].model, agents["codex"].effort) == ("gpt-6.1-sol", "medium")
+    assert (agents["codex"].build_model, agents["codex"].build_effort) == ("gpt-6.1-terra", "high")
+    assert agents["antigravity"].model == "gemini-4-argon-medium"
+    assert agents["antigravity"].build_model == "gemini-3.8-flash-high"
+    assert (agents["claude_api"].model, agents["claude_api"].effort) == (
+        "claude-opus-5-5",
+        "medium",
+    )
+    assert (agents["claude_api"].build_model, agents["claude_api"].build_effort) == (
+        "claude-sonnet-5-5",
+        "high",
+    )
+
+
+def test_build_models_can_be_set_in_a_goal_and_in_the_defaults(tmp_path, monkeypatch):
+    defaults(tmp_path, monkeypatch, '[agents.codex]\nbuild_model = "x-terra"\n')
+    text = minimal() + '[agents.codex]\nbuild_effort = "low"\n[agents.claude_api]\n'
+    text += 'build_model = "claude-sonnet-9"\n'
+    agents = load_goal(write(tmp_path, text)).agents
+    assert (agents["codex"].build_model, agents["codex"].build_effort) == ("x-terra", "low")
+    assert agents["claude_api"].build_model == "claude-sonnet-9"
+
+
+def test_the_antigravity_build_model_must_be_a_gemini(tmp_path):
+    text = minimal() + '[agents.antigravity]\nbuild_model = "gpt-6.1-terra"\n'
+    with pytest.raises(GoalError, match="build_model"):
+        load_goal(write(tmp_path, text))
+
+
+def test_a_repository_file_may_set_phases_and_build_models():
+    check_repo_table({"phases": False, "agents": {"codex": {"build_model": "m"}}})

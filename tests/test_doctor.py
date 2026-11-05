@@ -289,6 +289,18 @@ def test_stray_anthropic_variables_are_flagged(fakes, monkeypatch):
         assert SECRET not in c.name and SECRET not in c.detail
 
 
+def test_claude_subscription_tokens_are_flagged_and_never_shown(fakes, monkeypatch):
+    names = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+    for var in names:
+        monkeypatch.setenv(var, SECRET)
+    checks = run(fakes)
+    for var in names:
+        flagged = check(checks, var)
+        assert not flagged.ok and not flagged.blocking
+    for c in checks:
+        assert SECRET not in c.name and SECRET not in c.detail
+
+
 def test_claude_without_a_key_is_no_problem_when_others_can_run(fakes):
     checks = run(fakes, claude="")  # no key file written: Claude is optional
     assert check(checks, "claude_api").ok

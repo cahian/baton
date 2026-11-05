@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import queue
 import signal
@@ -27,6 +28,8 @@ SCRUBBED_ENV = (
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "CODEX_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",  # a Claude subscription login: only the API key may be used
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "CODEX_ACCESS_TOKEN",
     "CODEX_GUARDIAN_DECISIONS_API_KEY",
     "OPENAI_IDENTITY_TOKEN_FILE",
@@ -253,6 +256,8 @@ def run_streaming(
     tick: Callable[[], RoundResult | None],
     tick_s: float = 1.0,
     extra_env: Mapping[str, str] | None = None,
+    plain_env: Mapping[str, str] | None = None,
+    scrub: Sequence[str] = (),
 ) -> Exit:
     """Run `argv` in its own session and stream merged stdout/stderr line by line.
 
@@ -266,6 +271,10 @@ def run_streaming(
     `extra_env` is added to the scrubbed environment of this child only: the way an adapter passes
     its own credential. Its values are replaced by `[redacted]` in everything that leaves this
     function (the log, `on_output`, `on_line`, the tail), in case the child prints them.
+    `scrub` names (patterns) of further environment variables to drop first, before `extra_env`
+    puts the adapter's own back.
+    `plain_env` is added the same way but is no secret (a model name, a switch), so it is not
+    replaced: the stream has to be able to show it.
 
     Time limits only stop reading. Every queued line reaches `on_line` unless a stop was already
     decided, and the queue is bounded, so that is finite. The group is killed from its own
@@ -273,6 +282,9 @@ def run_streaming(
     """
     ctx.log_path.parent.mkdir(parents=True, exist_ok=True)
     env = clean_env()
+    for pattern in scrub:  # shell-style names: whatever the CLI could take a credential from
+        for name in [k for k in env if fnmatch.fnmatchcase(k, pattern)]:
+            del env[name]
     secrets = []
     for value in (extra_env or {}).values():
         env_value = str(value)
@@ -280,6 +292,8 @@ def run_streaming(
             secrets.append(env_value.encode("utf-8", errors="replace"))
     if extra_env:
         env.update(extra_env)
+    if plain_env:
+        env.update(plain_env)
     # Open the log before spawning: a failure here must not leave a running, unwatched child.
     log = ctx.log_path.open("ab")
     try:

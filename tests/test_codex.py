@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from baton import subagent_guard
 from baton.adapters.base import (
     AUTH,
     COMPLETED,
@@ -91,6 +92,8 @@ def make_cfg(bin_path="codex", **kw) -> AgentConfig:
         enabled=True,
         model="gpt-6.1-sol",
         effort="medium",
+        build_model="gpt-6.1-terra",
+        build_effort="high",
         threshold_pct=90,
         poll_s=15,
         bin=bin_path,
@@ -512,7 +515,18 @@ def test_polls_only_every_poll_s(fake, tmp_path, monkeypatch):
 # --- argv ------------------------------------------------------------------------------------
 
 
-def test_argv_has_model_effort_and_bypass(fake, tmp_path):
+def hook_args():
+    """What every Codex round gets for the subagent guard, as `-c` and a flag."""
+    command = json.dumps(f"{sys.executable} -I {Path(subagent_guard.__file__)}")
+    config = (
+        'hooks.PreToolUse=[{matcher=".*spawn_agent",'
+        f'hooks=[{{type="command",command={command}}}]}}]'
+    )
+    # features.hooks=true first: the guard cannot be switched off by a config file
+    return ["-c", "features.hooks=true", "-c", config, "--dangerously-bypass-hook-trust"]
+
+
+def test_argv_has_model_effort_the_guard_hook_and_bypass(fake, tmp_path):
     a = adapter(fake.bin, Reads(limits()), model="m-x", effort="high")
     a.run_round("go", make_ctx(tmp_path))
     argv = fake.exec_calls()[0]["argv"]
@@ -524,11 +538,74 @@ def test_argv_has_model_effort_and_bypass(fake, tmp_path):
         "m-x",
         "-c",
         "model_reasoning_effort=high",
+        *hook_args(),
         "--dangerously-bypass-approvals-and-sandbox",
         "-C",
         str(tmp_path),
         "-",
     ]
+
+
+def test_the_resumed_argv_carries_the_hook_too(fake, tmp_path):
+    adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path, session_id="thread-abc"))
+    argv = fake.exec_calls()[0]["argv"]
+    assert argv == [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "-m",
+        "gpt-6.1-sol",
+        "-c",
+        "model_reasoning_effort=medium",
+        *hook_args(),
+        "--dangerously-bypass-approvals-and-sandbox",
+        "thread-abc",
+        "-",
+    ]
+
+
+@pytest.mark.parametrize("tier", ["strong", "build"])
+@pytest.mark.parametrize("session", [None, "thread-abc"])
+def test_the_allowed_models_reach_every_round_as_the_pair(fake, tmp_path, tier, session):
+    adapter(fake.bin, Reads(limits())).run_round(
+        "go", make_ctx(tmp_path, tier=tier, session_id=session)
+    )
+    call = fake.exec_calls()[0]
+    assert call["baton_env"]["BATON_ALLOWED_MODELS"] == "gpt-6.1-sol,gpt-6.1-terra"
+    assert any(a.startswith("hooks.PreToolUse=") for a in call["argv"])
+
+
+def test_the_hook_is_given_per_run_with_no_file_written(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path))
+    assert not (tmp_path / "home" / ".codex").exists()  # nothing in ~/.codex is touched
+
+
+@pytest.mark.parametrize(
+    "tier,model,effort",
+    [("strong", "gpt-6.1-sol", "medium"), ("build", "gpt-6.1-terra", "high")],
+)
+def test_the_round_tier_picks_the_model_and_effort(fake, tmp_path, tier, model, effort):
+    a = CodexAdapter(make_cfg(fake.bin), read=Reads(limits()), poll_clock=lambda: 0.0)
+    a.run_round("go", make_ctx(tmp_path, tier=tier))
+    argv = fake.exec_calls()[0]["argv"]
+    assert argv[argv.index("-m") + 1] == model
+    assert f"model_reasoning_effort={effort}" in argv
+
+
+def test_a_resumed_build_round_uses_the_build_model(fake, tmp_path):
+    a = CodexAdapter(make_cfg(fake.bin), read=Reads(limits()), poll_clock=lambda: 0.0)
+    a.run_round("go", make_ctx(tmp_path, tier="build", session_id="thread-abc"))
+    argv = fake.exec_calls()[0]["argv"]
+    assert argv[:2] == ["exec", "resume"] and argv[argv.index("-m") + 1] == "gpt-6.1-terra"
+
+
+def test_no_tier_means_strong(fake, tmp_path):
+    a = CodexAdapter(make_cfg(fake.bin), read=Reads(limits()), poll_clock=lambda: 0.0)
+    a.run_round("go", make_ctx(tmp_path))
+    argv = fake.exec_calls()[0]["argv"]
+    assert argv[argv.index("-m") + 1] == "gpt-6.1-sol"
 
 
 def test_full_access_false_uses_workspace_write(fake, tmp_path):
@@ -754,7 +831,7 @@ def test_oserror_after_spawn_is_reported_as_such_and_still_gets_a_closing_read(
 ):
     from baton.adapters import codex
 
-    def broken(argv, cwd, stdin_text, ctx, on_line, tick, tick_s):
+    def broken(argv, cwd, stdin_text, ctx, on_line, tick, tick_s, **extra):
         ctx.on_spawn(4242)
         raise OSError("log disk full")
 
@@ -775,7 +852,7 @@ def test_oserror_after_spawn_is_reported_as_such_and_still_gets_a_closing_read(
 def test_oserror_before_spawn_says_cannot_start(tmp_path, monkeypatch):
     from baton.adapters import codex
 
-    def broken(argv, cwd, stdin_text, ctx, on_line, tick, tick_s):
+    def broken(argv, cwd, stdin_text, ctx, on_line, tick, tick_s, **extra):
         raise OSError("no such file")
 
     monkeypatch.setattr(codex, "run_streaming", broken)
@@ -964,3 +1041,73 @@ def test_an_evaluate_that_raises_at_start_is_a_limit_and_nothing_spawns(tmp_path
     res = run_guarded(guard, make_ctx(tmp_path), "codex", lambda c: ran.append(1) or None)
     assert res.outcome == LIMIT and res.until == NOW + 300 and "could not be judged" in res.reason
     assert not ran
+
+
+# --- the subagent guard: the hook blocks, the stream only logs ------------------------------------
+
+
+def collab(model=None, ident="item_1", tool="spawn_agent", kind="item.started"):
+    item = {"id": ident, "type": "collab_tool_call", "tool": tool}
+    if model is not None:
+        item["model"] = model
+    return {"type": kind, "item": item}
+
+
+def subagent_round(fake, tmp_path, monkeypatch, events, **ctx_kw):
+    monkeypatch.setenv("FAKE_CODEX_EXTRA", json.dumps(events))
+    seen = []
+    a = adapter(fake.bin, Reads(limits()))
+    ctx = make_ctx(tmp_path, on_subagent=lambda t, m: seen.append((t, m)), **ctx_kw)
+    return a.run_round("go", ctx), seen
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-5-mini", None])
+@pytest.mark.parametrize("tier", ["strong", "build"])
+def test_the_stream_logs_every_subagent_and_never_ends_the_round(
+    fake, tmp_path, monkeypatch, model, tier
+):
+    result, seen = subagent_round(fake, tmp_path, monkeypatch, [collab(model)], tier=tier)
+    assert result.outcome == COMPLETED  # the hook already denied what it had to
+    assert seen == [("spawn_agent", model)]
+
+
+def test_a_resumed_round_logs_too(fake, tmp_path, monkeypatch):
+    result, seen = subagent_round(
+        fake, tmp_path, monkeypatch, [collab("gpt-5-mini")], session_id="thread-abc"
+    )
+    assert result.outcome == COMPLETED and seen == [("spawn_agent", "gpt-5-mini")]
+
+
+def test_the_model_is_also_found_in_the_arguments(fake, tmp_path, monkeypatch):
+    event = collab(None)
+    event["item"]["arguments"] = {"model": "gpt-5-mini", "message": "x"}
+    _, seen = subagent_round(fake, tmp_path, monkeypatch, [event])
+    assert seen == [("spawn_agent", "gpt-5-mini")]
+
+
+def test_one_call_started_and_completed_with_its_model_seen_is_reported_once(
+    fake, tmp_path, monkeypatch
+):
+    events = [collab("gpt-6.1-terra"), collab("gpt-6.1-terra", kind="item.completed")]
+    _, seen = subagent_round(fake, tmp_path, monkeypatch, events)
+    assert len(seen) == 1
+
+
+def test_a_call_whose_model_only_shows_when_it_completes_is_reported_again(
+    fake, tmp_path, monkeypatch
+):
+    events = [collab(None), collab("gpt-5-mini", kind="item.completed")]
+    _, seen = subagent_round(fake, tmp_path, monkeypatch, events)
+    assert seen == [("spawn_agent", None), ("spawn_agent", "gpt-5-mini")]
+
+
+def test_calls_without_an_id_are_never_deduplicated(fake, tmp_path, monkeypatch):
+    def anonymous(model):
+        event = collab(model)
+        del event["item"]["id"]
+        return event
+
+    _, seen = subagent_round(
+        fake, tmp_path, monkeypatch, [anonymous("gpt-6.1-terra"), anonymous("gpt-6.1-terra")]
+    )
+    assert len(seen) == 2
