@@ -24,7 +24,8 @@ from baton.adapters.base import (
     RoundContext,
     RoundResult,
 )
-from baton.config import Goal
+from baton.config import Goal, GoalError, load_memory
+from baton.memory import Memory, RoundEntry
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, clean_env, kill_group, process_start
 from baton.scheduler import Scheduler, read_availability
 from baton.store import Store, workdir_lock
@@ -54,11 +55,16 @@ UNRUNNABLE_MESSAGE = (
     "path. Rounds go on as usual."
 )
 
-RULES = """\
+LESSONS_RULE = (
+    "- Keep durable findings (root causes, dead ends, what must not be retried) under a "
+    "`## Lessons` heading in the handoff. They outlive this goal."
+)
+RULES = f"""\
 Rules:
 - You are one shift of a relay. Another agent may continue after you at any moment.
 - Commit working progress often, in small steps.
 - Keep `.baton/HANDOFF.md` current: what was tried, what was learned, what comes next.
+{LESSONS_RULE}
 - Do not declare success. Only the verify command decides."""
 
 
@@ -70,12 +76,14 @@ def build_prompt(
     round_tail: str,
     resumed: bool,
     since_commits: str = "",
+    memory: str = "",
 ) -> str:
     """The prompt for one round.
 
     A fresh round gets the whole briefing. A resumed one already has it in its own history, so
     it only gets what changed: the commits others made since, the gate output, the previous
-    round's tail, notes and handoff.
+    round's tail, notes and handoff. `memory`, the text recalled from long-term memory, comes
+    after the handoff in both.
     """
     parts: list[str] = []
     if resumed:
@@ -104,6 +112,9 @@ def build_prompt(
     handoff = handoff.strip()
     if handoff:
         parts.append(f"Handoff (.baton/HANDOFF.md):\n{handoff}")
+    memory = memory.strip()
+    if memory:
+        parts.append(memory)
     if not resumed:
         parts.append(RULES)
     return "\n\n".join(parts) + "\n"
@@ -414,6 +425,12 @@ class _Run:
         self.heads: dict[str, str] = {}
         self.pause_until = 0.0
         self.verify_warning = ""
+        # Long-term memory: built the first time it is needed, None when it is off. A round that
+        # started a process waits in `pending` until its gate has run.
+        self.mem: Memory | None = None
+        self.mem_checked = False
+        self.pending: RoundEntry | None = None
+        self.pending_saved = False  # its page is already stored, with gate "none"
 
     # plumbing
 
@@ -456,6 +473,7 @@ class _Run:
         return True
 
     def finish(self, reason: str) -> int:
+        self.record_pending()  # nothing may be left unrecorded: there is no next gate to wait for
         try:
             self.store.clear_stop()  # a stop asked for during the last round has nothing left to do
         except Exception:
@@ -503,6 +521,84 @@ class _Run:
             self.emit("error", error=f"could not save state: {exc}")
             return False
         return True
+
+    # long-term memory: none of it may stop a goal
+
+    def memory(self) -> Memory | None:
+        """The goal's Memory, built once. None when it is off: `memory = false` in the goal,
+        `BATON_MEMORY=off` or `enabled = false` in the settings, or settings that cannot be read
+        (one event, and the goal goes on without memory)."""
+        if self.mem_checked:
+            return self.mem
+        self.mem_checked = True
+        if not self.goal.memory:
+            return None
+        try:
+            cfg = load_memory()
+            if cfg.enabled:
+                self.mem = Memory(cfg, self.goal.workdir, self.goal.name)
+        except GoalError as exc:
+            self.emit("memory", event="error", reason=f"memory is off, settings: {exc}")
+        except Exception as exc:
+            self.emit("memory", event="error", reason=f"memory is off: {type(exc).__name__}: {exc}")
+        return self.mem
+
+    def memory_call(self, name: str, *args: object, default: object = None):
+        """Call a Memory method. Whatever it raises is an event, never an error of the loop, and
+        the reason it left for itself is reported once."""
+        mem = self.memory()
+        if mem is None:
+            return default
+        try:
+            value = getattr(mem, name)(*args)
+        except Exception as exc:
+            self.emit("memory", event="error", reason=f"{type(exc).__name__}: {exc}")
+            return default
+        try:
+            reason, mem.last_error = mem.last_error, ""
+        except Exception:
+            reason = ""
+        if reason:
+            self.emit("memory", event="error", reason=reason)
+        return value
+
+    def recall(self, n: int) -> str:
+        mem = self.memory()
+        if mem is None:
+            return ""
+        objective = self.current_objective()  # only here: a briefing callable is not asked in vain
+        exclude = self.memory_call("round_path", n - 1, default="") if n > 1 else ""
+        text = self.memory_call("recall", objective, self.gate_tail, exclude, default="")
+        text = text if isinstance(text, str) else ""
+        if text.strip():
+            self.emit(
+                "memory", event="recalled", hits=getattr(mem, "last_hits", 0), chars=len(text)
+            )
+        return text
+
+    def save_pending(self) -> None:
+        """Store the pending round now, with no gate result, so that a runner killed during
+        the gate (or never reaching it) still leaves its page. The real result replaces it."""
+        if self.pending is None:
+            return
+        self.memory_call("remember_round", self.pending)
+        self.memory_call("remember_lessons", self.pending.handoff)
+        self.pending_saved = True
+
+    def record_pending(self, gate: str | None = None, gate_tail: str = "") -> None:
+        """Settle the round that waits for its gate, once: with the gate's result when it has
+        one (the page written at the round's end is replaced), or as it stands (nothing to do
+        when it was already stored)."""
+        entry, self.pending = self.pending, None
+        saved, self.pending_saved = self.pending_saved, False
+        if entry is None:
+            return
+        if gate is not None:
+            entry = replace(entry, gate=gate, gate_tail=gate_tail)
+        elif saved:
+            return
+        self.memory_call("remember_round", entry)
+        self.memory_call("remember_lessons", entry.handoff)
 
     # the loop
 
@@ -587,6 +683,10 @@ class _Run:
             self.need_gate = False
             self.emit("gate", passed=passed, tail=self.gate_tail)
             self.check_gate_ran()
+            stopped = self.gate_tail.rstrip().endswith("[verify stopped]")
+            self.record_pending(
+                "none" if stopped else "passed" if passed else "failed", self.gate_tail
+            )
             if passed and not self.owes_round and not self.unread_notes():
                 return self.finish("verify passed")
         self.need_gate = False
@@ -675,6 +775,7 @@ class _Run:
         assert self.sched is not None
         goal, store = self.goal, self.store
         agent = adapter.name
+        gate_was_due = self.need_gate
         self.need_gate = True
         n = self.round_no + 1
         self.round_no = n
@@ -692,6 +793,15 @@ class _Run:
         handoff = self.read_handoff()
         sid = self.sessions.get(agent)
         since = commits_since(goal.workdir, self.heads.get(agent, ""))
+        head_before = _head(goal.workdir) if self.memory() is not None else ""
+        recalled = self.recall(n)
+        if self.mem is not None and self.stop_requested():
+            # A stop that came while memory was being read: no process is spawned for this round,
+            # so it does not exist. The counter and the state go back, and the loop honours it.
+            self.round_no = n - 1
+            self.need_gate = gate_was_due
+            self.persist_softly()
+            return False
 
         buf = ""
         worked = False
@@ -754,6 +864,7 @@ class _Run:
                 self.round_tail,
                 resumed=session is not None,
                 since_commits=since,
+                memory=recalled,
             )
             ctx = RoundContext(
                 workdir=goal.workdir,
@@ -838,13 +949,40 @@ class _Run:
             back=watch.back if result.outcome == PREEMPTED and watch is not None else None,
         )
         self.persist_softly()
+        if spawned and self.memory() is not None:
+            # What the scheduler was told stays as it is; the page says what baton did.
+            ended_by_us = (
+                killed and not preempted and result.outcome in (COMPLETED, TIMEOUT, TRANSIENT)
+            )
+            self.pending = RoundEntry(
+                n=n,
+                agent=agent,
+                outcome="interrupted" if ended_by_us else result.outcome,
+                reason=result.reason or "",
+                seconds=round(ended - started, 1),
+                gate="none",
+                gate_tail="",
+                commits=commits_since(goal.workdir, head_before) if head_before else "",
+                handoff=self.read_handoff(limit=False),  # whole, for the lessons at its top
+                round_tail=buf,
+            )
+            if goal.verify_command:
+                self.save_pending()  # the gate may never finish: see `step`
+            else:
+                self.record_pending()
         return not goal.verify_command and result.outcome == COMPLETED and not killed
 
-    def read_handoff(self) -> str:
+    def current_objective(self) -> str:
+        try:
+            return self.objective() if self.objective is not None else self.goal.objective
+        except Exception:
+            return self.goal.objective
+
+    def read_handoff(self, limit: bool = True) -> str:
         try:
             text = (self.goal.workdir / ".baton" / "HANDOFF.md").read_text(
                 encoding="utf-8", errors="replace"
             )
         except OSError:
             return ""
-        return text[-HANDOFF_MAX_CHARS:]
+        return text[-HANDOFF_MAX_CHARS:] if limit else text

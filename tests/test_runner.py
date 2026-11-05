@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import threading
@@ -17,7 +18,8 @@ from baton.adapters.base import (
     Availability,
     RoundResult,
 )
-from baton.config import load_goal
+from baton.config import MemoryConfig, load_goal
+from baton.memory import Memory, RoundEntry
 from baton.proc import process_start
 from baton.runner import build_prompt, run_gate, run_goal, snapshot_work
 from baton.store import (
@@ -25,6 +27,7 @@ from baton.store import (
     StateError,
     Store,
     WorkdirBusy,
+    state_base,
     workdir_conflict,
     workdir_lock,
 )
@@ -130,6 +133,7 @@ def make_goal(
     snapshot=False,
     verify_extra="",
     order='"codex", "antigravity"',
+    top="",
 ):
     lines = [
         'name = "demo"',
@@ -137,6 +141,7 @@ def make_goal(
         f'objective = "{OBJECTIVE}"',
         f"snapshot = {str(snapshot).lower()}",
         f"order = [{order}]",
+        top,
     ]
     if verify:
         lines += ["[verify]", f'command = "{verify}"', verify_extra]
@@ -2295,3 +2300,585 @@ def test_the_daily_cap_stops_the_seventh_kill_when_the_plan_agent_never_blocks(f
     assert len(kills) == 6
     assert len(f.agents["codex"].prompts) == 6
     assert len(store.load_state()["preempts"]) == 6
+
+
+# long-term memory
+
+
+class FakeMemory:
+    """Stands in for `baton.memory.Memory`, recording what the runner asks of it. How it behaves
+    comes from `Plan`, set by the `memory` fixture before the runner builds it."""
+
+    class Plan:
+        text = ""
+        hits = 0
+        raises: Exception | None = None
+        error_on_recall = ""
+        on_recall = None
+
+    built: list["FakeMemory"] = []
+
+    def __init__(self, cfg, workdir, job, **kw):
+        self.cfg, self.workdir, self.job = cfg, workdir, job
+        self.recalls: list[tuple] = []
+        self.rounds: list[RoundEntry] = []
+        self.lessons: list[str] = []
+        self.last_hits = 0
+        self.last_error = ""
+        self.plan = FakeMemory.Plan
+        FakeMemory.built.append(self)
+
+    def round_path(self, n):
+        return f"rounds/{self.job}/r{n}.md"
+
+    def recall(self, objective, gate_tail, exclude=""):
+        self.recalls.append((objective, gate_tail, exclude))
+        if self.plan.on_recall:
+            self.plan.on_recall()
+        if self.plan.raises:
+            raise self.plan.raises
+        if self.plan.error_on_recall:
+            self.last_error = self.plan.error_on_recall
+            self.plan.error_on_recall = ""
+        self.last_hits = self.plan.hits
+        return self.plan.text
+
+    def remember_round(self, entry):
+        if self.plan.raises:
+            raise self.plan.raises
+        self.rounds.append(entry)
+
+    def remember_lessons(self, handoff):
+        if self.plan.raises:
+            raise self.plan.raises
+        self.lessons.append(handoff)
+
+
+@pytest.fixture
+def memory(monkeypatch):
+    """Memory switched on, with a fake in place of the real class. Returns the fake's plan."""
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+    FakeMemory.built = []
+    plan = type("Plan", (FakeMemory.Plan,), {})
+    monkeypatch.setattr(FakeMemory, "Plan", plan)
+    monkeypatch.setattr(runner, "Memory", FakeMemory)
+    plan.mem = lambda: FakeMemory.built[0]
+    return plan
+
+
+def memory_events(store):
+    return [e for e in store.events() if e["kind"] == "memory"]
+
+
+def plain_errors(store):
+    return [e for e in store.events() if e["kind"] == "error"]
+
+
+def test_build_prompt_puts_memory_after_the_handoff_and_before_the_rules(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    prompt = build_prompt(goal, "", "", "the handoff", "", False, memory="MEMORY BLOCK")
+    assert prompt.index("the handoff") < prompt.index("MEMORY BLOCK") < prompt.index("Rules:")
+
+
+def test_a_resumed_prompt_also_carries_the_memory(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    prompt = build_prompt(goal, "", "", "the handoff", "", True, memory="MEMORY BLOCK")
+    assert prompt.index("the handoff") < prompt.index("MEMORY BLOCK")
+    assert "Rules:" not in prompt
+
+
+def test_no_memory_changes_nothing_in_the_prompt(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    assert build_prompt(goal, "g", "n", "h", "t", False) == build_prompt(
+        goal, "g", "n", "h", "t", False, memory=""
+    )
+
+
+def test_the_rules_ask_for_lessons_under_their_heading():
+    assert (
+        "- Keep durable findings (root causes, dead ends, what must not be retried) under a "
+        "`## Lessons` heading in the handoff. They outlive this goal."
+    ) in runner.RULES
+
+
+def test_recalled_text_reaches_the_agent_and_is_announced(go, agents, work, store, memory):
+    memory.text, memory.hits = "REMEMBERED the widget broke on boot", 2
+    agents["codex"].script = [done(work)]
+    go()
+    assert "REMEMBERED the widget broke on boot" in agents["codex"].prompts[0]
+    event = memory_events(store)[0]
+    assert event["event"] == "recalled" and event["hits"] == 2
+    assert event["chars"] == len("REMEMBERED the widget broke on boot")
+
+
+def test_a_resumed_round_gets_the_memory_too(go, agents, work, world, memory):
+    memory.text, memory.hits = "REMEMBERED the widget broke on boot", 1
+
+    def first(agent, prompt, ctx):
+        ctx.on_session("s1")
+        return RoundResult(LIMIT, until=world.now + 10)
+
+    agents["codex"].script = [first, done(work)]
+    agents["antigravity"].script = [result(LIMIT, until=world.now + 3600)]
+    go()
+    assert agents["codex"].sessions == [None, "s1"]
+    assert "REMEMBERED" in agents["codex"].prompts[1]
+
+
+def test_no_hits_means_no_block_and_no_event(go, agents, work, store, memory):
+    agents["codex"].script = [done(work)]
+    go()
+    assert "Memory from earlier" not in agents["codex"].prompts[0]
+    assert memory_events(store) == []
+
+
+def test_memory_is_recalled_before_every_round_excluding_the_page_before(go, agents, work, memory):
+    agents["codex"].script = [result(COMPLETED), result(COMPLETED), done(work)]
+    go()
+    recalls = memory.mem().recalls
+    assert len(recalls) == 3
+    assert {r[0] for r in recalls} == {OBJECTIVE}
+    assert [r[2] for r in recalls][:3] == ["", "rounds/demo/r1.md", "rounds/demo/r2.md"]
+
+
+def test_the_gate_output_is_part_of_the_recall(tmp_path, work, go, agents, memory):
+    goal = make_goal(tmp_path, work, verify="echo gate-says-hello; test -f DONE")
+    agents["codex"].script = [done(work)]
+    # the first gate fails, so the first round sees its output
+    go(goal)
+    assert "gate-says-hello" in memory.mem().recalls[0][1]
+
+
+def test_the_recall_comes_after_the_handoff_is_read(go, agents, work, memory):
+    (work / ".baton").mkdir()
+    (work / ".baton" / "HANDOFF.md").write_text("older notes")
+    agents["codex"].script = [done(work)]
+    go()
+    assert "older notes" in agents["codex"].prompts[0]
+
+
+def test_a_failure_is_one_event_per_failure(go, agents, work, store, memory):
+    memory.error_on_recall = "memory is unavailable: gone"
+    agents["codex"].script = [result(TRANSIENT)]
+    agents["antigravity"].script = [result(COMPLETED), done(work)]
+    go()
+    errors = [e for e in memory_events(store) if e["event"] == "error"]
+    assert [e["reason"] for e in errors] == ["memory is unavailable: gone"]
+    assert memory.mem().last_error == ""  # reported once, then cleared
+
+
+def test_a_memory_that_raises_never_reaches_the_loop(go, agents, work, store, world, memory):
+    """The guard around every call: a bug in Memory must cost the round nothing."""
+    memory.raises = RuntimeError("memory exploded")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert len(agents["codex"].prompts) == 1  # the round ran, once
+    assert "finished" in kinds(store)
+    assert plain_errors(store) == []  # the loop's own error handler never saw it
+    assert 60 not in world.sleeps and sum(world.sleeps) < 60  # and no error sleep
+    reasons = [e["reason"] for e in memory_events(store) if e["event"] == "error"]
+    assert reasons and all("memory exploded" in r for r in reasons)
+
+
+def test_a_memory_that_raises_while_recording_does_not_stop_the_goal(
+    tmp_path, go, agents, work, store, memory
+):
+    memory.raises = RuntimeError("write failed")
+    agents["codex"].script = [result(COMPLETED), done(work)]
+    agents["antigravity"].script = [result(COMPLETED)]
+    assert go() == 0
+    assert "finished" in kinds(store) and plain_errors(store) == []
+
+
+# recording
+
+
+def test_a_round_is_recorded_after_its_gate_with_the_gate_result(
+    tmp_path, go, agents, work, store, memory
+):
+    goal = make_goal(tmp_path, work, verify="echo checking; test -f DONE")
+    agents["codex"].script = [say(["round one talking"], result(COMPLETED)), done(work)]
+    go(goal)
+    rounds = memory.mem().rounds
+    # Each round is written as soon as it ends, with no gate result, then again with the real one.
+    assert [(r.n, r.agent, r.gate) for r in rounds] == [
+        (1, "codex", "none"),
+        (1, "codex", "failed"),
+        (2, "codex", "none"),
+        (2, "codex", "passed"),
+    ]
+    assert rounds[0].gate_tail == "" and "checking" in rounds[1].gate_tail
+    assert rounds[1].outcome == COMPLETED
+    assert rounds[1].round_tail.strip() == "round one talking"
+    assert isinstance(rounds[1].seconds, float)
+
+
+def test_without_a_verify_command_a_round_is_recorded_at_once(
+    tmp_path, go, agents, work, store, memory
+):
+    agents["codex"].script = [result(COMPLETED)]
+    go(make_goal(tmp_path, work, verify=None))
+    rounds = memory.mem().rounds
+    assert len(rounds) == 1 and rounds[0].gate == "none" and rounds[0].gate_tail == ""
+    assert rounds[0].n == 1 and rounds[0].agent == "codex"
+
+
+def test_a_round_that_never_spawned_a_process_is_not_recorded(
+    tmp_path, go, agents, work, store, memory
+):
+    agents["codex"].script = [refused()]
+    agents["antigravity"].script = [done(work)]
+    go()
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert [(e["round"], e["agent"]) for e in ends] == [(1, "codex"), (2, "antigravity")]
+    assert {r.n for r in memory.mem().rounds} == {2}  # round 1 was refused: nothing ran
+
+
+@pytest.mark.parametrize("outcome", [LIMIT, TIMEOUT, TRANSIENT, AUTH, CREDIT_GUARD])
+def test_a_failed_round_is_recorded_with_its_real_outcome(go, agents, work, store, memory, outcome):
+    agents["codex"].script = [result(outcome, reason="why it ended", until=1_000_500.0), done(work)]
+    agents["antigravity"].script = [done(work)]
+    go()
+    first = memory.mem().rounds[0]
+    assert first.outcome == outcome and first.reason == "why it ended" and first.n == 1
+
+
+def test_a_preempted_round_is_recorded_as_preempted(go, agents, work, store, memory):
+    agents["codex"].script = [result(PREEMPTED, reason="codex is back", back="codex"), done(work)]
+    go()
+    assert memory.mem().rounds[0].outcome == PREEMPTED
+
+
+def test_a_stop_after_the_round_still_records_it_through_the_gate(go, agents, work, store, memory):
+    """step runs the gate before honouring a stop, so the pending entry is settled there."""
+    agents["codex"].script = [lambda a, p, c: (store.request_stop(), RoundResult(TIMEOUT))[1]]
+    assert go() == 0
+    rounds = memory.mem().rounds
+    assert [(r.n, r.outcome, r.gate) for r in rounds] == [
+        (1, TIMEOUT, "none"),
+        (1, TIMEOUT, "failed"),
+    ]
+    assert kinds(store)[-1] == "stopped"
+
+
+def test_a_stop_now_records_the_round_as_interrupted_with_no_gate_result(
+    tmp_path, go, agents, work, store, memory
+):
+    def step(agent, prompt, ctx):
+        (work / "STARTED").write_text("x")
+        store.request_stop(now=True)
+        assert ctx.should_kill() is True
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    agents["codex"].script = [step]
+    verify = "test -f STARTED && sleep 30; test -f DONE"  # slow only once a round has begun
+    assert go(make_goal(tmp_path, work, verify=verify)) == 0
+    rounds = memory.mem().rounds
+    assert [r.outcome for r in rounds] == ["interrupted", "interrupted"]
+    assert rounds[-1].gate == "none"  # the gate was ended, not failed
+    assert rounds[-1].reason == "stop requested"
+    assert kinds(store)[-1] == "stopped"
+    # the scheduler and the person still see what the adapter reported
+    end = [e for e in store.events() if e["kind"] == "round_end"][0]
+    assert end["outcome"] == COMPLETED
+
+
+def test_a_round_ended_by_an_interrupt_is_recorded_as_interrupted(
+    tmp_path, go, agents, work, store, memory
+):
+    agents["codex"].script = [interrupting(store, "look at this"), done(work)]
+    go(make_goal(tmp_path, work, verify=None))
+    assert memory.mem().rounds[0].outcome == "interrupted"
+
+
+def test_a_round_the_adapter_ended_on_its_own_stays_completed(go, agents, work, memory):
+    agents["codex"].script = [result(COMPLETED), done(work)]
+    go()
+    assert memory.mem().rounds[0].outcome == COMPLETED
+
+
+def test_a_credit_guard_that_came_with_a_kill_is_not_called_interrupted(
+    tmp_path, go, agents, work, store, memory
+):
+    def step(agent, prompt, ctx):
+        store.request_stop(now=True)
+        ctx.should_kill()
+        return RoundResult(CREDIT_GUARD, reason="balance moved")
+
+    agents["codex"].script = [step]
+    go(make_goal(tmp_path, work, verify=None))
+    assert memory.mem().rounds[0].outcome == CREDIT_GUARD
+
+
+def test_a_round_is_on_record_before_its_gate_runs(tmp_path, go, agents, work, store, memory):
+    """A runner killed during the gate (a SIGTERM, a crash) must not lose the round."""
+    agents["codex"].script = [say(["worked"], result(COMPLETED))]
+    real = runner.run_gate
+    calls = []
+
+    def dies_in_the_second_gate(goal, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            raise Died()
+        return real(goal, **kw)
+
+    runner.run_gate = dies_in_the_second_gate
+    try:
+        with pytest.raises(Died):
+            go()
+    finally:
+        runner.run_gate = real
+    rounds = memory.mem().rounds
+    assert [(r.n, r.agent, r.outcome, r.gate) for r in rounds] == [(1, "codex", COMPLETED, "none")]
+    assert rounds[0].round_tail.strip() == "worked"
+
+
+def test_a_round_without_a_verify_command_that_does_not_finish_the_goal_is_still_recorded(
+    tmp_path, go, agents, work, store, memory
+):
+    agents["codex"].script = [lambda a, p, c: (store.request_stop(), RoundResult(TIMEOUT))[1]]
+    assert go(make_goal(tmp_path, work, verify=None)) == 0
+    assert "finished" not in kinds(store)
+    rounds = memory.mem().rounds
+    assert [(r.n, r.outcome, r.gate) for r in rounds] == [(1, TIMEOUT, "none")]
+
+
+def test_a_stop_that_arrives_while_memory_is_read_spawns_nothing(
+    tmp_path, go, agents, work, store, memory
+):
+    memory.on_recall = lambda: store.request_stop()
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert agents["codex"].prompts == []  # no process for that round
+    assert memory.mem().rounds == [] and memory.mem().lessons == []
+    assert "round_start" not in kinds(store) and "round_end" not in kinds(store)
+    assert kinds(store)[-1] == "stopped"
+    state = store.load_state()
+    assert state["round"] == 0  # the number is not spent on a round that never was
+
+
+def test_after_an_abandoned_round_the_next_run_starts_at_the_same_number(
+    tmp_path, go, agents, work, store, memory
+):
+    memory.on_recall = lambda: store.request_stop()
+    go()
+    memory.on_recall = None
+    FakeMemory.built.clear()
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert [r.n for r in memory.mem().rounds][0] == 1
+
+
+def test_an_abandoned_round_does_not_run_the_gate_a_second_time(
+    tmp_path, go, agents, work, store, memory
+):
+    memory.on_recall = lambda: store.request_stop()
+    gates = []
+    real = runner.run_gate
+
+    def counting(goal, **kw):
+        gates.append(1)
+        return real(goal, **kw)
+
+    runner.run_gate = counting
+    try:
+        go()
+    finally:
+        runner.run_gate = real
+    assert len(gates) == 1
+
+
+def test_without_memory_a_stop_is_handled_exactly_as_before(go, agents, work, store):
+    agents["codex"].script = [lambda a, p, c: (store.request_stop(), RoundResult(COMPLETED))[1]]
+    assert go() == 0
+    assert len(agents["codex"].prompts) == 1
+
+
+def test_a_missing_ai_memory_binary_is_quiet_in_the_loop(
+    tmp_path, work, agents, store, world, monkeypatch
+):
+    from test_memory import FakeAiMemory
+
+    fake = FakeAiMemory()
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+
+    def real(cfg, workdir, job):
+        return Memory(
+            cfg,
+            workdir,
+            job,
+            run=fake.run,
+            popen=fake.popen,
+            health=fake.health,
+            clock=world.clock,
+            sleep=world.sleep,
+            which=lambda *a, **k: None,
+        )
+
+    monkeypatch.setattr(runner, "Memory", real)
+    agents["codex"].script = [result(COMPLETED), done(work)]
+    run_goal(make_goal(tmp_path, work), agents, store, world.clock, world.sleep)
+    assert memory_events(store) == []
+    assert fake.runs == [] and fake.popens == []
+    assert not (state_base() / ".ai-memory").exists()
+
+
+def test_a_goal_that_finishes_flushes_what_is_still_pending(
+    tmp_path, work, store, agents, world, memory
+):
+    goal = make_goal(tmp_path, work)
+    run = runner._Run(goal, agents, store, world.clock, world.sleep)
+    entry = RoundEntry(1, "codex", "completed", "", 1.0, "none", "", "", "h", "t")
+    run.pending = entry
+    assert run.finish("round completed") == 0
+    assert memory.mem().rounds == [entry]
+    assert run.pending is None
+
+
+def test_the_handoff_is_read_from_disk_after_the_round_without_the_prompt_cut(
+    tmp_path, go, agents, work, store, memory
+):
+    long_handoff = "## Lessons\n- keep this\n\n## Notes\n" + "x" * 20000
+
+    def writes(agent, prompt, ctx):
+        (work / ".baton").mkdir(exist_ok=True)
+        (work / ".baton" / "HANDOFF.md").write_text(long_handoff)
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [writes]
+    go(make_goal(tmp_path, work, verify=None))
+    mem = memory.mem()
+    assert mem.rounds[0].handoff == long_handoff  # what the agent wrote, whole
+    assert mem.lessons == [long_handoff]  # so the lessons at the top survive the 16000 cut
+
+
+def test_lessons_are_offered_after_every_record(go, agents, work, store, memory):
+    agents["codex"].script = [result(COMPLETED), done(work)]
+    agents["antigravity"].script = [result(COMPLETED)]
+    go()
+    mem = memory.mem()
+    assert len(mem.lessons) == len(mem.rounds) >= 2
+
+
+def test_the_commits_of_a_round_are_in_its_entry(
+    tmp_path, repo, commit, agents, store, world, memory
+):
+    goal = make_goal(tmp_path, repo, verify=None)
+
+    def works(agent, prompt, ctx):
+        commit("w.txt", "the widget fix")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [works]
+    run_goal(goal, agents, store, world.clock, world.sleep)
+    assert "the widget fix" in memory.mem().rounds[0].commits
+
+
+# switches
+
+
+def test_memory_false_in_the_goal_builds_no_memory_at_all(
+    tmp_path, work, go, agents, store, memory, monkeypatch
+):
+    def must_not_load():
+        raise AssertionError("settings were read for a goal that has memory off")
+
+    monkeypatch.setattr(runner, "load_memory", must_not_load)
+    agents["codex"].script = [done(work)]
+    go(make_goal(tmp_path, work, top="memory = false"))
+    assert FakeMemory.built == []
+    assert memory_events(store) == []
+    assert "Memory from earlier" not in agents["codex"].prompts[0]
+
+
+def test_baton_memory_off_builds_no_memory_at_all(go, agents, work, memory, monkeypatch):
+    monkeypatch.setenv("BATON_MEMORY", "off")
+    agents["codex"].script = [done(work)]
+    go()
+    assert FakeMemory.built == []
+
+
+def test_enabled_false_in_the_defaults_builds_no_memory(
+    go, agents, work, memory, tmp_path, monkeypatch
+):
+    path = tmp_path / "off.toml"
+    path.write_text("[memory]\nenabled = false\n")
+    monkeypatch.setenv("BATON_CONFIG", str(path))
+    agents["codex"].script = [done(work)]
+    go()
+    assert FakeMemory.built == []
+
+
+def test_the_defaults_reach_the_memory_that_is_built(
+    go, agents, work, memory, tmp_path, monkeypatch
+):
+    path = tmp_path / "set.toml"
+    path.write_text("[memory]\nport = 23456\nrecall_chars = 100\n")
+    monkeypatch.setenv("BATON_CONFIG", str(path))
+    agents["codex"].script = [done(work)]
+    go()
+    assert memory.mem().cfg == MemoryConfig(port=23456, recall_chars=100)
+
+
+def test_bad_memory_settings_turn_memory_off_with_one_event_and_the_goal_goes_on(
+    go, agents, work, store, world, memory, tmp_path, monkeypatch
+):
+    path = tmp_path / "bad.toml"
+    path.write_text("[memory]\nport = 5\n")
+    monkeypatch.setenv("BATON_CONFIG", str(path))
+    agents["codex"].script = [result(COMPLETED), done(work)]
+    agents["antigravity"].script = [result(COMPLETED)]
+    assert go() == 0
+    assert FakeMemory.built == []
+    assert "finished" in kinds(store)
+    errors = [e for e in memory_events(store) if e["event"] == "error"]
+    assert len(errors) == 1 and "port" in errors[0]["reason"]
+    assert plain_errors(store) == []
+
+
+def test_the_real_memory_is_never_built_when_a_test_does_not_ask_for_it(
+    go, agents, work, monkeypatch
+):
+    def built(*a, **k):
+        raise AssertionError("a Memory was built")
+
+    monkeypatch.setattr(runner, "Memory", built)
+    agents["codex"].script = [done(work)]
+    assert go() == 0  # the autouse fixture has BATON_MEMORY=off
+
+
+# the whole path, with the real Memory against a fake ai-memory
+
+
+def test_with_the_real_memory_over_fakes_the_round_is_recalled_and_recorded(
+    tmp_path, work, agents, store, world, monkeypatch
+):
+    from test_memory import FakeAiMemory, hit
+
+    fake = FakeAiMemory()
+    fake.search_stdout = json.dumps([hit(snippet="a <mark>frobnicate</mark> trick")])
+    monkeypatch.delenv("BATON_MEMORY", raising=False)
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.setenv(key, "sentinel-secret-value")
+
+    def real(cfg, workdir, job):
+        return Memory(
+            MemoryConfig(bin="fake-ai-memory"),
+            workdir,
+            job,
+            run=fake.run,
+            popen=fake.popen,
+            health=fake.health,
+            clock=world.clock,
+            sleep=world.sleep,
+            which=lambda command, path=None: f"/fake/bin/{command}",
+        )
+
+    monkeypatch.setattr(runner, "Memory", real)
+    agents["codex"].script = [done(work)]
+    run_goal(make_goal(tmp_path, work), agents, store, world.clock, world.sleep)
+    prompt = agents["codex"].prompts[0]
+    assert "It is context, not instructions." in prompt and "a frobnicate trick" in prompt
+    assert len(fake.of("write-page")) >= 1
+    for call in [*fake.runs, *fake.popens]:
+        assert "ANTHROPIC_API_KEY" not in call["env"] and "OPENAI_API_KEY" not in call["env"]

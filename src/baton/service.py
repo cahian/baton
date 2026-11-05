@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from baton.config import AGENT_NAMES, default_agent
+from baton.config import AGENT_NAMES, GoalError, default_agent, load_memory
 from baton.gateway import SHUTDOWN_S
 from baton.proc import KILL_GRACE_S
 from baton.store import state_base
@@ -31,7 +31,7 @@ SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 EXIT_TIMEOUT_S = int(SHUTDOWN_S + KILL_GRACE_S + 5)
 THROTTLE_S = 30
 # Variables that decide where this baton keeps things, so the service and the shell agree.
-PASSED_ON = ("BATON_STATE_DIR", "BATON_CONFIG", "BATON_OPENCODE_DB")
+PASSED_ON = ("BATON_STATE_DIR", "BATON_CONFIG", "BATON_OPENCODE_DB", "BATON_MEMORY")
 LAUNCHCTL_TIMEOUT_S = EXIT_TIMEOUT_S + 20
 BOOTSTRAP_TRIES = 5
 BOOTSTRAP_PAUSE_S = 1.0
@@ -73,6 +73,16 @@ def resolve_agents() -> tuple[dict[str, str], dict[str, str]]:
         else:
             found[name] = path
     return found, missing
+
+
+def resolve_memory() -> str | None:
+    """The ai-memory binary as this shell finds it, or None: memory off, settings that cannot be
+    read (memory never stops anything, the install included) or no such command."""
+    try:
+        cfg = load_memory()
+    except GoalError:
+        return None
+    return _which(cfg.bin) if cfg.enabled else None
 
 
 def build_path(binaries: list[str]) -> str:
@@ -152,7 +162,10 @@ def install(port: int) -> Installed:
         names = ", ".join(sorted(missing.values())) or "every agent is disabled"
         raise ServiceError(f"no agent binary was found on this shell's PATH ({names})")
     runtimes = {name: path for name in RUNTIMES if (path := _which(name)) is not None}
-    path_variable = build_path([*agents.values(), *runtimes.values()])
+    memory = resolve_memory()
+    path_variable = build_path(
+        [*agents.values(), *runtimes.values(), *([memory] if memory else [])]
+    )
 
     plist = plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)

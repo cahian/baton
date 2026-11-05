@@ -1574,3 +1574,9 @@ def test_opencode_config_follows_the_port(capsys):
     main(["opencode-config", "--port", "4321"])
     data = json.loads(capsys.readouterr().out)
     assert data["provider"]["baton"]["options"]["baseURL"] == "http://127.0.0.1:4321/v1"
+
+
+def test_memory_events_stay_out_of_the_chat():
+    """The person reads no recall and no memory failure: the event is for `baton status`."""
+    assert gateway.render_event("memory", {"event": "recalled", "hits": 3, "chars": 900}) == ""
+    assert gateway.render_event("memory", {"event": "error", "reason": "memory is down"}) == ""

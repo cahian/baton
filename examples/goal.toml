@@ -13,6 +13,7 @@ order = ["codex", "antigravity", "claude_api"]
 round_max_s = 3600   # one round may not run longer than this
 idle_s = 1200        # nor stay silent longer than this
 snapshot = true      # commit uncommitted work locally after each round (never pushes)
+memory = true        # long-term memory through ai-memory; false turns it off for this goal
 
 # The gate. The goal is finished only when this exits 0. Without it, the goal is finished as
 # soon as one round completes.

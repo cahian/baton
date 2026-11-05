@@ -2,8 +2,9 @@
 
 ![baton — One goal. Keep it moving. Three connected agents pass a glowing relay baton.](docs/assets/baton-banner.png)
 
-baton keeps one long coding goal moving for days by passing it between three coding agents,
-stopping each one before it can spend money it should not.
+baton keeps one long coding goal moving for days by passing it between coding agents, stopping
+each one before it can spend money it should not. It works with Codex and Antigravity alone;
+Claude is an optional third, a paid backup that only joins once you save an API key for it.
 
 You give it a goal (an objective, a working directory and a verification command). It runs one
 agent until that agent nears its limit, hands the work to the next, and when every agent is out,
@@ -29,7 +30,8 @@ pay for, so you need accounts and their command-line tools:
 | [OpenCode](https://opencode.ai) | the chat window you type in | yes, for this guide |
 | `codex` | OpenAI Codex, signed in to your plan | at least one of these two |
 | `agy` | Google Antigravity, signed in to your plan | at least one of these two |
-| `claude` | Claude Code, used only as a backup | no |
+| `claude` | Claude Code, an optional paid backup; baton works without it | no, optional |
+| [ai-memory](https://github.com/akitaonrails/ai-memory) | long-term memory across goals, see [below](#long-term-memory) | no |
 
 ### 1. Install baton
 
@@ -46,15 +48,18 @@ mkdir -p ~/.config/baton
 cp examples/defaults.toml ~/.config/baton/defaults.toml
 ```
 
-Open `~/.config/baton/defaults.toml` in any text editor and pick one of these:
+Claude is optional. Open `~/.config/baton/defaults.toml` in any text editor and pick one of these:
 
-- **No Claude backup:** under `[agents.claude_api]`, set `enabled = false`. Skip step 3.
+- **No Claude (the simplest):** change nothing, and skip step 3. Without a saved key, Claude never
+  runs and baton uses Codex and Antigravity only. To switch it off for good, set `enabled = false`
+  under `[agents.claude_api]`.
 - **With the Claude backup:** set `monthly_budget_usd` to the credit you actually have, and
-  `budget_reset_day` to the day of the month it renews. baton stops 10% before that number.
+  `budget_reset_day` to the day of the month it renews. baton stops 10% before that number. Then
+  do step 3.
 
 Change `enabled` for `codex` or `antigravity` the same way if you only have one of them.
 
-### 3. Add the Claude key (only with the backup)
+### 3. Add the Claude key (optional)
 
 Create an API key in the [Claude Console](https://platform.claude.com) and copy it. Then run this,
 which saves what you copied into a file only you can read:
@@ -78,10 +83,16 @@ baton doctor
 ```
 
 `install-service` keeps baton running in the background, even after a restart. Every line of
-`doctor` should read `ok`. `FAIL` tells you what to fix; `warn` is only a heads-up. It spends
+`doctor` should read `ok`; with no Claude key it says `claude_api: not configured (optional)`,
+which is fine. `FAIL` tells you what to fix; `warn` is only a heads-up. It spends
 nothing, so run it as often as you like.
 
 > **On Linux**, skip `install-service` and leave `baton serve` running in a terminal.
+
+**Optional: long-term memory.** If you want agents to remember what earlier goals learned in the
+same directory, put the `ai-memory` binary on your `PATH`; baton does the rest. `doctor` shows a
+`memory` line either way. Without the binary baton works exactly as before. The details, including
+how to install it, are in [Long-term memory](#long-term-memory).
 
 ### 5. Add baton to OpenCode
 
@@ -202,6 +213,12 @@ Codex and Antigravity are the plan agents: their included usage comes back at a 
 paid by use and has no reset that would ever stop it, so it is a fallback, wherever it stands in
 `order`. **Claude runs only while both others are out.**
 
+**Claude is optional.** baton works with Codex and Antigravity alone, and that is the default
+experience: until you save a key file (Quick start, step 3), Claude never runs and the rotation is
+the other two. It joins as a backup only once the key is there. To turn it off for good, set
+`enabled = false` under `[agents.claude_api]` in `defaults.toml`, or leave it out of `order` in a
+goal file. `baton doctor` reports an unconfigured Claude as one `ok` line, not a problem.
+
 The first plan agent in `order` starts. The current one keeps working until it is unavailable,
 then the next plan agent takes over, wrapping around. A plan agent that comes back does not
 preempt another plan agent that is working. When both are out, Claude runs. While it does, baton
@@ -212,6 +229,80 @@ agent whose round fails within five minutes of such a takeover stops being allow
 rounds until it completes one. At most six Claude rounds a day are ended this way (`baton
 status` says when the cap is active). When no agent can run, baton waits for the earliest known reset.
 Change the order, or disable an agent, in the goal file.
+
+## Long-term memory
+
+`.baton/HANDOFF.md` is short-term: it dies with the goal. [ai-memory](https://github.com/akitaonrails/ai-memory)
+is the long-term layer: what past rounds did and learned, searchable, across goals in the same
+directory. It adds to the handoff and never replaces it. It is optional: without the binary, or
+with memory off, nothing changes, and a memory failure can never stop a goal.
+
+**baton drives it; the agents do not.** baton calls the `ai-memory` command itself, between rounds,
+so the same memory reaches Codex, Antigravity and Claude alike. It uses no hooks and no MCP, and
+never runs `ai-memory setup`, `install-hooks`, `install-mcp` or `run`.
+
+**What is stored, and where.**
+
+- Before every round, baton searches the project's memory with words from the last verify output
+  (at most 16 of them) and the objective (the rest, up to 24 in all), and puts the best 5 hits (6000 characters at most) in the prompt, labelled as
+  context that may be out of date, not as instructions. Words are taken from the end of the
+  verify output and of the objective, where the errors and the newest message are. The hits sit
+  between `--- BEGIN BATON MEMORY ---` and `--- END BATON MEMORY ---`, one line each, starting
+  with the page's date and goal.
+- After a round that started a process, baton stores one page: the date, the agent, how it ended,
+  how long it took, the gate result, the commits it made, and the tails of the verify output, the
+  handoff and the round. It is written when the round ends and again, over itself, once the
+  verify has run, so a baton killed during the verify still leaves its page. A round that fails,
+  times out or has a failing verify is kept as a "gotcha"; a stop, an interrupt, a takeover by
+  another agent or a limit is normal rotation.
+- Agents are told to keep durable findings under a `## Lessons` heading in the handoff. When that
+  section changes, baton stores it as a pinned page that outlives the goal.
+- ai-memory redacts secrets before it stores anything. Memory is per directory: a project is the
+  directory's name plus a short hash of its full path, and a search never leaves it.
+- The data is in `~/.local/state/baton/.ai-memory` (mode 700), with its own config and its own
+  port, `127.0.0.1:18778`, so it never meets another ai-memory on the machine. The leading dot
+  keeps it clear of every goal's state directory, since no goal can be named that.
+  `BATON_STATE_DIR` moves it.
+  baton starts the server when it first needs one and leaves it running.
+- ai-memory gets only `PATH`, `HOME`, `TMPDIR`, `NO_COLOR` and `RUST_LOG` in its environment, so no
+  provider key can reach it, and baton configures no model for it: it uses none.
+
+**Install it.** Download the release for your platform from the
+[ai-memory releases](https://github.com/akitaonrails/ai-memory/releases), and put the `ai-memory`
+binary on your `PATH` (or set `bin` below to its path). Do not run `ai-memory setup`: it wires
+hooks into every session on the machine, which is what baton avoids. Then run `baton doctor`: the
+`memory` line shows the binary found and whether the server is up. If you run baton as a service,
+re-run `baton install-service` after installing ai-memory, so the service can find it.
+
+**Turn it off.** `memory = false` in a goal file or `baton.toml` turns it off for that project.
+`BATON_MEMORY=off` in the environment turns it off everywhere. In `defaults.toml`:
+
+```toml
+[memory]
+enabled = true
+bin = "ai-memory"      # a name on PATH, or a path
+port = 18778           # 1024-65535
+recall_chars = 6000    # 0-20000; 0 stops recall, recording goes on
+```
+
+A `baton.toml` that comes with a repository can only turn memory off or on; it cannot set `bin`
+or `port`. A `[memory]` table that cannot be read turns memory off, with one line in `baton status`
+and a warning in `baton doctor`.
+
+**Limits.**
+
+- One memory call, starting the server included, is given 8 seconds in all. After any failure
+  (server dead, garbage output) baton skips memory for 300 seconds, so a broken memory costs a
+  round one short wait at most. A missing binary costs nothing and says nothing; `baton doctor`
+  warns. Failures show in `baton status` as `memory` events, never in the chat.
+- If you change `port` while the old server is still running, baton starts no second one: it says
+  so, in `baton status` and `baton doctor`, and you stop the old server (or set the old port
+  back). baton never stops it for you.
+- A round that baton had to kill is still recorded, as `interrupted`.
+- Recall is keyword search, not understanding: it finds earlier pages that share words with the
+  failing output or the objective. It can miss, and it can return something stale.
+- Lessons longer than 10000 characters are cut to their last 10000.
+- Goals in one directory share one memory; the pages are told apart by goal name.
 
 ## How each agent is stopped before it costs money
 
@@ -364,7 +455,9 @@ Without `verify.command`, the goal is finished when a round completes.
 
 Between rounds each agent gets the same context: the repository, its commits, `.baton/HANDOFF.md`
 (kept current by the agents), the last gate output and the tail of the previous round. `.baton/`
-lives in the working directory and is added to `.git/info/exclude`. After each round baton commits
+lives in the working directory and is added to `.git/info/exclude`. With `ai-memory` installed, what
+earlier goals learned in the directory is added too (see [Long-term memory](#long-term-memory);
+`memory = false` turns it off). After each round baton commits
 uncommitted work locally as `baton: snapshot round <n> (<agent>)` so a hard stop loses nothing. It
 never pushes (`snapshot = false` turns the commits off).
 
