@@ -288,6 +288,9 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
             print(f"    reason: {info['reason']}")
         if info.get("usage"):
             print(f"    usage: {json.dumps(info['usage'], sort_keys=True)}")
+    phase = state.get("phase")
+    if isinstance(phase, dict) and isinstance(phase.get("phase"), str):
+        print(f"phase: {phase['phase']} (review cycles used: {phase.get('cycles', 0)})")
     frees = preempt_cap_frees_at(state.get("preempts"), now)
     if frees is not None:
         print(

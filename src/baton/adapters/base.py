@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import re
+import shlex
+import sys
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-COMPLETED, LIMIT, CREDIT_GUARD, AUTH, TRANSIENT, TIMEOUT, PREEMPTED = (
+from baton import subagent_guard
+
+if TYPE_CHECKING:
+    from baton.config import AgentConfig
+
+COMPLETED, LIMIT, CREDIT_GUARD, AUTH, TRANSIENT, TIMEOUT, PREEMPTED, SUBAGENT = (
     "completed",
     "limit",
     "credit_guard",
@@ -15,6 +23,7 @@ COMPLETED, LIMIT, CREDIT_GUARD, AUTH, TRANSIENT, TIMEOUT, PREEMPTED = (
     "transient",
     "timeout",
     "preempted",
+    "subagent",  # a visible subagent model outside the provider's two
 )
 
 
@@ -27,6 +36,9 @@ class RoundResult:
     reason: str = ""
     resume_failed: bool = False
     back: str = ""  # PREEMPTED only: the plan agent whose return ended the round
+    # COMPLETED only: the round was cut off by its own cap, so its work is not finished. The
+    # scheduler treats it as completed; a phase must not advance on it, nor a goal finish.
+    bounded: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +62,93 @@ class RoundContext:
     on_spawn: Callable[[int], None]
     session_id: str | None = None
     on_session: Callable[[str], None] = lambda _: None
+    # "strong" (plan, review and the plain relay) or "build": which of the two models runs.
+    tier: str = "strong"
+    # Told, with the tool and the model when the stream shows it, of every subagent a round starts.
+    on_subagent: Callable[[str, str | None], None] = lambda tool, model: None
+
+
+def tier_config(cfg: AgentConfig, tier: str) -> AgentConfig:
+    """`cfg` for a tier: the build tier swaps in the working model and effort, and nothing else
+    (the guard, the ledger, the budget and the resume all read the same config)."""
+    if tier == "build":
+        return replace(cfg, model=cfg.build_model, effort=cfg.build_effort)
+    return cfg
+
+
+_EFFORT_SUFFIX = re.compile(r"-(minimal|low|medium|high|xhigh)$")
+
+
+_CLAUDE_FAMILY = re.compile(r"^claude-([a-z]+)-")
+
+
+def claude_allowed_models(cfg: AgentConfig) -> list[str]:
+    """The names a Claude subagent may be given: the working model and the strong one, each by its
+    id and by its family alias (`sonnet`, `opus`), which Claude Code accepts."""
+    names: list[str] = []
+    for model in (cfg.build_model, cfg.model):
+        found = _CLAUDE_FAMILY.match(model)
+        for name in ([found.group(1)] if found else []) + [model]:
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def model_allowed(cfg: AgentConfig, model: str) -> bool:
+    """Whether a subagent may use `model`: exactly the provider's two, the strong and the build
+    one, and nothing that only looks like one. Antigravity keeps the effort in the model id, so
+    for it the two ids also match without their effort suffix."""
+    name = model.strip().lower()
+    allowed = {cfg.model.lower(), cfg.build_model.lower()}
+    if cfg.name == "antigravity":
+        allowed |= {_EFFORT_SUFFIX.sub("", a) for a in allowed}
+    if cfg.name == "claude_api":
+        allowed |= {n.lower() for n in claude_allowed_models(cfg)}
+    return name in allowed
+
+
+def subagent_guard_command() -> str:
+    """The command a vendor's PreToolUse hook runs: this Python, in isolated mode (`-I`: no
+    environment or user site can change what it imports), on the guard module."""
+    return shlex.join([sys.executable, "-I", str(Path(subagent_guard.__file__))])
+
+
+def check_subagent(
+    cfg: AgentConfig, ctx: RoundContext, tool: str, model: str | None, enforce: bool = False
+) -> RoundResult | None:
+    """Report a subagent the stream shows, and, with `enforce`, judge it: SUBAGENT only when its
+    model is visible and outside the pair. A subagent whose model the stream does not show is
+    logged and allowed, never guessed.
+
+    Claude and Codex do not enforce here: their PreToolUse hook denies the call before the
+    subagent exists, so the stream is a log (ending a round it would have handled costs a round).
+    Antigravity has no hook, and its model is rarely visible, so it enforces what it can see."""
+    ctx.on_subagent(tool, model)
+    if not enforce or model is None or model_allowed(cfg, model):
+        return None
+    allowed = ", ".join(sorted({cfg.model, cfg.build_model}))
+    return RoundResult(
+        SUBAGENT, reason=f"{tool} started a subagent on {model}, outside the allowed {allowed}"
+    )
+
+
+_MODEL_KEYS = ("model", "model_name", "modelname")
+
+
+def find_model(obj: object, depth: int = 2) -> str | None:
+    """A model name a stream event shows: a `model` key in the event or in a dict directly under
+    it. None when it does not show one."""
+    if not isinstance(obj, dict) or depth < 0:
+        return None
+    for key, value in obj.items():
+        if isinstance(key, str) and key.lower() in _MODEL_KEYS:
+            if isinstance(value, str) and value.strip():
+                return value
+    for value in obj.values():
+        found = find_model(value, depth - 1)
+        if found is not None:
+            return found
+    return None
 
 
 class Adapter(Protocol):

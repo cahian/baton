@@ -275,6 +275,9 @@ def render_event(kind: str, f: Mapping) -> str:
         tail = str(f.get("tail") or "").strip()[-GATE_SHOWN_CHARS:]
         shown = f"\n```\n{tail}\n```" if tail else ""
         return f"\n[baton] verify did not pass{shown}\n\n"
+    if kind == "phase":
+        cycle = f", review cycle {f['cycle']}" if f.get("cycle") else ""
+        return f"\n[baton] phase: {f.get('phase')}{cycle}: {f.get('reason')}\n\n"
     if kind == "verify_unrunnable":
         return f"\n[baton] warning: {f.get('message')}\n\n"
     if kind == "alert":

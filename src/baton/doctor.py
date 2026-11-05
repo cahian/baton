@@ -17,8 +17,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import NamedTuple
 
+from baton import superpowers
 from baton.adapters import antigravity, claude_api, codex
-from baton.config import AGENT_NAMES, AgentConfig, Goal, GoalError, default_agent, load_memory
+from baton.config import (
+    AGENT_NAMES,
+    AgentConfig,
+    Goal,
+    GoalError,
+    default_agent,
+    load_memory,
+    load_superpowers,
+)
 from baton.ledger import MIN_GRANT_USD, LedgerError
 from baton.memory import Memory
 from baton.proc import SCRUBBED_ENV
@@ -288,6 +297,28 @@ def _interactive() -> Check:
     )
 
 
+def _superpowers() -> Check:
+    """Superpowers is required: a goal waits, and runs no round, until it is found."""
+    name = "superpowers"
+    try:
+        found = superpowers.find_skills(load_superpowers())
+    except GoalError as exc:
+        return Check(name, False, True, f"settings: {exc}")
+    if found is not None:
+        try:
+            superpowers.Skills.load(found)
+        except (superpowers.SkillsError, OSError) as exc:
+            return Check(name, False, True, f"{found}: {exc}")
+        return Check(name, True, False, str(found))
+    return Check(
+        name,
+        False,
+        True,
+        "not found: a goal waits, and runs no round, until it is installed. Install it with: "
+        f"{superpowers.INSTALL_COMMAND}",
+    )
+
+
 def _memory(goal: Goal | None) -> Check:
     """Long-term memory is always optional: whatever is wrong with it, rounds run without it."""
     name = "memory"
@@ -353,5 +384,6 @@ def run_checks(goal: Goal | None, env: Mapping[str, str]) -> list[Check]:
             checks.append(Check(f"{name} limits", False, blocking, "skipped: no binary"))
         if name == "codex":
             checks.append(_interactive())
+    checks.append(_superpowers())
     checks.append(_memory(goal))
     return checks

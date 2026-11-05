@@ -712,3 +712,104 @@ def test_the_list_is_kept_short(tmp_path):
     now = Clock().now
     _, _, s = trio(tmp_path, saved={"preempts": [now - i for i in range(1, 500)]})
     assert len(s.snapshot()["preempts"]) == 6
+
+
+# --- pick(avoid=...): review goes to another provider without moving the rotation -------------
+
+
+def test_avoid_returns_the_other_plan_agent_and_leaves_current_alone(env):
+    clock, agents, store, make = env
+    sched = make()
+    assert sched.pick().name == "codex"
+    assert sched.pick(avoid="codex").name == "antigravity"
+    assert sched.current == "codex"  # the next non-review round continues as before
+    assert sched.pick().name == "codex"
+
+
+def test_avoid_does_not_persist_a_change_of_current(env):
+    clock, agents, store, make = env
+    sched = make()
+    sched.pick()
+    sched.pick(avoid="codex")
+    sched.save()
+    assert make().current == "codex"
+
+
+def test_avoid_with_no_other_plan_agent_returns_the_same_provider(env):
+    clock, agents, store, make = env
+    agents["antigravity"].avail = Availability(False, reason="out")
+    sched = make()
+    assert sched.pick(avoid="codex").name == "codex"
+
+
+def test_avoid_not_the_pick_changes_nothing(env):
+    clock, agents, store, make = env
+    sched = make()
+    assert sched.pick(avoid="antigravity").name == "codex"
+    assert sched.current == "codex"
+
+
+def test_avoid_never_returns_a_metered_agent(tmp_path):
+    clock = Clock()
+    agents = {
+        "codex": Agent("codex"),
+        "antigravity": Agent("antigravity"),
+        "claude_api": Agent("claude_api", metered=True),
+    }
+    agents["antigravity"].avail = Availability(False, reason="out")
+    sched = Scheduler(("codex", "antigravity", "claude_api"), agents, Store(tmp_path / "g"), clock)
+    assert sched.pick(avoid="codex").name == "codex"  # Claude is not brought in because of avoid
+    agents["codex"].avail = Availability(False, reason="out")
+    assert sched.pick(avoid="codex").name == "claude_api"  # both out: Claude, as always
+    assert sched.pick(avoid="claude_api").name == "claude_api"
+
+
+def test_avoid_skips_an_alternative_that_is_cooling_down(env):
+    clock, agents, store, make = env
+    sched = make()
+    sched.pick()
+    sched.record("antigravity", RoundResult(LIMIT, until=clock.now + 3600))
+    assert sched.pick(avoid="codex").name == "codex"
+
+
+# --- the subagent outcome ----------------------------------------------------------------------
+
+
+def test_a_subagent_round_keeps_the_agent_available_twice_and_rests_it_the_third_time(env):
+    from baton.adapters.base import SUBAGENT
+
+    clock, agents, store, make = env
+    sched = make()
+    for _ in range(2):
+        assert sched.pick().name == "codex"
+        sched.record("codex", RoundResult(SUBAGENT, reason="model"))
+    assert sched.pick().name == "codex"  # still the one that works
+    sched.record("codex", RoundResult(SUBAGENT, reason="model"))
+    assert sched.pick().name == "antigravity"  # rested after three in a row
+    clock.now += 61  # the first backoff of a failing agent
+    assert sched.pick().name == "antigravity"  # sticky until it is unavailable
+    agents["antigravity"].avail = Availability(False, reason="out")
+    assert sched.pick().name == "codex"
+
+
+def test_a_completed_round_resets_the_subagent_count(env):
+    from baton.adapters.base import SUBAGENT
+
+    clock, agents, store, make = env
+    sched = make()
+    for outcome in (SUBAGENT, SUBAGENT, COMPLETED, SUBAGENT, SUBAGENT):
+        sched.record("codex", RoundResult(outcome))
+    assert sched.pick().name == "codex"  # never three in a row
+
+
+def test_the_subagent_count_is_for_one_run_only(env):
+    from baton.adapters.base import SUBAGENT
+
+    clock, agents, store, make = env
+    sched = make()
+    for _ in range(2):
+        sched.record("codex", RoundResult(SUBAGENT))
+    sched.save()
+    again = make()  # a new run starts the count again
+    again.record("codex", RoundResult(SUBAGENT))
+    assert again.pick().name == "codex"

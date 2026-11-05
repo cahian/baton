@@ -864,6 +864,22 @@ def test_extra_env_values_are_redacted_from_log_and_lines(tmp_path):
     assert "key=[redacted]" in shown and "again [redacted]" in shown
 
 
+def test_plain_env_reaches_the_child_and_is_not_redacted(tmp_path):
+    ctx = make_ctx(tmp_path)
+    shown = []
+    ctx.on_output = shown.append
+    run_streaming(
+        py("import os; print('model=' + os.environ['M'])"),
+        tmp_path,
+        None,
+        ctx,
+        never,
+        lambda: None,
+        plain_env={"M": "claude-sonnet-5-5"},
+    )
+    assert "model=claude-sonnet-5-5" in shown
+
+
 def test_a_secret_split_across_two_chunks_is_still_redacted(tmp_path):
     secret = "fake-ant-api03-SPLITSPLITSPLIT"
     # one line, longer than the 64 KB chunk, with the secret straddling the cut
@@ -1139,3 +1155,28 @@ def test_a_last_piece_after_a_cut_line_is_checked_together_with_what_was_held(
     log, parsed, _, tail = final_piece(tmp_path, monkeypatch, code)
     assert SECRET[:8] not in log and SECRET[:8] not in tail
     assert log == "A" * (65536 - 4)
+
+
+def test_scrub_drops_every_variable_that_matches_before_the_adapter_adds_its_own(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XX_ONE", "1")
+    monkeypatch.setenv("XX_TWO", "2")
+    monkeypatch.setenv("YY_KEEP", "kept")
+    ctx = make_ctx(tmp_path)
+    shown = []
+    ctx.on_output = shown.append
+    run_streaming(
+        py(
+            "import os; print(sorted(k for k in os.environ if k[:3] in ('XX_', 'YY_')));"
+            " print(os.environ.get('XX_TWO'))"
+        ),
+        tmp_path,
+        None,
+        ctx,
+        never,
+        lambda: None,
+        scrub=("XX_*",),
+        extra_env={"XX_TWO": "its-own-value-123"},  # added back after the scrub
+    )
+    assert shown[0] == "['XX_TWO', 'YY_KEEP']"

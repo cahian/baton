@@ -160,6 +160,7 @@ class RoundEntry:
     commits: str
     handoff: str
     round_tail: str
+    phase: str = ""  # plan, build or review; empty for a plain relay
 
 
 def _tail(text: str, chars: int) -> str:
@@ -609,6 +610,8 @@ class Memory:
             f"- duration: {e.seconds:g} s",
             f"- gate: {e.gate}",
         ]
+        if e.phase:
+            lines.insert(5, f"- phase: {e.phase}")
         for title, shown in (
             ("Commits", _head(e.commits, COMMITS_PAGE_CHARS)),  # newest first: keep the top
             ("Gate output (tail)", _tail(e.gate_tail, GATE_PAGE_CHARS)),

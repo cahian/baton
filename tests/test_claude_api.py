@@ -1,5 +1,7 @@
 import json
 import os
+import shlex
+import subprocess
 import sys
 import threading
 import time
@@ -11,6 +13,7 @@ from pathlib import Path
 import pytest
 from conftest import codex_limits
 
+from baton import subagent_guard
 from baton.adapters import claude_api
 from baton.adapters.base import (
     AUTH,
@@ -27,6 +30,7 @@ from baton.adapters.claude_api import (
     KeyFileError,
     evaluate_line,
     fetch_cost_report,
+    guard_settings,
     make_cost_report,
     read_key,
 )
@@ -79,6 +83,8 @@ def make_cfg(env, **kw) -> AgentConfig:
         enabled=True,
         model="claude-opus-5-5",
         effort="medium",
+        build_model="claude-sonnet-5-5",
+        build_effort="high",
         threshold_pct=95,
         poll_s=15,
         bin=env.bin,
@@ -185,14 +191,14 @@ def test_evaluate_line_accepts_the_key_source():
 )
 def test_evaluate_line_stops_any_other_key_source(source):
     result = evaluate_line(init_line(source))
-    assert result is not None and result.outcome == CREDIT_GUARD
+    assert result is not None and result.outcome == AUTH
     assert "apiKeySource" in result.reason
 
 
 def test_evaluate_line_stops_an_init_without_a_key_source():
     line = json.dumps({"type": "system", "subtype": "init", "session_id": "s1"})
     result = evaluate_line(line)
-    assert result is not None and result.outcome == CREDIT_GUARD
+    assert result is not None and result.outcome == AUTH
 
 
 @pytest.mark.parametrize(
@@ -213,26 +219,167 @@ def test_evaluate_line_ignores_everything_else(line):
 # --- the command -----------------------------------------------------------------------------
 
 
-def test_argv_has_bare_model_effort_and_round_cap(env):
-    assert run(env).outcome == COMPLETED
-    (call,) = env.calls()
-    assert call["argv"] == [
+def expected_argv(model, effort, cap="10.00", resume=None):
+    argv = [
         "-p",
         "--output-format",
         "stream-json",
         "--verbose",
-        "--bare",
+        "--setting-sources=",
+        "--strict-mcp-config",
         "--model",
-        "claude-opus-5-5",
+        model,
         "--effort",
-        "medium",
+        effort,
         "--dangerously-skip-permissions",
-        "--allowedTools=Bash,Edit,Read,Write",
+        "--tools=Bash,Edit,Read,Write,Agent",
+        "--allowedTools=Bash,Edit,Read,Write,Agent",
+        f"--settings={guard_settings()}",
         "--max-budget-usd",
-        "10.00",
+        cap,
     ]
+    return argv + ["--resume", resume] if resume else argv
+
+
+@pytest.mark.parametrize(
+    "tier,model,effort",
+    [("strong", "claude-opus-5-5", "medium"), ("build", "claude-sonnet-5-5", "high")],
+)
+@pytest.mark.parametrize("session", [None, "abc-123"])
+def test_the_exact_argv_fresh_and_resumed_on_both_tiers(env, tier, model, effort, session):
+    assert run(env, tier=tier, session_id=session).outcome == COMPLETED
+    (call,) = env.calls()
+    assert call["argv"] == expected_argv(model, effort, resume=session)
+    assert "--bare" not in call["argv"]  # it would stop --tools and --settings from working
     assert call["stdin"] == "do the thing"  # the prompt goes on stdin, not on the command line
     assert call["cwd"] == str(env.root.resolve()) or call["cwd"] == str(env.root)
+
+
+def test_the_settings_hook_runs_the_guard_with_this_python_in_isolated_mode_and_blocks_on_failure(
+    env,
+):
+    run(env)
+    (arg,) = [a for a in env.calls()[0]["argv"] if a.startswith("--settings=")]
+    settings = json.loads(arg.removeprefix("--settings="))
+    (entry,) = settings["hooks"]["PreToolUse"]
+    assert entry["matcher"] == "Agent|Task"
+    (hook,) = entry["hooks"]
+    assert hook["type"] == "command" and hook["onFailure"] == "block"
+    assert shlex.split(hook["command"]) == [
+        sys.executable,
+        "-I",
+        str(Path(subagent_guard.__file__)),
+    ]
+    assert set(settings) == {"hooks"}
+
+
+def test_the_round_env_names_the_allowed_models_and_the_default_for_subagents(env):
+    run(env)
+    child = env.calls()[0]["env"]
+    assert child["BATON_ALLOWED_MODELS"] == "sonnet,claude-sonnet-5-5,opus,claude-opus-5-5"
+    assert child["CLAUDE_CODE_SUBAGENT_MODEL"] == "claude-sonnet-5-5"
+    assert child["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"  # every subagent on the working model
+    assert child["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert child["ANTHROPIC_API_KEY"] == KEY  # the key is there, and it is the only credential
+    assert "ANTHROPIC_AUTH_TOKEN" not in child
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_FOUNDRY_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "CLAUDE_CODE_OAUTH_SCOPES",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ],
+)
+def test_no_other_credential_or_provider_reaches_the_round(env, monkeypatch, name):
+    monkeypatch.setenv(name, "stray-value-from-the-parent")
+    monkeypatch.setenv("CLAUDE_CODE_SOMETHING_ELSE", "kept")
+    run(env)
+    child = env.calls()[0]["env"]
+    assert name not in child
+    assert child["ANTHROPIC_API_KEY"] == KEY  # added back after the scrub, from the key file
+    assert child["CLAUDE_CODE_SOMETHING_ELSE"] == "kept"  # only credential names go
+
+
+def config_dir():
+    from baton.store import state_base
+
+    return state_base() / ".claude-config"
+
+
+@pytest.mark.parametrize("session", [None, "abc-123"])
+def test_the_round_uses_a_config_dir_of_baton_s_own_so_the_users_file_cannot_swap_the_key(
+    env, monkeypatch, session
+):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")  # a parent's own is replaced
+    run(env, session_id=session)
+    child = env.calls()[0]["env"]
+    assert child["CLAUDE_CONFIG_DIR"] == str(config_dir())
+    assert config_dir().is_dir() and (config_dir().stat().st_mode & 0o777) == 0o700
+
+
+def test_every_round_uses_the_same_config_dir_so_sessions_resume(env):
+    run(env)
+    run(env, session_id="sess-1")
+    first, second = (c["env"]["CLAUDE_CONFIG_DIR"] for c in env.calls())
+    assert first == second == str(config_dir())
+
+
+def test_an_existing_config_dir_with_loose_mode_is_tightened(env):
+    config_dir().mkdir(parents=True)
+    config_dir().chmod(0o755)
+    run(env)
+    assert (config_dir().stat().st_mode & 0o777) == 0o700
+
+
+def test_a_config_dir_that_cannot_be_made_is_a_transient_round_that_spent_nothing(env):
+    config_dir().parent.mkdir(parents=True, exist_ok=True)
+    config_dir().write_text("a file where the directory should be")
+    result = run(env)
+    assert result.outcome == TRANSIENT and "config" in result.reason
+    assert env.calls() == [] and env.ledger.spent() == 0
+
+
+def test_a_parent_api_key_never_replaces_the_key_file(env, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-ant-api03-FROM-THE-PARENT-ENV-0000")
+    run(env)
+    assert env.calls()[0]["env"]["ANTHROPIC_API_KEY"] == KEY
+
+
+def test_the_allowed_models_follow_the_configured_pair(env):
+    run(env, adapter=make_adapter(env, model="claude-opus-9", build_model="claude-haiku-9"))
+    child = env.calls()[0]["env"]
+    assert child["BATON_ALLOWED_MODELS"] == "haiku,claude-haiku-9,opus,claude-opus-9"
+    assert child["CLAUDE_CODE_SUBAGENT_MODEL"] == "claude-haiku-9"
+
+
+def test_the_hook_denies_a_third_model_end_to_end(env):
+    """The hook the argv names, run the way Claude Code runs it, with this round's env."""
+    run(env)
+    call = env.calls()[0]
+    (arg,) = [a for a in call["argv"] if a.startswith("--settings=")]
+    hooks = json.loads(arg.removeprefix("--settings="))["hooks"]["PreToolUse"][0]["hooks"]
+    event = json.dumps({"tool_name": "Agent", "tool_input": {"model": "haiku"}})
+    done = subprocess.run(
+        shlex.split(hooks[0]["command"]),
+        input=event,
+        capture_output=True,
+        text=True,
+        env={"BATON_ALLOWED_MODELS": call["env"]["BATON_ALLOWED_MODELS"]},
+    )
+    assert json.loads(done.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_round_cap_is_what_the_ledger_granted(env):
@@ -242,21 +389,13 @@ def test_round_cap_is_what_the_ledger_granted(env):
     assert env.calls()[0]["argv"][-1] == "7.50"
 
 
-def test_resume_argv(env):
-    assert run(env, session_id="abc-123").outcome == COMPLETED
-    argv = env.calls()[0]["argv"]
-    assert argv[:2] == ["-p", "--output-format"] or argv[0] == "-p"
-    assert argv[argv.index("--resume") + 1] == "abc-123"
-    assert "--bare" in argv and "--max-budget-usd" in argv  # a resume is capped just the same
-
-
 @pytest.mark.parametrize("session_id", [None, "abc-123"])
 def test_allowed_tools_and_env_scrub_travel_together(env, session_id):
     """The scrub forces the default permission mode, so only the explicit tool list lets the agent
     write; dropping either half leaves rounds that succeed and change nothing."""
     assert run(env, session_id=session_id).outcome == COMPLETED
     (call,) = env.calls()
-    assert "--allowedTools=Bash,Edit,Read,Write" in call["argv"]
+    assert "--allowedTools=Bash,Edit,Read,Write,Agent" in call["argv"]
     assert call["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
 
 
@@ -595,7 +734,7 @@ def test_api_key_source_other_than_key_stops_round(env, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_API_KEY_SOURCE", "none")
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
     result = run(env)
-    assert result.outcome == CREDIT_GUARD and "apiKeySource" in result.reason
+    assert result.outcome == AUTH and "apiKeySource" in result.reason
     pid = int(env.pidfile.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)  # the group was killed, it did not run for 30 s
@@ -996,7 +1135,7 @@ def test_noise_lines_before_a_wrong_source_init_are_still_the_only_event(env, mo
     monkeypatch.setenv("FAKE_CLAUDE_STDERR", "warning: something harmless")
     monkeypatch.setenv("FAKE_CLAUDE_API_KEY_SOURCE", "none")
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
-    assert run(env).outcome == CREDIT_GUARD
+    assert run(env).outcome == AUTH
     assert env.ledger.spent() == 0
 
 
@@ -1006,7 +1145,7 @@ def test_an_event_before_a_wrong_source_init_keeps_the_reservation(env, monkeypa
     )
     monkeypatch.setenv("FAKE_CLAUDE_API_KEY_SOURCE", "none")
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
-    assert run(env).outcome == CREDIT_GUARD
+    assert run(env).outcome == AUTH
     assert env.ledger.spent() == Decimal("10.00")  # the init was not the only event
 
 
@@ -1172,3 +1311,92 @@ def test_only_the_agent_acting_counts_as_work(env, line, work):
     adapter = make_adapter(env)
     assert adapter.render(line)  # the person sees all of them
     assert adapter.is_work(line) is work
+
+
+# --- the subagent guard: the hook is the first layer, the stream the second -------------------
+
+
+def agent_use(model=None, name="Agent", ident="toolu_1"):
+    block = {"type": "tool_use", "id": ident, "name": name, "input": {"prompt": "do it"}}
+    if model is not None:
+        block["input"]["model"] = model
+    if ident is None:
+        del block["id"]
+    return {"type": "assistant", "message": {"role": "assistant", "content": [block]}}
+
+
+def claude_round(env, monkeypatch, events, **ctx_kw):
+    monkeypatch.setenv("FAKE_CLAUDE_EXTRA", json.dumps(events))
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    seen = []
+    started = time.monotonic()
+    result = run(env, on_subagent=lambda t, m: seen.append((t, m)), **ctx_kw)
+    return result, seen, time.monotonic() - started
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5", "sonnet", "opus"])
+def test_a_subagent_on_either_model_or_its_alias_is_allowed(env, monkeypatch, model):
+    monkeypatch.setenv("FAKE_CLAUDE_EXTRA", json.dumps([agent_use(model)]))
+    seen = []
+    result = run(env, on_subagent=lambda t, m: seen.append((t, m)))
+    assert result.outcome == COMPLETED and seen == [("Agent", model)]
+
+
+@pytest.mark.parametrize("model", ["claude-haiku-4-5", "haiku", "gpt-5", "inherit", None])
+@pytest.mark.parametrize("name", ["Agent", "Task"])
+def test_the_stream_only_logs_a_subagent_the_hook_denies_it_does_not_end_the_round(
+    env, monkeypatch, model, name
+):
+    monkeypatch.setenv("FAKE_CLAUDE_EXTRA", json.dumps([agent_use(model, name=name)]))
+    seen = []
+    result = run(env, on_subagent=lambda t, m: seen.append((t, m)))
+    assert result.outcome == COMPLETED  # a round it would have ended once cost a 5 USD reservation
+    assert seen == [(name, model)]
+
+
+def test_a_subagent_with_no_model_is_logged_and_allowed(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_EXTRA", json.dumps([agent_use(None)]))
+    seen = []
+    result = run(env, on_subagent=lambda t, m: seen.append((t, m)))
+    assert result.outcome == COMPLETED and seen == [("Agent", None)]
+
+
+def test_a_call_with_no_id_is_never_skipped_as_a_repeat(env, monkeypatch):
+    event = agent_use("sonnet", ident=None)
+    monkeypatch.setenv("FAKE_CLAUDE_EXTRA", json.dumps([event, event]))
+    seen = []
+    run(env, on_subagent=lambda t, m: seen.append((t, m)))
+    assert len(seen) == 2
+
+
+def test_another_tool_is_not_a_subagent(env, monkeypatch):
+    block = {"type": "tool_use", "id": "t", "name": "Write", "input": {"model": "haiku"}}
+    event = {"type": "assistant", "message": {"content": [block]}}
+    monkeypatch.setenv("FAKE_CLAUDE_EXTRA", json.dumps([event]))
+    seen = []
+    result = run(env, on_subagent=lambda t, m: seen.append((t, m)))
+    assert result.outcome == COMPLETED and seen == []
+
+
+@pytest.mark.parametrize("source", ["none", "claude.ai", "oauth", "/login managed key"])
+def test_a_subscription_login_is_refused_at_once_before_any_spend(env, monkeypatch, source):
+    monkeypatch.setenv("FAKE_CLAUDE_API_KEY_SOURCE", source)
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    started = time.monotonic()
+    result = run(env)
+    assert result.outcome == AUTH and "apiKeySource" in result.reason
+    assert time.monotonic() - started < 15  # the group was stopped, not waited for
+    assert env.ledger.spent() == 0  # no model call was made
+
+
+def test_a_round_cut_off_by_its_budget_is_bounded_but_still_completed_for_the_scheduler(
+    env, monkeypatch
+):
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_SUBTYPE", "error_max_budget_usd")
+    result = run(env)
+    assert result.outcome == COMPLETED and result.bounded is True
+
+
+def test_a_normal_round_is_not_bounded(env):
+    assert run(env).bounded is False

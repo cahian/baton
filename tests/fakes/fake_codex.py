@@ -12,7 +12,8 @@ Subcommands:
               announce, `FAKE_CODEX_EXEC_SLEEP` the seconds to stay alive afterwards,
               `FAKE_CODEX_EXEC_EXIT` the exit code, `FAKE_CODEX_EXEC_FAIL` a line to print
               (non-JSON, to stderr-like stdout) before exiting. `FAKE_CODEX_EXEC_PIDFILE` gets
-              the exec process's pid.
+              the exec process's pid. `FAKE_CODEX_EXTRA` is a JSON list of events printed after
+              `thread.started`.
 """
 
 import json
@@ -96,12 +97,15 @@ def exec_cmd() -> None:
                         "stdin": stdin_text,
                         "cwd": os.getcwd(),
                         "anthropic_env": sorted(k for k in os.environ if k.startswith("ANTHROPIC")),
+                        "baton_env": {k: v for k, v in os.environ.items() if k.startswith("BATON")},
                     }
                 )
                 + "\n"
             )
     thread_id = os.environ.get("FAKE_CODEX_THREAD_ID", "thread-1")
     emit({"type": "thread.started", "thread_id": thread_id})
+    for extra in json.loads(os.environ.get("FAKE_CODEX_EXTRA", "[]")):
+        emit(extra)
     fail = os.environ.get("FAKE_CODEX_EXEC_FAIL")
     if fail:
         sys.stdout.write(fail + "\n")

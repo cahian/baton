@@ -13,6 +13,8 @@ recall_chars = 6000    # most memory put in one prompt, 0-20000; 0 stops recall,
 enabled = true
 model = "claude-opus-5-5"
 effort = "medium"
+build_model = "claude-sonnet-5-5"   # the phases' working tier (plan and review use `model`)
+build_effort = "high"
 # One budget for every goal, because they all spend the same Console credit.
 monthly_budget_usd = 200   # what the organization holds
 reserve_pct = 10           # kept back; the spend ceiling is 200 - 10% = 180
@@ -24,6 +26,7 @@ admin_key_file = ""        # optional: an Admin API key file, to cross-check spe
 [agents.antigravity]
 enabled = true
 model = "gemini-4-argon-medium"
+build_model = "gemini-3.8-flash-high"   # must start with gemini-
 threshold_pct = 90
 poll_s = 30
 
@@ -31,5 +34,13 @@ poll_s = 30
 enabled = true
 model = "gpt-6.1-sol"
 effort = "medium"
+build_model = "gpt-6.1-terra"
+build_effort = "high"
 threshold_pct = 90
 poll_s = 15
+
+# Superpowers is required (git clone https://github.com/obra/superpowers ~/.config/baton/superpowers).
+# Leave `dir` empty: only the official Claude Code plugin install and that clone are found
+# automatically. An install anywhere else needs `dir`. Only this file may set it: a goal file or a repository's baton.toml cannot.
+[superpowers]
+dir = ""

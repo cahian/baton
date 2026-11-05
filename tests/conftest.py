@@ -50,6 +50,15 @@ def agy_credits(balance="0") -> str:
 
 
 @pytest.fixture(autouse=True)
+def phases_off_by_default(request, monkeypatch):
+    """Phases default to on, and the plain relay is what most tests pin: so a goal that does not
+    say otherwise runs without phases here. A test that is about phases is marked `phases` and sees
+    the real default."""
+    if request.node.get_closest_marker("phases") is None:
+        monkeypatch.setattr("baton.config.PHASES_DEFAULT", False)
+
+
+@pytest.fixture(autouse=True)
 def isolated_baton_files(tmp_path, monkeypatch):
     """No test reads the real defaults file or touches the real spend ledger."""
     monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "config" / "defaults.toml"))
@@ -58,6 +67,27 @@ def isolated_baton_files(tmp_path, monkeypatch):
     # Long-term memory is off in every test: none may start a real `ai-memory`, even if one is on
     # the PATH. A test that needs memory builds `Memory` with fakes, or turns this back on itself.
     monkeypatch.setenv("BATON_MEMORY", "off")
+
+
+def make_skills(root: Path) -> Path:
+    """A skills directory holding every file baton uses, each with text that names it."""
+    from baton.superpowers import REQUIRED
+
+    for name in REQUIRED:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\nname: front matter\n---\nTEXT OF {name}\n")
+    return root
+
+
+@pytest.fixture(autouse=True)
+def fake_skills(tmp_path_factory, monkeypatch) -> Path:
+    """Superpowers is mandatory, and no test may read the real install: every search finds this
+    fake directory. The tests of the search itself call the function they imported at collection,
+    before this patch, with a home of their own."""
+    root = make_skills(tmp_path_factory.mktemp("superpowers") / "skills")
+    monkeypatch.setattr("baton.superpowers.find_skills", lambda cfg=None, home=None: root)
+    return root
 
 
 class Fakes:
@@ -129,6 +159,7 @@ class Fakes:
             f'workdir = "{self.work}"',
             'objective = "Make the widget frobnicate."',
             "snapshot = false",
+            "phases = false",  # the plain relay; tests about phases build their own goal
             f"order = {json.dumps(list(order))}",
             extra,
         ]
@@ -172,6 +203,9 @@ def fakes(tmp_path, monkeypatch) -> Fakes:
     setenv("FAKE_CODEX_CALLS", str(f.codex_calls_file))
     setenv("FAKE_CODEX_EXEC_PIDFILE", str(f.codex_pidfile))
     setenv("HOME", str(tmp_path / "home"))  # no test reads the real home, or a real key file
+    # The processes that tests start (`baton run`, `baton serve`) search for Superpowers for real:
+    # they find this copy, in the last place the search looks.
+    make_skills(tmp_path / "home" / ".config/baton/superpowers/skills")
     setenv("FAKE_CLAUDE_CALLS", str(f.claude_calls_file))
     setenv("FAKE_AGY_CALLS", str(f.agy_calls_file))
     setenv("FAKE_AGY_READ_LOG", str(f.agy_read_log))

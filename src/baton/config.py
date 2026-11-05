@@ -22,6 +22,8 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "enabled": True,
         "model": "gpt-6.1-sol",
         "effort": "medium",
+        "build_model": "gpt-6.1-terra",
+        "build_effort": "high",
         "threshold_pct": 90,
         "poll_s": 15,
         "bin": "codex",
@@ -31,6 +33,8 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "enabled": True,
         "model": "gemini-4-argon-medium",
         "effort": "medium",  # unused by agy: effort is part of the model id
+        "build_model": "gemini-3.8-flash-high",
+        "build_effort": "high",  # unused as well
         "threshold_pct": 90,
         "poll_s": 30,
         "bin": "agy",
@@ -42,6 +46,8 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "enabled": True,
         "model": "claude-opus-5-5",
         "effort": "medium",
+        "build_model": "claude-sonnet-5-5",
+        "build_effort": "high",
         "bin": "claude",
         "monthly_budget_usd": Decimal("200"),
         "reserve_pct": 10,
@@ -67,6 +73,7 @@ GOAL_KEYS = frozenset(
         "idle_s",
         "snapshot",
         "memory",
+        "phases",
         "verify",
         "agents",
     }
@@ -84,6 +91,9 @@ GLOBAL_ONLY = ("monthly_budget_usd", "reserve_pct", "budget_reset_day")
 REPO_FORBIDDEN = ("bin", "key_file", "admin_key_file", "full_access", "poll_s")
 MAX_THRESHOLD_PCT = 90
 ANTIGRAVITY_MODEL_PREFIX = "gemini-"
+# Whether a goal runs plan, build and review phases when it does not say. Tests turn it off, so
+# they pin the plain relay, and the tests about phases turn it back on.
+PHASES_DEFAULT = True
 
 
 class GoalError(Exception):
@@ -94,8 +104,10 @@ class GoalError(Exception):
 class AgentConfig:
     name: str
     enabled: bool
-    model: str
+    model: str  # the strong tier, and the only one the plain relay uses
     effort: str
+    build_model: str  # the working tier of the phases
+    build_effort: str
     threshold_pct: int
     poll_s: int
     bin: str
@@ -117,6 +129,14 @@ class MemoryConfig:
     bin: str = "ai-memory"
     port: int = 18778
     recall_chars: int = 6000
+
+
+@dataclass(frozen=True)
+class SuperpowersConfig:
+    """The `[superpowers]` table of the defaults file. Only the defaults file may set it: a
+    repository's `baton.toml` must not choose which files become part of a prompt."""
+
+    dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -142,6 +162,7 @@ class Goal:
     verify_timeout_s: int
     agents: dict[str, AgentConfig]
     path: Path
+    phases: bool = True
 
 
 def _table(data: dict[str, Any], key: str, where: str) -> dict[str, Any]:
@@ -218,6 +239,8 @@ def _load_claude_api(table: dict[str, Any]) -> AgentConfig:
         enabled=_bool(table, "enabled", d["enabled"], where),
         model=_str(table, "model", d["model"], where),
         effort=_str(table, "effort", d["effort"], where),
+        build_model=_str(table, "build_model", d["build_model"], where),
+        build_effort=_str(table, "build_effort", d["build_effort"], where),
         bin=os.path.expanduser(_str(table, "bin", d["bin"], where)),
         monthly_budget_usd=_usd(table, "monthly_budget_usd", d["monthly_budget_usd"], where),
         reserve_pct=_int(table, "reserve_pct", d["reserve_pct"], where, 1, 99),
@@ -238,11 +261,16 @@ def _load_agent(name: str, table: dict[str, Any]) -> AgentConfig:
     model = _str(table, "model", d["model"], where)
     if name == "antigravity" and not model.startswith(ANTIGRAVITY_MODEL_PREFIX):
         raise GoalError(f"{where}model must start with {ANTIGRAVITY_MODEL_PREFIX!r}")
+    build_model = _str(table, "build_model", d["build_model"], where)
+    if name == "antigravity" and not build_model.startswith(ANTIGRAVITY_MODEL_PREFIX):
+        raise GoalError(f"{where}build_model must start with {ANTIGRAVITY_MODEL_PREFIX!r}")
     return AgentConfig(
         name=name,
         enabled=_bool(table, "enabled", d["enabled"], where),
         model=model,
         effort=_str(table, "effort", d["effort"], where),
+        build_model=build_model,
+        build_effort=_str(table, "build_effort", d["build_effort"], where),
         threshold_pct=_int(table, "threshold_pct", d["threshold_pct"], where, 1, MAX_THRESHOLD_PCT),
         poll_s=_int(table, "poll_s", d["poll_s"], where, 1, 3600),
         bin=os.path.expanduser(_str(table, "bin", d["bin"], where)),
@@ -277,7 +305,7 @@ def load_defaults() -> dict[str, dict[str, Any]]:
     try:
         # [memory] is read, and judged, by load_memory: a bad one must not keep a goal from
         # loading, since memory is never allowed to stop a goal.
-        _check_keys(data, {"agents", "memory"}, "the defaults file")
+        _check_keys(data, {"agents", "memory", "superpowers"}, "the defaults file")
         agents = _table(data, "agents", "")
         unknown = sorted(set(agents) - set(AGENT_NAMES))
         if unknown:
@@ -321,6 +349,30 @@ def load_memory() -> MemoryConfig:
             bin=os.path.expanduser(_str(table, "bin", d["bin"], "memory.")),
             port=_int(table, "port", d["port"], "memory.", 1024, 65535),
             recall_chars=_int(table, "recall_chars", d["recall_chars"], "memory.", 0, 20000),
+        )
+    except GoalError as exc:
+        raise GoalError(f"{path}: {exc}") from exc
+
+
+def load_superpowers() -> SuperpowersConfig:
+    """The `[superpowers]` table of the defaults file. A key that is unknown or a value that is
+    invalid raises GoalError, like the rest of that file."""
+    path = defaults_path()
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return SuperpowersConfig()
+    except OSError as exc:
+        raise GoalError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    try:
+        data = tomllib.loads(raw.decode("utf-8"), parse_float=Decimal)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise GoalError(f"invalid defaults file {path}: {exc}") from exc
+    try:
+        table = _table(data, "superpowers", "")
+        _check_keys(table, {"dir"}, "[superpowers]")
+        return SuperpowersConfig(
+            dir=os.path.expanduser(_optional_str(table, "dir", "", "superpowers."))
         )
     except GoalError as exc:
         raise GoalError(f"{path}: {exc}") from exc
@@ -440,6 +492,7 @@ def goal_from_table(
         idle_s=_int(data, "idle_s", 1200, "", 1, 10**7),
         snapshot=_bool(data, "snapshot", True, ""),
         memory=_bool(data, "memory", True, ""),
+        phases=_bool(data, "phases", PHASES_DEFAULT, ""),
         verify_command=verify_command,
         verify_timeout_s=_int(verify, "timeout_s", 3600, "verify.", 1, 10**7),
         agents=agents,

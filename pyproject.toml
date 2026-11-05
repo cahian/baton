@@ -23,6 +23,9 @@ build-backend = "uv_build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 timeout = 120
+markers = [
+    "phases: run with the real default of the phases setting (on), not the test default (off)",
+]
 
 [tool.ruff]
 line-length = 100
