@@ -709,6 +709,10 @@ notes (`.superpowers/`, `.oneshot-state.md`) stay untracked, and a test enforces
 
 The design is in [`docs/specs/2026-11-04-baton-design.md`](docs/specs/2026-11-04-baton-design.md).
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Credits
 
 baton uses two projects it does not bundle and did not write:
