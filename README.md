@@ -1,5 +1,7 @@
 # baton
 
+![baton — One goal. Keep it moving. Three connected agents pass a glowing relay baton.](docs/assets/baton-banner.png)
+
 baton keeps one long coding goal moving for days by passing it between three coding agents,
 stopping each one before it can spend money it should not.
 
