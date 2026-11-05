@@ -292,6 +292,13 @@ class Reading:
     credits: str | Exception
 
 
+def _failed(command: str, answer: object) -> str:
+    """Why a command's answer is no text: the exception that replaced it, or a wrong type."""
+    if isinstance(answer, Exception):
+        return f"{command} failed: {answer}"
+    return f"{command} answered {type(answer).__name__}, not text"
+
+
 def _evaluate(reading: Reading, threshold_pct: int, now: float) -> Eval:
     """Judge a read without letting one unreadable command hide the other.
 
@@ -302,13 +309,13 @@ def _evaluate(reading: Reading, threshold_pct: int, now: float) -> Eval:
     rows: list[dict] | None = None
     balance: Decimal | None = None
 
-    if isinstance(reading.usage, Exception):
-        blind.append(f"/usage failed: {reading.usage}")
+    if not isinstance(reading.usage, str):
+        blind.append(_failed("/usage", reading.usage))
     else:
         rows, problems = _parse_usage_lenient(reading.usage)
         blind.extend(f"/usage unreadable: {p}" for p in problems)
-    if isinstance(reading.credits, Exception):
-        blind.append(f"/credits failed: {reading.credits}")
+    if not isinstance(reading.credits, str):
+        blind.append(_failed("/credits", reading.credits))
     else:
         try:
             balance = parse_credits(reading.credits)

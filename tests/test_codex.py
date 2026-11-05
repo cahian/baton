@@ -858,3 +858,44 @@ def test_only_the_agent_acting_counts_as_work(line, work):
     adapter = CodexAdapter(make_cfg(), read=lambda: {})
     assert adapter.render(line)  # the person sees all of them
     assert adapter.is_work(line) is work
+
+
+# --- a read that cannot be judged must not lose the balance ----------------------------------
+
+
+def _guard(reads):
+    from baton.adapters.codex import evaluate
+    from baton.adapters.guard import Guard
+
+    clock = iter(range(0, 10_000, 100))
+    it = iter(reads)
+    return Guard(make_cfg(), lambda: next(it), evaluate, lambda: next(clock), lambda: NOW)
+
+
+def _flag_without_reached_type(balance):
+    return without(limits(balance=balance, allowed=False), "rateLimits", "rateLimitReachedType")
+
+
+def test_the_flag_false_without_a_reached_type_does_not_raise():
+    a = check_limits(_flag_without_reached_type("9"), 90, NOW)
+    assert not a.ok and "rateLimitReachedType is missing" in a.reason and a.until == NOW + 300
+
+
+def test_a_balance_drop_in_a_read_with_no_reached_type_and_the_flag_false_is_credit_guard():
+    guard = _guard([limits(balance="10"), _flag_without_reached_type("9")])
+    assert guard.start() is None
+    res = guard.tick()
+    assert res is not None and res.outcome == CREDIT_GUARD and "dropped" in res.reason
+
+
+def test_the_closing_read_sees_a_drop_in_a_read_with_no_reached_type_and_the_flag_false():
+    guard = _guard([limits(balance="10"), _flag_without_reached_type("9")])
+    assert guard.start() is None
+    res = guard.close()
+    assert res is not None and res.outcome == CREDIT_GUARD and "dropped" in res.reason
+
+
+def test_a_reset_too_large_for_a_float_is_not_a_reset():
+    r = limits(primary=95, primary_reset=10**400, secondary_reset=10**400)
+    a = check_limits(r, 90, NOW)
+    assert not a.ok and a.until is None  # refused, reset unknown: the scheduler backs off

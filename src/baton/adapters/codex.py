@@ -246,7 +246,7 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
             blind.append("ordinaryUsageAllowed is missing or not a boolean")
         elif allowed is False:
             reasons.append("ordinary usage is not allowed")
-            flag_only = limits["rateLimitReachedType"] is None
+            flag_only = limits.get("rateLimitReachedType") is None
 
     saturated = []
     for name, window in windows.items():
@@ -258,7 +258,17 @@ def _evaluate(result: object, threshold_pct: int, now: float) -> Eval:
         return Eval(Availability(True, usage=usage), False, False, balance)
 
     def resets(group: list[dict]) -> list[float]:
-        return [float(w["resetsAt"]) for w in group if _is_number(w.get("resetsAt"))]
+        # A reset that does not fit a finite float (10**400, 1e999) is no reset.
+        epochs = []
+        for w in group:
+            if _is_number(w.get("resetsAt")):
+                try:
+                    epoch = float(w["resetsAt"])
+                except OverflowError:
+                    continue
+                if epoch == epoch and epoch not in (float("inf"), float("-inf")):
+                    epochs.append(epoch)
+        return epochs
 
     if reasons and flag_only and not saturated:
         # No window explains the refusal, and the latest window reset can be days away.
