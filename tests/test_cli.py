@@ -160,6 +160,24 @@ def test_status_prints_cooldowns(fakes, capsys):
     assert "limit" in out  # the last event
 
 
+def test_status_says_in_a_sentence_which_agent_came_back(fakes, capsys):
+    store = store_for(fakes)
+    store.save_state({"round": 4, "current": "claude_api", "agents": {}})
+    store.emit(
+        "round_end",
+        round=4,
+        agent="claude_api",
+        outcome="preempted",
+        reason="codex is available again",
+        back="codex",
+        seconds=12.0,
+    )
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "round 4: claude_api stopped because codex is available again" in out
+    assert "outcome=preempted" not in out
+
+
 def test_status_reports_a_live_runner(fakes, capsys):
     holder = subprocess.Popen(
         [

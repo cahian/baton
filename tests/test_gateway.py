@@ -644,6 +644,21 @@ def test_an_agent_that_gives_no_reason_is_not_left_out():
     assert "- codex: it gave no reason" in text
 
 
+def test_a_preempted_round_says_which_agent_came_back():
+    text = gateway.render_event(
+        "round_end",
+        {
+            "round": 4,
+            "agent": "claude_api",
+            "outcome": "preempted",
+            "reason": "codex is available again",
+            "back": "codex",
+        },
+    )
+    assert "[baton] round 4: claude_api stopped because codex is available again." in text
+    assert "preempted" not in text
+
+
 def test_a_wait_with_its_own_reason_keeps_it():
     text = gateway.render_event(
         "wait", {"seconds": 60, "reason": "the last round ended at once", "agents": {}}
