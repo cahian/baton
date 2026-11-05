@@ -72,6 +72,9 @@ LARGE_LINE = 32 * 1024
 EXPIRY_MARGIN_S = 3600
 # The longest line that may be read as an error message when it is not JSON.
 SHORT_ERROR_LINE = 300
+# CLAUDE_CODE_SUBPROCESS_ENV_SCRUB forces Claude Code's permission mode to default, so
+# --dangerously-skip-permissions is ignored and, without this list, every write is denied.
+ALLOWED_TOOLS = "Bash,Edit,Read,Write"
 
 API_BASE = "https://api.anthropic.com"
 REPORT_PAGES = 12  # a period is at most 31 daily buckets, which is one page of 31
@@ -445,6 +448,7 @@ class ClaudeApiAdapter:
             "--effort",
             self.cfg.effort,
             "--dangerously-skip-permissions",
+            f"--allowedTools={ALLOWED_TOOLS}",  # `=` form: the flag is variadic and would eat args
             "--max-budget-usd",
             format(granted, "f"),
         ]

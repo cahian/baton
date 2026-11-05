@@ -153,8 +153,10 @@ Runs the Claude Code CLI against a Console API key, billed to the organization's
 
 ```
 claude -p --output-format stream-json --verbose --bare --model <model> --effort <effort> \
-  --dangerously-skip-permissions --max-budget-usd <round cap>
+  --dangerously-skip-permissions --allowedTools=Bash,Edit,Read,Write --max-budget-usd <round cap>
 ```
+
+The child runs with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, which forces the default permission mode; `--allowedTools` (in the `=` form, the flag is variadic) is what lets it write.
 
 Prompt on stdin. The key is read from `key_file` at spawn and passed only in that process's environment as `ANTHROPIC_API_KEY`. It is never logged, stored in state, or passed to other agents. The file must be a regular file with mode 600.
 
