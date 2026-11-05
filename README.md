@@ -14,6 +14,182 @@ Every agent runs through its vendor's own CLI. baton reimplements no agent. Cont
 them through the repository, its commits and a handoff file, and each vendor's own conversation
 is resumed when its turn comes again.
 
+## Quick start: from zero to your first task
+
+This walks you through everything once, with no prior knowledge of baton. It takes about 15
+minutes. The commands assume macOS; on Linux everything works except the background service, so
+use the note in step 4.
+
+**Before you start.** baton does not bring its own AI. It drives the coding tools you already
+pay for, so you need accounts and their command-line tools:
+
+| Tool | What it is for | Required? |
+| --- | --- | --- |
+| [uv](https://docs.astral.sh/uv/) | installs baton | yes |
+| [OpenCode](https://opencode.ai) | the chat window you type in | yes, for this guide |
+| `codex` | OpenAI Codex, signed in to your plan | at least one of these two |
+| `agy` | Google Antigravity, signed in to your plan | at least one of these two |
+| `claude` | Claude Code, used only as a backup | no |
+
+### 1. Install baton
+
+```
+git clone https://github.com/cahian/baton.git
+cd baton
+uv tool install .
+```
+
+### 2. Create your settings
+
+```
+mkdir -p ~/.config/baton
+cp examples/defaults.toml ~/.config/baton/defaults.toml
+```
+
+Open `~/.config/baton/defaults.toml` in any text editor and pick one of these:
+
+- **No Claude backup:** under `[agents.claude_api]`, set `enabled = false`. Skip step 3.
+- **With the Claude backup:** set `monthly_budget_usd` to the credit you actually have, and
+  `budget_reset_day` to the day of the month it renews. baton stops 10% before that number.
+
+Change `enabled` for `codex` or `antigravity` the same way if you only have one of them.
+
+### 3. Add the Claude key (only with the backup)
+
+Create an API key in the [Claude Console](https://platform.claude.com) and copy it. Then run this,
+which saves what you copied into a file only you can read:
+
+```
+touch ~/.config/baton/anthropic.key
+chmod 600 ~/.config/baton/anthropic.key
+pbpaste > ~/.config/baton/anthropic.key
+```
+
+Do not paste the key into a chat or into a project.
+
+**Check your billing first.** baton cannot see or change it. If the Console has auto-reload on, or
+holds credits you bought, using the key can spend that money. Turn auto-reload off.
+
+### 4. Start baton and check it
+
+```
+baton install-service
+baton doctor
+```
+
+`install-service` keeps baton running in the background, even after a restart. Every line of
+`doctor` should read `ok`. `FAIL` tells you what to fix; `warn` is only a heads-up. It spends
+nothing, so run it as often as you like.
+
+> **On Linux**, skip `install-service` and leave `baton serve` running in a terminal.
+
+### 5. Add baton to OpenCode
+
+```
+baton opencode-config
+```
+
+This prints a block of settings. Where it goes depends on whether you already use OpenCode:
+
+- **No `~/.config/opencode/opencode.json` yet:** save it directly:
+
+  ```
+  mkdir -p ~/.config/opencode
+  baton opencode-config > ~/.config/opencode/opencode.json
+  ```
+
+- **You already have that file:** do not run the command above, it would erase your settings.
+  Open the file and copy the `baton` entry into your existing `provider` section.
+
+Then tell OpenCode to read the change. If you skip this, baton will not show up:
+
+```
+opencode reload
+```
+
+### 6. Connect it, once
+
+Use a throwaway folder for your first try. **The agents have full access to the folder where you
+open OpenCode**, so do not start in a project you care about:
+
+```
+mkdir -p ~/baton-test
+cd ~/baton-test
+git init
+opencode
+```
+
+1. Type `/models`. Searching for `baton` shows **No results found**. That is expected the first
+   time.
+2. Press `ctrl+a` to see all integrations, and choose **baton**.
+
+   ![The integration list with baton selected](docs/assets/tutorial-connect.png)
+
+3. It asks for an API key. baton does not need one, but the box cannot be empty. Type `local`
+   and press Enter.
+
+   ![The API key prompt](docs/assets/tutorial-api-key.png)
+
+4. Type `/models` again and choose **Auto**. If OpenCode asks for a variant, keep **Default**.
+   baton ignores this setting; effort is set in your `defaults.toml`.
+
+   ![The variant list with Default marked](docs/assets/tutorial-variant.png)
+
+You are ready when the box at the bottom says **Auto baton**:
+
+![OpenCode with the Auto model from baton selected](docs/assets/tutorial-ready.png)
+
+OpenCode remembers the connection, but check that label whenever you open a new session.
+
+### 7. Send your first task
+
+```
+Create a hello.py that prints "hi" and run it to check.
+```
+
+The answer streams in the chat like any other model. A line tells you each time one agent hands
+over to another. While it works:
+
+- **To change direction,** just send another message. It interrupts the current round.
+- **Closing OpenCode does not stop the work.** It keeps running in the background.
+
+### 8. Watch it, or stop it
+
+Run these in another terminal:
+
+```
+baton jobs                   # everything running; names look like session-<id>
+baton status session-<id>    # where it is and what it has spent
+baton stop session-<id>      # stop it
+baton doctor                 # limits and spending right now
+```
+
+### 9. Let it run until the job is really done
+
+By default, the work ends after one round. For a long goal, give baton a test to pass: create a
+file named `baton.toml` in your project with the command that proves the job is finished.
+
+```toml
+[verify]
+command = "./check.sh"
+timeout_s = 3600
+```
+
+baton then keeps going, across agents and limit resets, until that command succeeds. An agent
+saying "done" does not count. Without a good check it may stop too early, and with an impossible
+one it will keep trying, so choose something you trust.
+
+### If something goes wrong
+
+| What you see | What to do |
+| --- | --- |
+| `baton` is not in `/models` | Run `opencode reload`, reopen OpenCode, then do step 6. |
+| It asks for an API key | Type `local`. |
+| The model still is not listed | In your project, run `echo '{"model":"baton/auto"}' > opencode.json`, then reopen OpenCode. |
+| The answer never starts | Run `baton doctor` and `baton jobs`. |
+| It says it is waiting | Every agent hit its limit. It resumes alone at the next reset. |
+| You want to go back to another model | Choose it in `/models`. Nothing else changes. |
+
 ## The rotation
 
 The default order, all at medium effort:
