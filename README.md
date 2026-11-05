@@ -31,7 +31,8 @@ reads the plan agents (without a model call) from their reset time onward, at mo
 seconds, and as soon as one is available it ends the Claude round and that agent takes over. If
 both are, the first in `order` goes first. This is not a failure: Claude gets no cooldown. A plan
 agent whose round fails within five minutes of such a takeover stops being allowed to end Claude
-rounds until it completes one. When no agent can run, baton waits for the earliest known reset.
+rounds until it completes one. At most six Claude rounds a day are ended this way (`baton
+status` says when the cap is active). When no agent can run, baton waits for the earliest known reset.
 Change the order, or disable an agent, in the goal file.
 
 ## How each agent is stopped before it costs money

@@ -22,6 +22,7 @@ from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, opencode_config, serve
 from baton.runner import preempted_sentence, run_goal
+from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
 from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
 
@@ -287,6 +288,12 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
             print(f"    reason: {info['reason']}")
         if info.get("usage"):
             print(f"    usage: {json.dumps(info['usage'], sort_keys=True)}")
+    frees = preempt_cap_frees_at(state.get("preempts"), now)
+    if frees is not None:
+        print(
+            f"preemption cap: Claude was ended {MAX_PREEMPTS_PER_DAY} times in the last 24 hours "
+            f"to give way to a plan agent, so it is not ended again before {_when(frees)}"
+        )
     if state.get("verify_warning"):
         print(f"warning: {state['verify_warning']}")
     if state.get("group"):

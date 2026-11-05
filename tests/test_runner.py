@@ -2167,3 +2167,131 @@ def test_a_limit_after_a_long_round_following_a_preemption_does_not_block(fallba
     f.agents["codex"].script = [codex_works_then_hits_its_limit]
     assert f.run() == 0
     assert store.load_state()["agents"]["codex"]["blocked"] is False
+
+
+# the watcher's read and the read in `pick` disagree: one kill per agent, and a day's cap
+
+DISAGREE_NAME = "baton-preempt"
+
+
+def flapping(adapter):
+    """Reads ok to the watcher thread and not available to anyone else (`pick`)."""
+
+    def availability():
+        if threading.current_thread().name == DISAGREE_NAME:
+            return Availability(True)
+        return Availability(False, reason="not really")
+
+    adapter.availability = availability
+
+
+def killed_then_back(f, kills=None):
+    """A Claude round that runs until the watcher ends it, with every cooldown over."""
+
+    def step(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        until_true(ctx)
+        if kills is not None:
+            kills.append(1)
+        return RoundResult(COMPLETED, reason="stop requested")
+
+    return step
+
+
+def left_alone(f, seen):
+    """A Claude round that the watcher must not end, whatever it reads, and then finishes. Whether
+    it was left alone goes into `seen` (an assert here would be swallowed as an adapter error)."""
+
+    def step(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        f.world.now += 4000
+        time.sleep(0.3)  # many polls
+        seen.append(ctx.should_kill() is False)
+        (f.work / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    return step
+
+
+def test_a_flapping_read_costs_one_kill_per_agent_and_blocks_it(fallback, store):
+    f = fallback
+    for name in ("codex", "antigravity"):
+        flapping(f.agents[name])
+    seen = []
+    f.agents["claude_api"].script = [killed_then_back(f), killed_then_back(f), left_alone(f, seen)]
+    assert f.run() == 0
+    assert seen == [True]
+    events = store.events()
+    backs = [e["back"] for e in events if e["kind"] == "round_end" and e["outcome"] == PREEMPTED]
+    assert sorted(backs) == ["antigravity", "codex"]
+    assert {e["agent"] for e in events if e["kind"] == "round_start"} == {"claude_api"}
+    agents = store.load_state()["agents"]
+    assert agents["codex"]["blocked"] and agents["antigravity"]["blocked"]
+    assert not agents["codex"]["after_preempt"] and not agents["antigravity"]["after_preempt"]
+
+
+def test_a_block_set_by_a_flapping_read_clears_when_the_agent_completes_a_round(fallback, store):
+    f = fallback
+    flapping(f.agents["codex"])
+
+    def claude_then_codex_is_steady(agent, prompt, ctx):
+        f.world.now += 4000
+        del f.agents["codex"].availability  # back to the plain `avail` attribute
+        f.agents["codex"].avail = Availability(True)
+        time.sleep(0.3)
+        assert ctx.should_kill() is False  # blocked: the watcher does not look
+        return RoundResult(COMPLETED)
+
+    f.agents["claude_api"].script = [killed_then_back(f), claude_then_codex_is_steady]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    starts = [e["agent"] for e in store.events() if e["kind"] == "round_start"]
+    assert starts == ["claude_api", "claude_api", "codex"]
+    assert store.load_state()["agents"]["codex"]["blocked"] is False
+
+
+def test_the_daily_cap_stops_the_seventh_kill_when_the_blocks_do_not_hold(
+    fallback, store, monkeypatch
+):
+    from baton.scheduler import MAX_PREEMPTS_PER_DAY, Scheduler
+
+    monkeypatch.setattr(Scheduler, "_block_unproven", lambda self, agent: None)
+    f = fallback
+    flapping(f.agents["codex"])
+    kills, seen = [], []
+    f.agents["claude_api"].script = [killed_then_back(f, kills) for _ in range(6)] + [
+        left_alone(f, seen)
+    ]
+    assert f.run() == 0
+    assert seen == [True]
+    assert MAX_PREEMPTS_PER_DAY == len(kills) == 6
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert [e["outcome"] for e in ends].count(PREEMPTED) == 6
+    assert len(store.load_state()["preempts"]) == 6
+
+
+def test_the_daily_cap_stops_the_seventh_kill_when_the_plan_agent_never_blocks(fallback, store):
+    f = fallback
+    kills, seen = [], []
+
+    def claude_killed(agent, prompt, ctx):
+        f.agents["codex"].avail = Availability(True)
+        return killed_then_back(f, kills)(agent, prompt, ctx)
+
+    def codex_idles_a_round(agent, prompt, ctx):
+        # it completes, so no block ever sets; then it is used up again
+        f.agents["codex"].avail = Availability(False, until=f.world.now + 3600, reason="full")
+        return RoundResult(COMPLETED)
+
+    def last_claude(agent, prompt, ctx):
+        f.agents["codex"].avail = Availability(True)
+        return left_alone(f, seen)(agent, prompt, ctx)
+
+    f.agents["claude_api"].script = [claude_killed] * 6 + [last_claude]
+    f.agents["codex"].script = [codex_idles_a_round] * 6
+    assert f.run() == 0
+    assert seen == [True]
+    assert len(kills) == 6
+    assert len(f.agents["codex"].prompts) == 6
+    assert len(store.load_state()["preempts"]) == 6

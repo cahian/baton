@@ -32,6 +32,12 @@ MIN_WAIT_S = 30
 # A plan agent whose round, right after it ended a metered one, fails in less than this long
 # without having worked is blocked from preempting again: it read ok but cannot hold a round.
 PREEMPT_PROOF_S = 300
+# At most this many metered rounds are ended to give way to a plan agent in 24 hours; each kill
+# leaves a round's budget counted in the ledger, so this bounds that overcount whatever the cause.
+MAX_PREEMPTS_PER_DAY = 6
+PREEMPT_WINDOW_S = 24 * 3600
+# A time further ahead than this is not a clock being a little off, it is a bad value.
+PREEMPT_SKEW_S = 3600
 # A reset further out than this is a bad reading (milliseconds for seconds, say), not a reset,
 # and counts as unknown.
 MAX_COOLDOWN_S = 8 * 24 * 3600
@@ -41,6 +47,28 @@ def _num(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value) if math.isfinite(value) else None
+
+
+def preempts_in_window(raw: Any, now: float) -> list[float]:
+    """The epoch times in `raw` that are valid and fall in the last 24 hours, oldest first, no
+    more than the cap's worth (the newest). Anything else, or a `raw` that is no list, is
+    dropped."""
+    if not isinstance(raw, list):
+        return []
+    times = []
+    for item in raw:
+        t = _num(item)
+        if t is not None and now - PREEMPT_WINDOW_S < t <= now + PREEMPT_SKEW_S:
+            times.append(t)
+    return sorted(times)[-MAX_PREEMPTS_PER_DAY:]
+
+
+def preempt_cap_frees_at(raw: Any, now: float) -> float | None:
+    """When the day's preemptions run out for good, or None while the cap is not reached."""
+    window = preempts_in_window(raw, now)
+    if len(window) < MAX_PREEMPTS_PER_DAY:
+        return None
+    return window[-MAX_PREEMPTS_PER_DAY] + PREEMPT_WINDOW_S
 
 
 def read_availability(adapter: Adapter) -> Availability:
@@ -64,8 +92,12 @@ class Scheduler:
     reads ok but whose next round fails within `PREEMPT_PROOF_S` (and not as completed or
     timeout) is blocked: `plan_ready_to_check` leaves it out, so it stops costing a metered round
     per attempt, until a round of it completes, times out or lasts that long. `pick` still tries
-    it at a round boundary. With everyone exhausted `pick` returns None and `next_wake` says when
-    to look again.
+    it at a round boundary. An agent that carries that mark and reads not available in `pick`
+    (the watcher saw it ok, the read there said no) is blocked at once, as if its round had
+    failed. As a backstop, `MAX_PREEMPTS_PER_DAY` preemptions in 24 hours make
+    `plan_ready_to_check` return nothing, so the watcher stops reading and killing.
+    With everyone exhausted `pick` returns None and
+    `next_wake` says when to look again.
 
     Cooldowns live in memory first. They are written to the store when `save` is called and
     after `record`, and a store that cannot be read or written never resets them. The runner's
@@ -89,9 +121,11 @@ class Scheduler:
         self._lock = threading.RLock()
         self._agents: dict[str, dict] = {name: self._blank() for name in self.order}
         self.current: str = self.order[0]
+        self._preempts: list[float] = []
         saved = store.load_state()  # StateError is the caller's to survive
         if saved.get("current") in self._agents:
             self.current = saved["current"]
+        self._preempts = preempts_in_window(saved.get("preempts"), clock())
         stored = saved.get("agents")
         if isinstance(stored, dict):
             for name, raw in stored.items():
@@ -171,13 +205,25 @@ class Scheduler:
                 if avail.ok:
                     self.current = name
                     return adapter
+                self._block_unproven(agent)
             return None
+
+    def _block_unproven(self, agent: dict) -> None:
+        """An agent whose preemption it caused and that now reads not available: the watcher saw
+        it ok and this read says no, so it cannot hold a round, and the watcher must not kill
+        another one for it. Same as a round of it failing at once."""
+        if agent["after_preempt"]:
+            agent["blocked"], agent["after_preempt"] = True, False
+            self._save_quietly()
 
     def plan_ready_to_check(self) -> list[str]:
         """The plan agents whose cooldown has passed and that are not blocked, in `order`: the
-        ones worth reading while a metered agent runs. Moves nothing."""
+        ones worth reading while a metered agent runs. Moves nothing. Nothing at all once the day's
+        preemptions are used up."""
         with self._lock:
             now = self._clock()
+            if len(preempts_in_window(self._preempts, now)) >= MAX_PREEMPTS_PER_DAY:
+                return []
             return [
                 n
                 for n in self._plan_names()
@@ -219,6 +265,7 @@ class Scheduler:
             # agent that was back has a round to prove itself with, the next one it runs.
             if result.back in self._agents:
                 self._agents[result.back]["after_preempt"] = True
+            self._preempts = preempts_in_window([*self._preempts, now], now)
             self._save_quietly()
             return
         if not self._adapters[agent].metered:
@@ -282,7 +329,11 @@ class Scheduler:
                     "blocked": raw["blocked"],
                     "after_preempt": raw["after_preempt"],
                 }
-            return {"current": self.current, "agents": agents}
+            return {
+                "current": self.current,
+                "agents": agents,
+                "preempts": preempts_in_window(self._preempts, now),
+            }
 
     def save(self) -> None:
         """Write the rotation into state.json next to whatever else it holds.
