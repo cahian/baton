@@ -953,18 +953,20 @@ def edge_run(tmp_path, monkeypatch, code, cap=None, grace=0.2):
 def test_a_key_split_at_the_log_cap_of_a_stopped_round_is_not_written(tmp_path, monkeypatch):
     """After a stop the log takes at most STOP_LOG_BYTES more. The last chunk it took ended with
     the key minus one character, held back; the cap then cut the rest off, and the end of the
-    round used to flush that held tail into the log."""
+    round used to flush that held tail into the log. The stop comes at the first line, so the
+    child must outlive it to write the rest: it ignores SIGTERM and ends by itself, and the grace
+    period never runs out. Otherwise a stop that wins the race leaves nothing to check."""
     code = (
-        "import os, sys, time\n"
+        "import os, signal, sys\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "k = os.environ['K']\n"
         "sys.stdout.write('go\\n'); sys.stdout.flush()\n"
         f"sys.stdout.write('A' * (65536 - {KEEP}) + k[:{KEEP}]); sys.stdout.flush()\n"
         "sys.stdout.write('B' * 70000 + '\\n'); sys.stdout.flush()\n"
-        "time.sleep(30)\n"
     )
-    log = edge_run(tmp_path, monkeypatch, code, cap=65536)
+    log = edge_run(tmp_path, monkeypatch, code, cap=65536, grace=30)
     assert SECRET[:8] not in log and SECRET[2:12] not in log
-    assert "A" * 100 in log  # the part before it was logged
+    assert log == "go\n" + "A" * (65536 - KEEP)  # the part before it was logged, and nothing after
 
 
 def test_the_held_tail_is_dropped_when_the_log_is_full(tmp_path, monkeypatch):
