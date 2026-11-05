@@ -9,7 +9,7 @@ effort = "medium"
 monthly_budget_usd = 200   # what the organization holds
 reserve_pct = 10           # kept back; the spend ceiling is 200 - 10% = 180
 budget_reset_day = 1       # day of the month the period starts, 00:00 UTC
-round_budget_usd = 10      # most one round may spend
+round_budget_usd = 5       # most one round may spend (a killed round counts all of it)
 key_file = "~/.config/baton/anthropic.key"   # must be a regular file, mode 600
 admin_key_file = ""        # optional: an Admin API key file, to cross-check spend with the Console
 

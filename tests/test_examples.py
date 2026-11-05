@@ -16,12 +16,14 @@ def test_example_goal_loads(monkeypatch, tmp_path):
     assert goal.order == ("codex", "antigravity", "claude_api")
     assert goal.verify_command == "./check.sh"
     assert goal.agents["claude_api"].model == "claude-opus-5-5"
+    assert goal.agents["claude_api"].round_budget_usd == Decimal("5")
 
 
 def test_example_defaults_load(monkeypatch):
     monkeypatch.setenv("BATON_CONFIG", str(EXAMPLES / "defaults.toml"))
     tables = load_defaults()
     assert tables["claude_api"]["monthly_budget_usd"] == Decimal("200")
+    assert tables["claude_api"]["round_budget_usd"] == Decimal("5")
     assert set(tables) == {"claude_api", "antigravity", "codex"}
 
 

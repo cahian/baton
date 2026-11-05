@@ -5,7 +5,10 @@ name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
 
-# Rotation order. The first entry starts; when the last runs out it wraps to the first available.
+# Rotation order of the plan agents (codex, antigravity): the first available starts, and when the
+# working one runs out the next takes over, wrapping around. claude_api is paid by use, so it is a
+# fallback wherever it appears here: it runs only while both others are out, and the first plan
+# agent that comes back ends its round.
 order = ["codex", "antigravity", "claude_api"]
 round_max_s = 3600   # one round may not run longer than this
 idle_s = 1200        # nor stay silent longer than this
@@ -37,5 +40,5 @@ poll_s = 30
 enabled = true
 model = "claude-opus-5-5"
 effort = "medium"
-round_budget_usd = 10
+round_budget_usd = 5
 key_file = "~/.config/baton/anthropic.key"

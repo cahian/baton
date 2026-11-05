@@ -20,10 +20,18 @@ The default order, all at medium effort:
 2. **Gemini 4 Argon**, through Antigravity (`agy`).
 3. **Claude Opus 5.5**, through a Console API key (never a subscription login).
 
-The first agent in `order` starts. The current agent keeps working until it is unavailable, then
-the rotation moves on. When the last agent runs out it wraps to the first one that is available.
-When none is, baton waits for the earliest known reset. An agent that comes back does not preempt
-the one working. Change the order, or disable an agent, in the goal file.
+Codex and Antigravity are the plan agents: their included usage comes back at a reset. Claude is
+paid by use and has no reset that would ever stop it, so it is a fallback, wherever it stands in
+`order`. **Claude runs only while both others are out.**
+
+The first plan agent in `order` starts. The current one keeps working until it is unavailable,
+then the next plan agent takes over, wrapping around. A plan agent that comes back does not
+preempt another plan agent that is working. When both are out, Claude runs. While it does, baton
+reads the plan agents (without a model call) from their reset time onward, at most every 30
+seconds, and as soon as one is available it ends the Claude round and that agent takes over. If
+both are, the first in `order` goes first. This is not a failure: Claude gets no cooldown. When no
+agent can run, baton waits for the earliest known reset. Change the order, or disable an agent, in
+the goal file.
 
 ## How each agent is stopped before it costs money
 
@@ -59,11 +67,13 @@ budget is baton's own:
 - Spend is summed from `total_cost_usd` in each round's result, in one ledger shared by every
   goal (`~/.local/state/baton/claude-spend.json`), under a lock. A period starts on
   `budget_reset_day` at 00:00 UTC.
-- Before a round, baton reserves `round_budget_usd` (default 10), passed to Claude as
+- Before a round, baton reserves `round_budget_usd` (default 5), passed to Claude as
   `--max-budget-usd`. If the ceiling would be passed, the round shrinks to what is left, and below
   5 USD the agent is unavailable until the next period.
 - A round that ends without a result keeps its whole reservation counted. Crashes overcount and
-  never undercount. A corrupt ledger makes the agent unavailable; it is never recreated silently.
+  never undercount. So does a round ended because a plan agent came back: it has no result, and
+  whatever it spent before is counted as the whole 5 USD. The ledger drifts high, never low, and
+  the small default keeps that drift small. A corrupt ledger makes the agent unavailable; it is never recreated silently.
 - Optionally, `admin_key_file` points to an Admin API key. baton then also reads the Console cost
   report and uses the larger of that and the ledger. It never lowers the ledger, and a failed read
   makes the agent unavailable.
@@ -120,7 +130,7 @@ effort = "medium"
 monthly_budget_usd = 200   # what the organization holds
 reserve_pct = 10           # kept back; the spend ceiling is 200 - 10% = 180
 budget_reset_day = 1       # day of the month the period starts, 00:00 UTC
-round_budget_usd = 10      # most one round may spend
+round_budget_usd = 5       # most one round may spend (a killed round counts all of it)
 key_file = "~/.config/baton/anthropic.key"
 admin_key_file = ""        # optional Admin API key file, to cross-check spend
 
@@ -217,8 +227,9 @@ a note that interrupts the running round. A message gets at least one round, eve
 already passes. A request that repeats what was already accepted, as a client's retry does, attaches
 to the stream and interrupts nothing, so it costs no round. `baton jobs` lists every job, and
 `baton status`, `baton say` and `baton stop` accept its name (`session-<id>`) in place of a goal
-file. The stream shows the agents' text, one line per rotation, waits and gate results, and when no
-agent can run it says why, for each one. Title requests are answered locally and spend nothing. The
+file. The stream shows the agents' text, one line per rotation, a sentence when a returning plan
+agent ends a Claude round, waits and gate results, and when no agent can run it says why, for
+each one. Title requests are answered locally and spend nothing. The
 working directory is read from OpenCode's own database (`~/.local/share/opencode/opencode.db`, or
 the path in `BATON_OPENCODE_DB`); baton never guesses one.
 
