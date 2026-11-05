@@ -13,6 +13,7 @@ does: "ANTHROPIC_API_KEY" when that variable is set, "none" otherwise, unless ov
   FAKE_CLAUDE_SLEEP           seconds to stay alive before the result event
   FAKE_CLAUDE_COST            total_cost_usd, written into the JSON verbatim (default 0.0123)
   FAKE_CLAUDE_NO_RESULT       no result event
+  FAKE_CLAUDE_LINGER          seconds to stay alive after the result event, before exiting
   FAKE_CLAUDE_IS_ERROR        the result is an error; its text is FAKE_CLAUDE_ERROR_TEXT
   FAKE_CLAUDE_SUBTYPE         result subtype (default success)
   FAKE_CLAUDE_RESUME_FAIL     with --resume: complain on stderr and exit 1 before any event
@@ -147,6 +148,7 @@ def main() -> None:
         line = json.dumps(result).replace('"__COST__"', env.get("FAKE_CLAUDE_COST", "0.0123"))
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
+    time.sleep(float(env.get("FAKE_CLAUDE_LINGER", "0")))
     sys.exit(int(env.get("FAKE_CLAUDE_EXIT", "0")))
 
 

@@ -520,6 +520,13 @@ class ClaudeApiAdapter:
         elif self._never_reached_the_api(exit_, stream):
             self._release(reservation_id)
         if exit_.stopped is not None:
+            if exit_.stopped.outcome == COMPLETED and (stream.is_error or stream.kinds):
+                # The stop (a plan agent is back, a stop request) landed after the API had
+                # already refused the round: what it said is the story, and the credit stays
+                # marked as gone.
+                refusal = self._refusal(stream)
+                if refusal is not None:
+                    return refusal
             return exit_.stopped
         return self._outcome(exit_.timed_out, exit_.returncode, stream, ctx)
 

@@ -1801,6 +1801,27 @@ def test_a_metered_round_is_ended_when_a_plan_agent_reads_available(fallback, st
     assert f.world.sleeps == []  # no backoff, no pause
 
 
+@pytest.mark.parametrize("outcome", [LIMIT, AUTH, CREDIT_GUARD])
+def test_a_refusal_that_came_with_the_kill_is_not_turned_into_a_preemption(
+    fallback, store, outcome
+):
+    f = fallback
+
+    def claude(agent, prompt, ctx):
+        ctx.on_output("working on it")
+        comes_back(f)
+        until_true(ctx)  # the kill lands, and the adapter had already seen the API refuse
+        return RoundResult(outcome, until=f.world.now + 7200, reason="Credit balance is too low")
+
+    f.agents["claude_api"].script = [claude]
+    f.agents["codex"].script = [done(f.work)]
+    assert f.run() == 0
+    first = [e for e in store.events() if e["kind"] == "round_end"][0]
+    assert first["agent"] == "claude_api" and first["outcome"] == outcome
+    assert first["back"] is None
+    assert store.load_state()["agents"]["claude_api"]["until"] > f.world.now
+
+
 def test_the_next_pick_after_a_preemption_is_the_plan_agent(fallback, store):
     f = fallback
 

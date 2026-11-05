@@ -615,6 +615,38 @@ def test_a_stop_request_ends_the_round_and_keeps_the_reservation(env, monkeypatc
     assert env.ledger.spent() == Decimal("10.00")
 
 
+def test_a_refusal_already_on_the_stream_wins_over_a_stop_that_lands_before_the_exit(
+    env, monkeypatch
+):
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "Credit balance is too low")
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "0")
+    monkeypatch.setenv("FAKE_CLAUDE_LINGER", "30")
+    seen = threading.Event()
+    adapter = make_adapter(env)
+    result = run(
+        env,
+        adapter,
+        on_output=lambda line: seen.set() if "Credit balance" in line else None,
+        should_kill=seen.is_set,  # the error result is on the stream, the process is still alive
+    )
+    assert result.outcome == LIMIT and result.until == NEXT_PERIOD
+    assert env.ledger.exhausted()
+    assert not adapter.availability().ok
+
+
+def test_a_stop_on_a_healthy_stream_is_still_a_stop(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_LINGER", "30")
+    seen = threading.Event()
+    result = run(
+        env,
+        on_output=lambda line: seen.set() if "working" in line else None,
+        should_kill=seen.is_set,
+    )
+    assert result.outcome == COMPLETED and result.reason == "stop requested"
+    assert not env.ledger.exhausted()
+
+
 def test_a_timeout_is_a_timeout_and_keeps_the_reservation(env, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
     result = run(env, round_max_s=1)
