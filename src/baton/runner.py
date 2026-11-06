@@ -97,6 +97,7 @@ LESSONS_RULE = (
     "- Keep durable findings (root causes, dead ends, what must not be retried) under a "
     "`## Lessons` heading in the handoff. They outlive this goal."
 )
+PINNED_GOAL_HEAD = "Goal, fixed by the person. It does not change until the person changes it:"
 RULES = f"""\
 Rules:
 - You are one shift of a relay. Another agent may continue after you at any moment.
@@ -117,15 +118,19 @@ def build_prompt(
     memory: str = "",
     phase_block: str = "",
     skills: str = "",
+    pinned_goal: str = "",
 ) -> str:
     """The prompt for one round.
 
     A fresh round gets the whole briefing. A resumed one already has it in its own history, so
     it only gets what changed: the commits others made since, the gate output, the previous
     round's tail, notes and handoff. `memory`, the text recalled from long-term memory, comes
-    after the handoff in both.
+    after the handoff in both. `pinned_goal`, when the person has fixed one, opens every prompt.
     """
     parts: list[str] = []
+    pinned_goal = pinned_goal.strip()
+    if pinned_goal:
+        parts.append(f"{PINNED_GOAL_HEAD}\n{pinned_goal}")
     if resumed:
         parts.append("Your turn again. This is what changed since your last round.")
     else:
@@ -189,6 +194,15 @@ def file_large_note(workdir: Path, text: str, now: float) -> tuple[str, Path | N
         f"`{relative}`: read that file in full before you act on it.]\n\n",
         path,
     )
+
+
+def pin_goal(store: Store, workdir: Path, text: str, now: float) -> str:
+    """Fix `text` as the goal. One over NOTE_INLINE_CHARS goes to a file the way a large note does,
+    once, and what is pinned is its start and the line naming the file: every prompt carries the
+    goal, so it must stay small. Returns what was pinned."""
+    short, _ = file_large_note(workdir, text, now)
+    store.set_goal(short)
+    return short
 
 
 # gate
@@ -561,6 +575,7 @@ class _Run:
         self.heads: dict[str, str] = {}
         self.pause_until = 0.0
         self.verify_warning = ""
+        self.oneshot_pinned = False  # set when `oneshot` has pinned the objective, once
         # Long-term memory: built the first time it is needed, None when it is off. A round that
         # started a process waits in `pending` until its gate has run.
         self.mem: Memory | None = None
@@ -648,6 +663,7 @@ class _Run:
             "note_log": list(self.note_log),
             "note_seen": dict(self.note_seen),
             "owes_round": self.owes_round,
+            "oneshot_pinned": self.oneshot_pinned,
             "verify_warning": self.verify_warning,
             **(
                 {
@@ -847,6 +863,13 @@ class _Run:
         )
         rounds = state.get("round")
         self.round_no = rounds if isinstance(rounds, int) and rounds > 0 else 0
+        self.oneshot_pinned = state.get("oneshot_pinned") is True
+        if goal.oneshot and not self.oneshot_pinned:
+            # Once, and saved below before any round: a restart must not undo `goal off`. A goal
+            # the person already set counts as the pin.
+            if not self.store.goal():
+                pin_goal(self.store, goal.workdir, self.current_objective(), self.clock())
+            self.oneshot_pinned = True
         tail = state.get("round_tail")
         self.round_tail = tail if isinstance(tail, str) else ""
         notes = state.get("notes")
@@ -1242,6 +1265,7 @@ class _Run:
                 since_commits=since,
                 memory=recalled,
                 phase_block=self.phase_block(phase),
+                pinned_goal=self.store.goal(),
                 # A resumed conversation already holds the methods from its first round, except
                 # that the plan round after a failed gate always gets systematic-debugging.
                 skills=self.skills_block(agent, phase, fresh=session is None),

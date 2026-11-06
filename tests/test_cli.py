@@ -58,6 +58,78 @@ def test_say_without_text_is_refused(fakes, capsys):
     assert "empty" in capsys.readouterr().err
 
 
+def test_goal_sets_the_pinned_goal_of_a_goal_file_or_a_job(fakes, capsys):
+    assert main(["goal", str(fakes.goal()), "ship", "the", "parser"]) == 0
+    assert store_for(fakes).goal() == "ship the parser"
+    assert "goal set" in capsys.readouterr().out
+    assert store_for(fakes).read_inbox() == ""  # the pinned goal is in every prompt: no note
+    store_for(fakes, "session-ses_1").set_goal("old")
+    assert main(["goal", "session-ses_1", "new one"]) == 0
+    assert store_for(fakes, "session-ses_1").goal() == "new one"
+
+
+def test_a_big_goal_is_filed_and_only_its_start_is_pinned(fakes):
+    big = "word " * 3000
+    assert main(["goal", str(fakes.goal()), big]) == 0
+    pinned = store_for(fakes).goal()
+    assert len(pinned) < 1500 and "`.baton/notes/" in pinned
+    (path,) = list((fakes.work / ".baton" / "notes").iterdir())
+    assert path.read_text(encoding="utf-8").strip() == big.strip()
+
+
+def test_a_big_goal_for_a_job_is_filed_in_the_directory_job_json_names(fakes):
+    store = store_for(fakes, "session-ses_2")
+    store.save_job({"workdir": str(fakes.work), "session": "ses_2"})
+    assert main(["goal", "session-ses_2", "word " * 3000]) == 0
+    assert "`.baton/notes/" in store.goal()
+    assert len(list((fakes.work / ".baton" / "notes").iterdir())) == 1
+
+
+def test_goal_off_clears_it(fakes, capsys):
+    store_for(fakes).set_goal("something")
+    assert main(["goal", str(fakes.goal()), "--off"]) == 0
+    assert store_for(fakes).goal() == ""
+    assert "goal cleared" in capsys.readouterr().out
+
+
+def test_goal_needs_a_text_or_off_and_not_both(fakes, capsys):
+    goal = str(fakes.goal())
+    assert main(["goal", goal]) == 2
+    assert "goal" in capsys.readouterr().err
+    assert main(["goal", goal, "   "]) == 2
+    assert main(["goal", goal, "--off", "and", "text"]) == 2
+    assert store_for(fakes).goal() == ""
+
+
+def test_goal_for_an_unknown_job_is_refused_and_creates_nothing(fakes, capsys):
+    assert main(["goal", "session-nope", "x"]) == 2
+    assert not state_dir("session-nope").exists()
+
+
+def test_next_stores_the_request(fakes, capsys):
+    goal = str(fakes.goal())
+    assert main(["next", goal]) == 0
+    store = store_for(fakes)
+    assert store.take_interrupt() is False
+    assert store.take_next() == "soon"
+    assert "next requested" in capsys.readouterr().out
+
+
+def test_next_now_also_requests_an_interrupt(fakes):
+    assert main(["next", str(fakes.goal()), "--now"]) == 0
+    store = store_for(fakes)
+    assert store.take_interrupt() is True
+    assert store.take_next() == "now"
+
+
+def test_a_broken_defaults_file_does_not_block_goal_or_next(fakes):
+    goal = fakes.goal()
+    fakes.defaults("[agents.codex]\nthreshold_pct = 'high'\n")
+    assert main(["goal", str(goal), "still", "here"]) == 0
+    assert main(["next", str(goal)]) == 0
+    assert store_for(fakes).goal() == "still here"
+
+
 BROKEN_DEFAULTS = "[agents.codex]\nthreshold_pct = 'high'\n"
 
 

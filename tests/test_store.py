@@ -293,3 +293,65 @@ def test_a_claim_that_cannot_be_read_counts_as_busy(tmp_path):
         base = store_mod.state_base() / store_mod.WORKDIRS_DIR
         next(base.glob("*.claim")).write_text("{ not json")
         assert workdir_conflict(tmp_path / "anything") is not None
+
+
+def test_no_goal_until_one_is_set(st):
+    assert st.goal() == ""
+    st.set_goal("  ship the parser\nand its tests \n")
+    assert st.goal() == "ship the parser\nand its tests"
+    assert (st.root / "goal.md").read_text(encoding="utf-8").strip() == st.goal()
+
+
+def test_a_goal_set_again_replaces_the_old_one_atomically(st):
+    st.set_goal("one")
+    st.set_goal("two")
+    assert st.goal() == "two"
+    assert [p.name for p in st.root.iterdir() if p.name.startswith(".goal")] == []
+
+
+def test_a_blank_goal_counts_as_none(st):
+    st.set_goal("x")
+    (st.root / "goal.md").write_text(" \n\n", encoding="utf-8")
+    assert st.goal() == ""
+
+
+def test_clear_goal_is_safe_with_none(st):
+    st.clear_goal()
+    st.set_goal("x")
+    st.clear_goal()
+    assert st.goal() == "" and not (st.root / "goal.md").exists()
+
+
+def test_archive_goal_moves_it_aside_for_the_record(st):
+    st.archive_goal()  # nothing to move
+    assert not (st.root / "goal.done.md").exists()
+    st.set_goal("done work")
+    st.archive_goal()
+    assert st.goal() == ""
+    assert (st.root / "goal.done.md").read_text(encoding="utf-8").strip() == "done work"
+    st.set_goal("second goal")
+    st.archive_goal()
+    assert (st.root / "goal.done.md").read_text(encoding="utf-8").strip() == "second goal"
+
+
+def test_next_is_taken_once_and_remembers_now(st):
+    assert st.take_next() == ""
+    st.request_next(False)
+    assert st.take_next() == "soon"
+    assert st.take_next() == ""
+    st.request_next(True)
+    assert st.take_next() == "now"
+
+
+def test_a_later_plain_next_does_not_downgrade_a_pending_next_now(st):
+    st.request_next(True)
+    st.request_next(False)
+    assert st.take_next() == "now"
+    st.request_next(False)
+    st.request_next(True)  # but an upgrade is kept
+    assert st.take_next() == "now"
+
+
+def test_an_unreadable_goal_file_counts_as_no_goal(st):
+    (st.root / "goal.md").mkdir()  # reading it is an OSError, not a missing file
+    assert st.goal() == ""

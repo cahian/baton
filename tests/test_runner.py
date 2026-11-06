@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import types
+from dataclasses import replace
 
 import pytest
 
@@ -3374,3 +3375,127 @@ def test_a_saved_session_with_no_mark_starts_at_zero(go, agents, work, store):
     agents["codex"].script = [done(work)]
     assert go() == 0
     assert "ONE" in agents["codex"].prompts[0]
+
+
+# the pinned goal
+
+PINNED = "Goal, fixed by the person. It does not change until the person changes it:\n"
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_a_pinned_goal_opens_every_prompt(tmp_path, work, resumed):
+    goal = make_goal(tmp_path, work)
+    prompt = build_prompt(
+        goal, "gate out", "a note", "the handoff", "tail", resumed, pinned_goal="ship it\nwell"
+    )
+    assert prompt.startswith(PINNED + "ship it\nwell\n\n")
+    assert prompt.index("ship it") < prompt.index("gate out") < prompt.index("a note")
+
+
+def test_no_pinned_goal_changes_nothing_in_the_prompt(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    for resumed in (False, True):
+        plain = build_prompt(goal, "g", "n", "h", "t", resumed)
+        assert plain == build_prompt(goal, "g", "n", "h", "t", resumed, pinned_goal="  \n")
+        assert "fixed by the person" not in plain
+
+
+def test_a_goal_in_the_store_reaches_the_first_prompt(go, agents, work, store):
+    store.set_goal("the fixed goal")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert agents["codex"].prompts[0].startswith(PINNED + "the fixed goal\n")
+
+
+def test_goal_off_takes_effect_from_the_next_rounds_prompt(go, agents, work, store):
+    store.set_goal("the fixed goal")
+
+    def person_turns_it_off(agent, prompt, ctx):
+        store.clear_goal()  # while the round runs: this round's prompt is already built
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [person_turns_it_off, done(work)]
+    assert go() == 0
+    first, second = agents["codex"].prompts
+    assert "the fixed goal" in first and "fixed by the person" not in second
+
+
+def test_a_goal_set_mid_run_reaches_the_next_round_resumed_or_not(go, agents, work, store):
+    def person_sets_it(agent, prompt, ctx):
+        store.set_goal("set while running")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [person_sets_it, done(work)]
+    assert go() == 0
+    first, second = agents["codex"].prompts
+    assert "fixed by the person" not in first
+    assert second.startswith(PINNED + "set while running\n")
+
+
+def test_oneshot_pins_the_objective_as_the_goal_at_start(tmp_path, work, go, agents, store):
+    goal = make_goal(tmp_path, work, top="oneshot = true")
+    agents["codex"].script = [done(work)]
+    assert go(goal) == 0
+    assert store.goal() == OBJECTIVE
+    assert agents["codex"].prompts[0].startswith(PINNED + OBJECTIVE + "\n")
+
+
+def test_oneshot_keeps_a_goal_that_is_already_set(tmp_path, work, go, agents, store):
+    store.set_goal("the person's own")
+    agents["codex"].script = [done(work)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == "the person's own"
+
+
+def test_oneshot_does_not_bring_back_a_goal_the_person_cleared(tmp_path, work, go, agents, store):
+    # A restart that comes before round 1 has no rounds to go by: the state says it was pinned.
+    store.save_state({"oneshot_pinned": True})
+    agents["codex"].script = [done(work)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == ""
+    assert "fixed by the person" not in agents["codex"].prompts[0]
+
+
+def test_oneshot_pins_once_and_says_so_in_state_json(tmp_path, work, go, agents, store):
+    goal = make_goal(tmp_path, work, top="oneshot = true", verify="")
+    assert go(goal) == 0
+    assert store.load_state()["oneshot_pinned"] is True
+    store.clear_goal()  # the person turns it off, and the job starts again at once
+    assert go(goal) == 0
+    assert store.goal() == ""
+
+
+def test_a_state_without_the_flag_pins_at_the_first_start(tmp_path, work, go, agents, store):
+    store.save_state({"round": 0, "workdir": str(work)})  # as an older baton wrote it
+    agents["codex"].script = [done(work)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == OBJECTIVE
+
+
+def test_a_goal_that_was_already_set_counts_as_the_pin(tmp_path, work, go, agents, store):
+    store.set_goal("the person's own")
+    agents["codex"].script = [done(work)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    store.clear_goal()
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == ""
+
+
+def test_a_big_oneshot_objective_is_filed_and_only_its_start_is_pinned(
+    tmp_path, work, go, agents, store
+):
+    big = "word " * 3000
+    goal = replace(make_goal(tmp_path, work), objective=big, oneshot=True)
+    agents["codex"].script = [done(work)]
+    assert go(goal) == 0
+    pinned = store.goal()
+    assert len(pinned) < 1500 and "`.baton/notes/" in pinned
+    (name,) = [p for p in (work / ".baton" / "notes").iterdir()]
+    assert name.read_text(encoding="utf-8").strip() == big.strip()
+
+
+def test_without_oneshot_no_goal_is_pinned(go, agents, work, store):
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert store.goal() == ""
+    assert "fixed by the person" not in agents["codex"].prompts[0]

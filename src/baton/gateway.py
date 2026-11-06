@@ -27,9 +27,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 from baton.adapters.base import Adapter
+from baton.commands import GOAL, GOAL_OFF, NEXT, Command, parse_command
 from baton.config import Goal, GoalError, check_repo_table, goal_from_table
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group
-from baton.runner import file_large_note, preempted_sentence, run_goal
+from baton.runner import file_large_note, pin_goal, preempted_sentence, run_goal
 from baton.store import (
     AlreadyRunning,
     StateError,
@@ -68,6 +69,8 @@ INBOX_DB_TIMEOUT_S = 1.0
 INBOX_TAKEN_TTL_S = 24 * 3600.0
 INBOX_SEEN_MAX = 500
 DELIVERED = "that message was already delivered"
+# What an agent is told when the person clears the goal: a resumed one still remembers it.
+GOAL_CLEARED_NOTE = "The person cleared the goal."
 GATE_SHOWN_CHARS = 1500
 NAME_MAX_CHARS = 100
 # job.json `status`: anything but RUNNING is left alone when `baton serve` starts.
@@ -184,6 +187,8 @@ def history_text(messages: list) -> str:
         if role not in ("user", "assistant"):
             continue  # the system prompt and tool traffic belong to OpenCode's own agent
         text = _text_of(message).strip()
+        if role == "user" and parse_command(text) is not None:
+            continue  # an old `goal off` or `next` would only contradict the goal now pinned
         if text:
             turns.append((role, text))
     prefix = {"user": "Person: ", "assistant": "Assistant: "}
@@ -654,45 +659,104 @@ class Job:
                 self._end = kind
         self._push(render_event(kind, fields))
 
-    def add_note(self, text: str, mark: tuple[int, str] | None, row: str | None = None) -> bool:
+    def add_note(
+        self,
+        text: str,
+        mark: tuple[int, str] | None,
+        row: str | None = None,
+        original: str | None = None,
+    ) -> bool:
         """Queue a new message for the running job and end the current round once the tool in
         flight is done, so the next one reads it. `row` is the id of the OpenCode inbox row it
-        came from, in place of a request's `mark`. A note over NOTE_INLINE_CHARS goes to a file
-        and only its start is kept, so no prompt carries it whole. False when the job is over or
-        about to be."""
+        came from, in place of a request's `mark`; `original` is the words OpenCode will post
+        again when they differ from the note's (a goal command's note is only its goal). A note
+        over NOTE_INLINE_CHARS goes to a file and only its start is kept, so no prompt carries it
+        whole. False when the job is over or about to be."""
         with self._cond:
             if self._done or self._closing:
                 return False
-            digest = text_hash(text)
             short, _ = file_large_note(self.workdir, text, time.time())
             self.store.say(short)
             self.context.append({"role": "user", "content": short})
-            if row is not None:
-                # Right after the note is safe: nothing later may make it be taken again.
-                self._inbox_seen = [*self._inbox_seen, row][-INBOX_SEEN_MAX:]
-                entry = self._inbox_taken.setdefault(digest, {"n": 0, "at": 0.0})
-                entry.update(n=entry["n"] + 1, at=time.time())
+            # Right after the note is safe: nothing later may make it be taken again.
+            self._took_row(text if original is None else original, row)
             try:
                 self.store.request_interrupt()
             except OSError:
                 pass  # the note is in the inbox: the next round reads it
-            if mark is not None:
-                self.accept(mark)
-            else:
-                self.save()
+            self._accept_or_save(mark)
         self._push(
             "\n[baton] message received: it reaches the agent after the current tool call or in "
             "the next round\n\n"
         )
         return True
 
+    def _took_row(self, original: str, row: str | None) -> None:
+        """Remember an inbox row as taken, and its words as waiting for their echo. Called with
+        the lock held."""
+        if row is None:
+            return
+        self._inbox_seen = [*self._inbox_seen, row][-INBOX_SEEN_MAX:]
+        entry = self._inbox_taken.setdefault(text_hash(original), {"n": 0, "at": 0.0})
+        entry.update(n=entry["n"] + 1, at=time.time())
+
+    def _accept_or_save(self, mark: tuple[int, str] | None) -> None:
+        if mark is not None:
+            self.accept(mark)
+        else:
+            self.save()
+
+    def deliver(self, text: str, mark: tuple[int, str] | None, row: str | None = None) -> bool:
+        """Hand the person's message to the job: a `baton:` command is carried out, anything else
+        becomes a note. The one door for a request and for an inbox row, so both are parsed alike.
+        False when the job is over or about to be."""
+        command = parse_command(text)
+        if command is None:
+            return self.add_note(text, mark, row)
+        return self.command(command, text, mark, row)
+
+    def command(
+        self, command: Command, original: str, mark: tuple[int, str] | None, row: str | None = None
+    ) -> bool:
+        """Carry out a command on the running job. A goal and `goal off` are also notes, so the
+        round in flight ends and the next one reads them (a resumed agent is told that the goal
+        changed); `next` is no note. False when the job is over or about to be."""
+        with self._cond:
+            if self._done or self._closing:
+                return False
+            if command.kind == GOAL:
+                # A big goal is filed once, and the note says no more than what is pinned.
+                short = pin_goal(self.store, self.workdir, command.text, time.time())
+                self._push("\n[baton] goal set\n\n")
+                return self.add_note(short, mark, row, original)
+            if command.kind == GOAL_OFF:
+                self.store.clear_goal()
+                self._push("\n[baton] goal cleared\n\n")
+                return self.add_note(GOAL_CLEARED_NOTE, mark, row, original)
+            if command.kind == NEXT:
+                self.store.request_next(command.now)
+                if command.now:
+                    try:
+                        self.store.request_interrupt()
+                    except OSError:
+                        pass  # the request is stored: the round that ends next takes it
+                    self._push(
+                        "\n[baton] next now requested: it moves on after the current tool call\n\n"
+                    )
+                else:
+                    self._push("\n[baton] next requested: it moves on when this round ends\n\n")
+            self._took_row(original, row)
+            self._accept_or_save(mark)
+            return True
+
     def take_row(self, row_id: str, text: str) -> bool:
-        """A message OpenCode holds in its inbox for this session, delivered as a note. False
-        when this row was taken before, or the job cannot take it."""
+        """A message OpenCode holds in its inbox for this session, delivered like a request: a
+        command is carried out and anything else becomes a note. False when this row was taken
+        before, or the job cannot take it."""
         with self._cond:
             if row_id in self._inbox_seen:
                 return False
-            return self.add_note(text.strip(), None, row_id)
+            return self.deliver(text.strip(), None, row_id)
 
     def echo(self, messages: list) -> bool:
         """Account for a request's messages against the notes taken from OpenCode's inbox. True
@@ -725,7 +789,7 @@ class Job:
         on with a follow-up) or is over ("gone"). "timeout" when it is still neither."""
         deadline = time.monotonic() + timeout
         while True:
-            if self.add_note(text, mark):
+            if self.deliver(text, mark):
                 return "accepted"
             if not self.is_running():
                 return "gone"
@@ -969,6 +1033,7 @@ class JobManager:
         if index is None or not text:
             raise GatewayError("the last message is empty, so there is nothing to work on.")
         mark = message_mark(messages, index)
+        command = parse_command(text)
         while True:
             with self._lock:
                 if self._closed:
@@ -990,6 +1055,12 @@ class JobManager:
                     if is_echo:
                         self._echoes.add((session, mark))
                 if old is None or not old.is_running():
+                    # The echo of a command row already carried out (the job it ran in has
+                    # stopped) never runs it again: it only answers.
+                    said = (session, mark) in self._echoes
+                    if command is not None and command.kind != GOAL:
+                        self._echoes.discard((session, mark))
+                        self._answer_command(session, command, mark, old, delivered=said)
                     self._refuse_if_busy(session, workdir)
                     if old is not None:
                         accepted, inbox = old.accepted(), old.inbox_state()
@@ -1000,17 +1071,24 @@ class JobManager:
                             _inbox_seen_ids(record.get("inbox_seen")),
                             _taken(record.get("inbox_taken")),
                         )
-                    said = (session, mark) in self._echoes  # its note is already unread in the job
                     self._echoes.discard((session, mark))
+                    # A goal is its own objective: the command's words are not work to do. A big
+                    # one is filed here, once, and `_create` and the pin both take its start.
+                    objective = text
+                    if command is not None:
+                        objective, _ = file_large_note(workdir, command.text, time.time())
                     job = self._create(
-                        session, workdir, messages[:index], text, accepted, inbox, say=not said
+                        session, workdir, messages[:index], objective, accepted, inbox, say=not said
                     )
+                    if command is not None and not said:  # an echo's goal was set when it was taken
+                        job.store.set_goal(objective)
+                        job._push("\n[baton] goal set\n\n")
                     job.accept(mark)
                     self._jobs[session] = job
                     job.start()
                     self._watch_inbox()
                     return job
-                if old.add_note(text, mark):
+                if old.deliver(text, mark):
                     return old
             # It is wrapping up and still holds the goal's lock: wait outside our own lock, so
             # other sessions are not held up.
@@ -1022,6 +1100,47 @@ class JobManager:
                     "the previous run of this session is still shutting down; send the "
                     "message again in a moment."
                 )
+
+    def _answer_command(
+        self,
+        session: str,
+        command: Command,
+        mark: tuple[int, str],
+        old: Job | None,
+        delivered: bool,
+    ) -> None:
+        """A command with no job running to carry it out: `goal off` still clears the session's
+        goal, and `next` has nothing to move on and stores nothing, so it cannot surprise a later
+        job. The mark is saved with the job's record, status untouched, so a retry does nothing.
+        The echo of a command row (`delivered`) was carried out when the row was taken: it only
+        answers. Raises GatewayError, which is how a one-line answer reaches the chat."""
+        if delivered:
+            raise GatewayError(DELIVERED)
+        self._save_mark(session, mark, old)
+        if command.kind == GOAL_OFF:
+            root = state_dir(job_name(session))
+            if root.is_dir():
+                Store(root).clear_goal()
+            raise GatewayError("goal cleared")
+        raise GatewayError("no job is running, so there is nothing to move on")
+
+    def _save_mark(self, session: str, mark: tuple[int, str], old: Job | None) -> None:
+        """Accept `mark` in the session's job.json, if it has one, and leave its status alone."""
+        if old is not None:
+            old.accept(mark)  # saves with the status the job ended with
+            return
+        root = state_dir(job_name(session))
+        if not (root / "job.json").exists():
+            return
+        store = Store(root)
+        try:
+            record = store.load_job()
+            if record is None:
+                return
+            record["accepted"] = sorted(_marks(record.get("accepted")) | {mark})
+            store.save_job(record)
+        except (StateError, OSError, ValueError):
+            pass  # a retry then repeats a command that is safe to repeat
 
     def _refuse_if_busy(self, session: str, workdir: Path) -> None:
         resolved = workdir.resolve()
@@ -1082,6 +1201,7 @@ class JobManager:
         # A stop or interrupt left by something earlier is not about this message.
         job.store.clear_stop()
         job.store.take_interrupt()
+        job.store.take_next()  # a `next` meant for an older job is stale
         if resumed and say:
             job.store.say(text)  # the resumed prompt carries no objective, only notes
         return job

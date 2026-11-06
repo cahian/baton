@@ -21,7 +21,7 @@ from baton.adapters.codex import CodexAdapter
 from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_goal_ref
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, opencode_config, serve
-from baton.runner import preempted_sentence, run_goal
+from baton.runner import pin_goal, preempted_sentence, run_goal
 from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
 from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
@@ -378,6 +378,46 @@ def cmd_say(args: argparse.Namespace) -> int:
     return 0
 
 
+def _job_workdir(store: Store) -> Path | None:
+    """The directory a job's job.json names, for filing a big goal there."""
+    try:
+        record = store.load_job()
+    except StateError:
+        return None
+    directory = record.get("workdir") if record else None
+    return Path(directory) if isinstance(directory, str) and directory else None
+
+
+def cmd_goal(args: argparse.Namespace) -> int:
+    name, ref = _resolve(args.goal_target)
+    text = " ".join(args.text).strip()
+    if args.off == bool(text):
+        _err("give the goal's text, or --off to clear it (not both)")
+        return 2
+    store = Store(state_dir(name))
+    if args.off:
+        store.clear_goal()
+        print("goal cleared; the next round's prompt no longer carries it")
+    else:
+        workdir = ref.workdir if ref else _job_workdir(store)
+        if workdir is None:
+            store.set_goal(text)  # nowhere to file a big one: pinned whole
+        else:
+            pin_goal(store, workdir, text, time.time())
+        print("goal set; every prompt from the next round opens with it")
+    return 0
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    name, _ = _resolve(args.goal)
+    store = Store(state_dir(name))
+    store.request_next(now=args.now)
+    if args.now:
+        store.request_interrupt()
+    print("next requested" + (" now: after the current tool call" if args.now else ""))
+    return 0
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     name, _ = _resolve(args.goal)
     store = Store(state_dir(name))
@@ -471,6 +511,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("text", nargs="+", help="the note")
     p.set_defaults(func=cmd_say)
+
+    p = sub.add_parser("goal", help="fix the goal every prompt opens with, or clear it")
+    p.add_argument(
+        "goal_target", metavar="goal", help="goal file, or a job name such as session-<id>"
+    )
+    p.add_argument("--off", action="store_true", help="clear the goal instead of setting one")
+    p.add_argument("text", nargs="*", help="the goal")
+    p.set_defaults(func=cmd_goal)
+
+    p = sub.add_parser("next", help="ask for the next agent in the queue")
+    p.add_argument("goal", help="goal file, or a job name such as session-<id>")
+    p.add_argument(
+        "--now", action="store_true", help="also end the current round after its tool call"
+    )
+    p.set_defaults(func=cmd_next)
 
     p = sub.add_parser("stop", help="request a stop")
     p.add_argument("goal", help="goal file, or a job name such as session-<id>")

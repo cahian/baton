@@ -584,3 +584,25 @@ def test_the_antigravity_build_model_must_be_a_gemini(tmp_path):
 
 def test_a_repository_file_may_set_phases_and_build_models():
     check_repo_table({"phases": False, "agents": {"codex": {"build_model": "m"}}})
+
+
+# --- one-shot goal ---------------------------------------------------------------------------
+
+
+def test_oneshot_is_off_by_default_and_can_be_turned_on(tmp_path):
+    assert load_goal(write(tmp_path, minimal())).oneshot is False
+    on = minimal().replace('objective = "Ship it."', 'objective = "x"\noneshot = true')
+    assert load_goal(write(tmp_path, on)).oneshot is True
+
+
+def test_oneshot_must_be_a_boolean(tmp_path):
+    bad = minimal().replace('objective = "Ship it."', 'objective = "x"\noneshot = "yes"')
+    with pytest.raises(GoalError, match="oneshot"):
+        load_goal(write(tmp_path, bad))
+
+
+def test_a_repo_table_may_not_set_oneshot(tmp_path):
+    # It would pin text an agent wrote as the person's goal: only the person's goal file may.
+    with pytest.raises(GoalError, match="oneshot"):
+        check_repo_table({"oneshot": True})
+    check_repo_table({"phases": True})  # the rest of the table is judged elsewhere

@@ -2284,3 +2284,532 @@ def test_the_echo_of_a_read_note_is_answered_from_job_json_alone_too(gw, tmp_pat
     assert len(gw.agents["claude_api"].prompts) == rounds
     assert job_json(job.store.root)["status"] == gateway.STOPPED
     assert job_json(job.store.root)["inbox_taken"] == {}  # and it is used up
+
+
+# `baton:` commands
+
+GOAL_HEAD = "Goal, fixed by the person. It does not change until the person changes it:"
+
+
+def session_store():
+    return Store(state_dir(gateway.job_name(SESSION)))
+
+
+def running_job(gw, *lines):
+    """A job held in a round until released, so a command meets a job that runs."""
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy", *lines)]
+    first = gw.stream("first request")
+    first.read_until("busy")
+    return first, release
+
+
+def finish(first, release):
+    release.set()
+    text = first.read_all()
+    first.close()
+    return text
+
+
+def test_goal_starts_a_job_with_its_text_as_the_objective(gw):
+    s = gw.stream("baton: goal make the build green")
+    text = s.read_all()
+    s.close()
+    assert "[baton] goal set" in text
+    assert session_store().goal() == "make the build green"
+    prompt = gw.agents["claude_api"].prompts[0]
+    assert prompt.startswith(GOAL_HEAD + "\nmake the build green\n")
+    assert "Objective:\nmake the build green" in prompt
+    assert "baton: goal" not in prompt
+
+
+def test_goal_keeps_the_conversation_before_it_in_the_objective(gw):
+    s = Stream(gw.port, request("earlier talk", "baton: goal ship it"), session=SESSION)
+    s.read_all()
+    s.close()
+    assert "earlier talk" in gw.agents["claude_api"].prompts[0]
+    assert session_store().goal() == "ship it"
+
+
+def test_goal_with_a_running_job_sets_it_and_adds_a_note(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    first = gw.stream("first request")
+    first.read_until("busy")
+    second = gw.stream("baton: goal ship the parser\nwith tests")
+    text = second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+    assert "[baton] goal set" in text
+    prompts = gw.agents["claude_api"].prompts
+    assert len(prompts) == 2
+    assert prompts[1].startswith(GOAL_HEAD + "\nship the parser\nwith tests\n")
+    assert "Notes from the person:\nship the parser\nwith tests" in prompts[1]
+    assert user_texts(gw.job()) == ["first request", "ship the parser\nwith tests"]
+    ended = [e for e in gw.events() if e["kind"] == "round_end"]
+    assert ended[0]["interrupted"] is True
+
+
+CLEARED = "The person cleared the goal."
+
+
+def test_goal_off_clears_it_and_tells_the_agent_with_a_short_note(gw):
+    first, release = running_job(gw)
+    session_store().set_goal("old goal")
+    second = gw.stream("first request", "baton: goal off")
+    text = second.read_until("[baton] goal cleared")
+    store = gw.job().store
+    assert session_store().goal() == ""
+    assert store.read_inbox().strip() == CLEARED
+    assert user_texts(gw.job()) == ["first request", CLEARED]
+    assert store.take_interrupt() is True  # delivered like any note
+    release.set()
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+    assert "[baton] goal cleared" in text
+    assert CLEARED in gw.agents["claude_api"].prompts[-1]
+
+
+def test_goal_off_reaches_the_next_rounds_prompt_only(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    session_store().set_goal("old goal")
+    first = gw.stream("first request")
+    first.read_until("busy")
+    second = gw.stream("first request", "baton: goal off")
+    second.read_all()
+    for s in (first, second):
+        s.close()
+    first_prompt, second_prompt = gw.agents["claude_api"].prompts[:2]
+    assert "old goal" in first_prompt and "fixed by the person" not in second_prompt
+    assert CLEARED in second_prompt
+
+
+def test_goal_off_without_a_job_answers_one_line_and_starts_none(gw):
+    session_store().set_goal("old goal")
+    s = gw.stream("baton: goal off")
+    assert s.read_all().strip() == "[baton] goal cleared"
+    s.close()
+    assert session_store().goal() == ""
+    assert gw.job() is None
+    assert gw.agents["claude_api"].prompts == []
+
+
+def test_next_with_a_running_job_stores_the_request_and_follows_it(gw):
+    first, release = running_job(gw)
+    second = gw.stream("first request", "baton: next")
+    second.read_until("[baton] next requested")
+    store = gw.job().store
+    assert store.take_interrupt() is False  # plain next waits for the round to end
+    assert store.read_inbox() == ""
+    assert store.take_next() == "soon"
+    release.set()
+    assert "[baton] done" in second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+
+
+def test_next_now_also_asks_to_interrupt(gw):
+    first, release = running_job(gw)
+    second = gw.stream("first request", "baton: next now")
+    second.read_until("[baton] next now requested")
+    store = gw.job().store
+    assert store.take_next() == "now"
+    assert store.take_interrupt() is True
+    assert store.read_inbox() == ""
+    release.set()
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+
+
+def test_next_without_a_job_answers_one_line_and_stores_nothing(gw):
+    s = gw.stream("baton: next")
+    text = s.read_all()
+    s.close()
+    assert text.strip() == "[baton] no job is running, so there is nothing to move on"
+    assert gw.job() is None and gw.agents["claude_api"].prompts == []
+    assert session_store().take_next() == ""
+
+
+def test_a_retried_command_does_nothing_twice(gw):
+    first, release = running_job(gw)
+    second = gw.stream("first request", "baton: next now")
+    second.read_until("[baton] next now requested")
+    store = gw.job().store
+    assert store.take_next() == "now" and store.take_interrupt() is True
+    again = gw.stream("first request", "baton: next now")  # the same request, retried
+    release.set()
+    again.read_all()
+    again.close()
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+    assert store.take_next() == "" and store.take_interrupt() is False
+
+
+def test_a_retried_goal_adds_one_note_only(gw):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    first = gw.stream("first request")
+    first.read_until("busy")
+    for _ in range(2):
+        s = gw.stream("first request", "baton: goal ship it")
+        s.read_all()
+        s.close()
+    first.close()
+    assert user_texts(gw.job()).count("ship it") == 1
+
+
+def test_only_the_newest_message_is_a_command(gw):
+    first, release = running_job(gw)
+    session_store().set_goal("kept")
+    second = gw.stream("first request", "baton: goal off", "now carry on")
+    second.read_until("received")
+    assert user_texts(gw.job())[-1] == "now carry on"
+    assert session_store().goal() == "kept"
+    release.set()
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+
+
+@pytest.mark.parametrize(
+    "words", ["please baton: next now", "the baton: goal off switch", "baton: next soon"]
+)
+def test_text_that_only_contains_command_words_is_a_note(gw, words):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    session_store().set_goal("kept")
+    first = gw.stream("first request")
+    first.read_until("busy")
+    second = gw.stream(words)
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+    assert words in user_texts(gw.job())
+    assert session_store().goal() == "kept" and session_store().take_next() == ""
+
+
+def test_a_command_row_in_the_inbox_goes_through_the_same_parsing(gw, tmp_path):
+    first, release = running_job(gw)
+    add_inbox_row(tmp_path, "row1", "baton: goal off")
+    add_inbox_row(tmp_path, "row2", "baton: next now")
+    session_store().set_goal("old goal")
+    gw.manager.poll_inbox()
+    store = gw.job().store
+    assert store.goal() == ""
+    assert store.take_next() == "now" and store.take_interrupt() is True
+    assert store.read_inbox().strip() == CLEARED
+    assert user_texts(gw.job()) == ["first request", CLEARED]
+    finish(first, release)
+
+
+def test_a_goal_row_sets_the_goal_and_adds_the_goal_text_as_a_note(gw, tmp_path):
+    first, release = running_job(gw)
+    add_inbox_row(tmp_path, "row1", "BATON: Goal ship it")
+    gw.manager.poll_inbox()
+    store = gw.job().store
+    assert store.goal() == "ship it"
+    assert user_texts(gw.job()) == ["first request", "ship it"]
+    assert store.read_inbox().strip() == "ship it"
+    finish(first, release)
+
+
+def test_a_command_row_is_taken_once(gw, tmp_path):
+    first, release = running_job(gw)
+    add_inbox_row(tmp_path, "row1", "baton: next")
+    gw.manager.poll_inbox()
+    store = gw.job().store
+    assert store.take_next() == "soon"
+    gw.manager.poll_inbox()
+    gw.manager.poll_inbox()
+    assert store.take_next() == ""
+    finish(first, release)
+
+
+def test_the_post_of_a_command_row_follows_the_job_and_does_nothing_more(gw, tmp_path):
+    first, release = running_job(gw)
+    add_inbox_row(tmp_path, "row1", "baton: goal off")
+    session_store().set_goal("old goal")
+    gw.manager.poll_inbox()
+    session_store().set_goal("set again by hand")
+    again = gw.stream("first request", "baton: goal off")  # OpenCode posts what it queued
+    release.set()
+    assert "[baton] done" in again.read_all()
+    again.close()
+    first.read_all()
+    first.close()
+    assert session_store().goal() == "set again by hand"  # not cleared a second time
+    assert user_texts(gw.job()) == ["first request", CLEARED]  # and the note said once
+    assert job_json(gw.job().store.root)["inbox_taken"] == {}
+
+
+def test_the_post_of_a_goal_row_does_not_add_a_second_note(gw, tmp_path):
+    first, release = running_job(gw)
+    add_inbox_row(tmp_path, "row1", "baton: goal ship it")
+    gw.manager.poll_inbox()
+    again = gw.stream("first request", "baton: goal ship it")
+    release.set()
+    again.read_all()
+    again.close()
+    first.read_all()
+    first.close()
+    assert user_texts(gw.job()).count("ship it") == 1
+    assert len(gw.agents["claude_api"].prompts) == 2  # one for the note, no third
+
+
+def test_a_command_row_does_not_start_a_job_that_is_not_running(gw, tmp_path):
+    first, release = running_job(gw)
+    finish(first, release)
+    assert wait_for(lambda: not gw.job().is_running())
+    add_inbox_row(tmp_path, "row1", "baton: goal off")
+    gw.manager.poll_inbox()  # no running job: nothing to take it
+    assert [m for m in user_texts(gw.job())] == ["first request"]
+
+
+def test_a_command_saves_its_mark_so_a_restart_does_not_repeat_it(gw):
+    first, release = running_job(gw)
+    second = gw.stream("first request", "baton: next now")
+    second.read_until("[baton] next now requested")
+    assert job_json(gw.job().store.root)["accepted"]
+    release.set()
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+
+
+def test_history_leaves_out_the_persons_commands_but_keeps_their_other_words():
+    messages = [
+        {"role": "user", "content": "build the thing"},
+        {"role": "assistant", "content": "on it"},
+        {"role": "user", "content": "baton: goal off"},
+        {"role": "user", "content": "baton: next now"},
+        {"role": "user", "content": "baton: goal ship it"},
+        {"role": "user", "content": "please baton: next"},
+    ]
+    text = gateway.history_text(messages)
+    assert "build the thing" in text and "on it" in text and "please baton: next" in text
+    assert "baton: goal" not in text and "next now" not in text
+
+
+def test_a_new_job_briefing_carries_no_old_command(gw):
+    s = Stream(
+        gw.port,
+        request("first", "baton: goal off", "carry on", history=[]),
+        session=SESSION,
+    )
+    s.read_all()
+    s.close()
+    prompt = gw.agents["claude_api"].prompts[0]
+    assert "first" in prompt and "carry on" in prompt and "baton: goal off" not in prompt
+
+
+# the echo of a command row never runs the command again
+
+
+def stopped_with_rows(gw, tmp_path, *rows):
+    """A job stopped while the rows (text each) taken from the inbox left a note unread."""
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    job = gw.job()
+    job.store.request_stop()
+    for n, text in enumerate(rows):
+        add_inbox_row(tmp_path, f"row{n}", text)
+    gw.manager.poll_inbox()
+    release.set()
+    first.read_all()
+    first.close()
+    assert wait_for(lambda: not job.is_running())
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    assert gateway._notes_unread(job.store)  # something is unread
+    return job
+
+
+@pytest.mark.parametrize("restarted", [False, True])
+@pytest.mark.parametrize("command", ["baton: goal off", "baton: next", "baton: next now"])
+def test_the_echo_of_a_command_row_on_a_stopped_job_is_delivered_and_runs_nothing(
+    gw, tmp_path, command, restarted
+):
+    job = stopped_with_rows(gw, tmp_path, "an unread note", command)
+    session_store().set_goal("set later")
+    session_store().take_next()
+    session_store().take_interrupt()
+    rounds = len(gw.agents["claude_api"].prompts)
+    manager = restart(gw) if restarted else gw.manager
+    echo = gw.stream("go", command)
+    assert echo.read_all().strip() == "[baton] that message was already delivered"
+    echo.close()
+    assert session_store().goal() == "set later"  # `goal off` did not run again
+    assert session_store().take_next() == "" and session_store().take_interrupt() is False
+    assert len(gw.agents["claude_api"].prompts) == rounds and not job.is_running()
+    assert manager._echoes == set()  # nothing is left to leak into a later message
+
+
+@pytest.mark.parametrize("restarted", [False, True])
+def test_the_echo_of_a_goal_row_on_a_stopped_job_starts_it_without_setting_the_goal_again(
+    gw, tmp_path, restarted
+):
+    stopped_with_rows(gw, tmp_path, "baton: goal first goal")
+    session_store().set_goal("set later")
+    rounds = len(gw.agents["claude_api"].prompts)
+    manager = restart(gw) if restarted else gw.manager
+    echo = gw.stream("go", "baton: goal first goal")
+    reply = echo.read_all()
+    echo.close()
+    assert "already delivered" not in reply and "[baton] done" in reply
+    assert "goal set" not in reply
+    assert session_store().goal() == "set later"
+    prompts = gw.agents["claude_api"].prompts[rounds:]
+    assert prompts and notes_block(prompts[0]).count("first goal") == 1
+    assert manager._echoes == set()
+
+
+def test_the_echo_of_a_command_row_on_a_finished_job_is_delivered(gw, tmp_path):
+    first, release = running_job(gw)
+    add_inbox_row(tmp_path, "row1", "baton: next")
+    gw.manager.poll_inbox()
+    finish(first, release)
+    assert wait_for(lambda: not gw.job().is_running())
+    session_store().take_next()
+    rounds = len(gw.agents["claude_api"].prompts)
+    echo = gw.stream("first request", "baton: next")
+    assert echo.read_all().strip() == "[baton] that message was already delivered"
+    echo.close()
+    assert session_store().take_next() == ""
+    assert len(gw.agents["claude_api"].prompts) == rounds
+
+
+# a command with no job running keeps its mark in job.json, and leaves the status alone
+
+
+def finished_job(gw):
+    s = gw.stream("go")
+    s.read_all()
+    s.close()
+    job = gw.job()
+    assert wait_for(lambda: not job.is_running())
+    assert job_json(job.store.root)["status"] == gateway.FINISHED
+    return job
+
+
+def stopped_job(gw):
+    (gw.work / "baton.toml").write_text('[verify]\ncommand = "test -f DONE"\n')  # never met
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    job = gw.job()
+    job.store.request_stop()
+    release.set()
+    first.read_all()
+    first.close()
+    assert wait_for(lambda: not job.is_running())
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    return job
+
+
+def mark_of(*texts):
+    messages = request(*texts)["messages"]
+    return gateway.message_mark(messages, gateway.last_user_index(messages))
+
+
+@pytest.mark.parametrize("restarted", [False, True])
+@pytest.mark.parametrize("ended", [finished_job, stopped_job])
+@pytest.mark.parametrize(
+    ("command", "answer"),
+    [
+        ("baton: goal off", "[baton] goal cleared"),
+        ("baton: next", "[baton] no job is running, so there is nothing to move on"),
+        ("baton: next now", "[baton] no job is running, so there is nothing to move on"),
+    ],
+)
+def test_a_command_without_a_running_job_saves_its_mark_and_keeps_the_status(
+    gw, command, answer, ended, restarted
+):
+    job = ended(gw)
+    status = job_json(job.store.root)["status"]
+    session_store().set_goal("old goal")
+    if restarted:
+        restart(gw)
+    s = gw.stream("go", command)
+    assert s.read_all().strip() == answer
+    s.close()
+    record = job_json(job.store.root)
+    assert record["status"] == status
+    assert list(mark_of("go", command)) in record["accepted"]
+    # a retry of the same request does nothing
+    session_store().set_goal("set again")
+    session_store().request_next(False)
+    retry = gw.stream("go", command)
+    retry.read_all()
+    retry.close()
+    assert session_store().goal() == "set again"
+    assert session_store().take_next() == "soon"  # still the one stored by hand, not new
+    assert job_json(job.store.root)["status"] == status
+
+
+def test_a_command_with_no_record_at_all_makes_no_job_json(gw):
+    s = gw.stream("baton: next")
+    s.read_all()
+    s.close()
+    assert not (session_store().root / "job.json").exists()
+
+
+# a new job does not inherit a request meant for an older one
+
+
+def test_a_new_job_does_not_take_a_stale_next_request(gw):
+    session_store().request_next(True)
+    s = gw.stream("do the thing")
+    s.read_all()
+    s.close()
+    assert session_store().take_next() == ""
+
+
+# a repository may not switch on a one-shot goal
+
+
+def test_a_baton_toml_may_not_set_oneshot(gw):
+    (gw.work / "baton.toml").write_text("oneshot = true\n")
+    s = gw.stream("do the thing")
+    text = s.read_all()
+    s.close()
+    assert "oneshot" in text and "[baton]" in text
+    assert gw.job() is None and gw.agents["claude_api"].prompts == []
+
+
+# a big goal is filed once and only its start is pinned
+
+
+def test_a_big_goal_is_filed_and_pins_only_its_start(gw):
+    big = "word " * 3000
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    first = gw.stream("first request")
+    first.read_until("busy")
+    second = gw.stream(f"baton: goal {big}")
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+    pinned = session_store().goal()
+    assert len(pinned) < 1500 and "`.baton/notes/" in pinned
+    files = list((gw.work / ".baton" / "notes").iterdir())
+    assert len(files) == 1 and files[0].read_text(encoding="utf-8").strip() == big.strip()
+    assert gw.agents["claude_api"].prompts[1].startswith(GOAL_HEAD + "\n" + pinned[:200])
+
+
+def test_a_big_goal_that_starts_a_job_is_filed_once_too(gw):
+    big = "word " * 3000
+    s = gw.stream(f"baton: goal {big}")
+    s.read_all()
+    s.close()
+    assert "`.baton/notes/" in session_store().goal()
+    assert len(list((gw.work / ".baton" / "notes").iterdir())) == 1

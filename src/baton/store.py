@@ -167,6 +167,9 @@ class Store:
         self._stop = self.root / "stop"
         self._interrupt = self.root / "interrupt"
         self._job = self.root / "job.json"
+        self._goal = self.root / "goal.md"
+        self._goal_done = self.root / "goal.done.md"
+        self._next = self.root / "next"
         self._seq = max(self._last_seq(self._events), self._last_seq(self._rotated))
 
     # events
@@ -364,6 +367,46 @@ class Store:
         except FileNotFoundError:
             return False
         return True
+
+    # goal
+
+    def set_goal(self, text: str) -> None:
+        """Pin the goal the person fixed: every prompt opens with it until they change it."""
+        _atomic_write(self._goal, text.strip() + "\n")
+
+    def goal(self) -> str:
+        """The pinned goal, "" when none is set (the goal is on while this is not empty)."""
+        try:
+            return self._goal.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""  # unreadable is no goal, as an unreadable handoff is none
+
+    def clear_goal(self) -> None:
+        self._goal.unlink(missing_ok=True)
+
+    def archive_goal(self) -> None:
+        """Keep a goal that ended in `goal.done.md` and leave none pinned."""
+        try:
+            os.replace(self._goal, self._goal_done)
+        except FileNotFoundError:
+            pass
+
+    # next
+
+    def request_next(self, now: bool = False) -> None:
+        """Ask for the next agent in the queue. `now` does not wait for the round to end."""
+        if not now and self._next.exists():
+            return  # a request already waits, and never downgrade a `now`
+        _atomic_write(self._next, "now\n" if now else "soon\n")
+
+    def take_next(self) -> str:
+        """The pending request, cleared: "" when none, "now" when forced, otherwise "soon"."""
+        try:
+            content = self._next.read_text(encoding="utf-8").strip()
+            self._next.unlink()
+        except FileNotFoundError:
+            return ""
+        return "now" if content == "now" else "soon"
 
     # lock
 

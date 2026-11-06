@@ -74,6 +74,7 @@ GOAL_KEYS = frozenset(
         "snapshot",
         "memory",
         "phases",
+        "oneshot",
         "verify",
         "agents",
     }
@@ -163,6 +164,8 @@ class Goal:
     agents: dict[str, AgentConfig]
     path: Path
     phases: bool = True
+    # The objective is pinned as the goal when the job starts: it holds until the person changes it.
+    oneshot: bool = False
 
 
 def _table(data: dict[str, Any], key: str, where: str) -> dict[str, Any]:
@@ -424,6 +427,11 @@ def load_goal(path: Path) -> Goal:
 
 def check_repo_table(data: dict[str, Any]) -> None:
     """Refuse what a `baton.toml` may not set. A malformed `agents` is left for the builder."""
+    if "oneshot" in data:
+        raise GoalError(
+            "oneshot may not be set here: it would pin text an agent wrote as the person's goal "
+            "(set it in a goal file you pass to `baton run`)"
+        )
     agents = data.get("agents")
     for agent, table in agents.items() if isinstance(agents, dict) else ():
         for key in REPO_FORBIDDEN:
@@ -493,6 +501,7 @@ def goal_from_table(
         snapshot=_bool(data, "snapshot", True, ""),
         memory=_bool(data, "memory", True, ""),
         phases=_bool(data, "phases", PHASES_DEFAULT, ""),
+        oneshot=_bool(data, "oneshot", False, ""),
         verify_command=verify_command,
         verify_timeout_s=_int(verify, "timeout_s", 3600, "verify.", 1, 10**7),
         agents=agents,

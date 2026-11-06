@@ -578,6 +578,7 @@ name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
 phases = true   # false keeps the plain relay, with the strong model for every round
+oneshot = false # true pins the objective as the goal when the job first starts
 
 [verify]
 command = "./check.sh"
@@ -587,6 +588,14 @@ timeout_s = 3600
 The verification command runs through the shell in the working directory. Exit 0 finishes the
 goal; anything else, including a timeout, means not done, and its output goes to the next round.
 Without `verify.command`, the goal is finished when a cycle ends (a round, with `phases = false`).
+
+A goal the person fixes (`goal.md` in the state directory, set from OpenCode or with `baton goal`) opens
+every prompt, fresh or resumed, with `Goal, fixed by the person. It does not change until the person
+changes it:` and its text. It is on while that file is not empty. A goal over 8000 characters goes to
+a file under `.baton/notes/` once, and only its first 1000 characters and the file's name are pinned.
+`oneshot = true` pins the objective as the goal once, at a job's first start (state.json remembers it),
+so a restart never brings back one that was cleared. Only a goal file you pass to `baton run` may set
+it: a repository's `baton.toml` is refused, as it would pin text an agent wrote.
 
 Between rounds each agent gets the same context: the repository, its commits, `.baton/HANDOFF.md`
 (kept current by the agents), the last gate output and the tail of the previous round. `.baton/`
@@ -645,7 +654,7 @@ characters goes to a file under `.baton/notes/` in the directory, with its first
 and the file's name in the prompt. A message gets at least one round, even if the gate
 already passes. A request that repeats what was already accepted, as a client's retry does, attaches
 to the stream and interrupts nothing, so it costs no round. `baton jobs` lists every job, and
-`baton status`, `baton say` and `baton stop` accept its name (`session-<id>`) in place of a goal
+`baton status`, `baton say`, `baton goal`, `baton next` and `baton stop` accept its name (`session-<id>`) in place of a goal
 file. The stream shows the agents' text, one line per rotation, a sentence when a returning plan
 agent ends a Claude round, waits and gate results, and when no agent can run it says why, for
 each one. Title requests are answered locally and spend nothing. The
@@ -654,6 +663,22 @@ the path in `BATON_OPENCODE_DB`); baton never guesses one.
 
 One runner works in a directory at a time, across `baton run` and `baton serve`. A directory inside
 or around a running one counts as busy, since the two would commit each other's work.
+
+### Commands in the chat
+
+A message that starts with `baton:` (any case) is a command, not work. They never start with `/`,
+which belongs to OpenCode. Text that only contains these words is an ordinary message.
+
+| Message | What it does |
+|---|---|
+| `baton: goal <text>` | Fix the goal (the rest of the message, over any number of lines). With no job running it starts one with `<text>` as the objective; with one running it is also a note, so the next round reads it. Chat: `[baton] goal set`. |
+| `baton: goal off` | Clear the goal, from the next round's prompt, and leave the note `The person cleared the goal.` for the agent. Chat: `[baton] goal cleared`. |
+| `baton: next` | Ask for the next agent in the queue after this round. It is stored for the rotation to take. With no job running baton answers in one line and stores nothing. |
+| `baton: next now` | The same, and the round ends after its current tool call. |
+
+A command typed while the reply streams goes through the same parsing when baton reads it from
+OpenCode's queue, and neither a retry of one nor OpenCode's later post of the same words runs it
+twice. Old commands are left out of the conversation a new job is briefed with.
 
 ### Keeping it running
 
@@ -689,6 +714,8 @@ for writing it by hand.
 | `baton jobs` | List every job and goal that has state: whether its runner is alive, round, current agent, last event. |
 | `baton status <goal.toml or job>` | One-shot status: rounds, cooldowns, recent events. |
 | `baton say <goal.toml or job> [--now] "note"` | Leave a note for the next round. `--now` also ends the current one, after its tool call. |
+| `baton goal <goal.toml or job> "text"` / `--off` | Fix the goal every prompt opens with, or clear it. |
+| `baton next <goal.toml or job> [--now]` | Ask for the next agent in the queue; `--now` also ends the round after its tool call. |
 | `baton stop <goal.toml or job> [--now]` | Stop after the current round, or kill the round with `--now`. |
 | `baton opencode-config [--port 18777]` | Print the provider JSON for `opencode.json`. |
 | `baton install-service [--port 18777]` | Write the launchd plist and load it (macOS). |
