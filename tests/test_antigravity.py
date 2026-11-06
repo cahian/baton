@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from baton import gateway
 from baton.adapters.antigravity import (
     GEMINI_MODELS,
     AntigravityAdapter,
@@ -424,7 +425,7 @@ def test_classify_other_text_is_left_to_the_caller(text):
 def test_disabled_is_unavailable():
     a = AntigravityAdapter(make_cfg(enabled=False), read=Reads())
     res = a.availability()
-    assert not res.ok and "disabled" in res.reason
+    assert not res.ok and "disabled" in res.reason and res.permanent
 
 
 def test_availability_reads_both_commands_and_checks():
@@ -478,6 +479,100 @@ def test_render_extracts_text_delta():
     )
     assert a.render("plain text line") == "plain text line"
     assert a.render("   ") is None
+
+
+def tool_line(tool, parameters=None, state="ACTIVE", **step):
+    update = {"step_index": 3, "state": state, "step_type": "tool", "tool_name": tool, **step}
+    if parameters is not None:
+        update["tool_info"] = {"name": tool, "parameters": parameters}
+    return json.dumps({"event": "step_update", "step_update": update})
+
+
+def delta_line(text):
+    return json.dumps({"event": "step_update", "step_update": {"text_delta": text}})
+
+
+def test_render_shows_a_command_as_it_starts():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line("run_command", {"CommandLine": "git status"})) == "$ git status"
+    # the same step reported again as DONE shows nothing
+    assert a.render(tool_line("run_command", {"CommandLine": "git status"}, state="DONE")) is None
+
+
+def test_render_shows_another_tool_with_its_first_parameter():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line("read_file", {"Path": "/a/b", "Other": "x"})) == "read_file: /a/b"
+    # the first one that is a non-blank string, in order
+    params = {"Lines": 5, "Blank": "  ", "Path": "/a/b"}
+    assert a.render(tool_line("read_file", params)) == "read_file: /a/b"
+    assert a.render(tool_line("read_file", {"Lines": 5})) == "read_file"
+    assert a.render(tool_line("manage_task")) == "manage_task"
+    # a command without a usable CommandLine is any other tool
+    assert a.render(tool_line("run_command", {"CommandLine": "  ", "Cwd": "/w"})) == (
+        "run_command: /w"
+    )
+    assert a.render(tool_line("run_command", {"CommandLine": 7})) == "run_command"
+
+
+@pytest.mark.parametrize("info", [None, "text", ["a"], 5])
+def test_render_tolerates_tool_info_that_is_not_a_dict(info):
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    line = tool_line("read_file", state="ACTIVE", tool_info=info)
+    assert a.render(line) == "read_file"
+    line = tool_line("read_file", state="ACTIVE", tool_info={"parameters": info})
+    assert a.render(line) == "read_file"
+
+
+@pytest.mark.parametrize("name", [None, "", 5])
+def test_render_shows_no_tool_step_without_a_name(name):
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line(None, {"Path": "/a"}, tool_name=name)) is None
+
+
+def test_render_does_not_show_a_step_that_is_not_a_tool():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    line = tool_line("read_file", {"Path": "/a"}, step_type="agent_response")
+    assert a.render(line) is None
+
+
+def test_render_keeps_the_first_line_of_a_command_and_marks_the_cut():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    command = "  echo one\necho two\n"
+    assert a.render(tool_line("run_command", {"CommandLine": command})) == "$ echo one …"
+    # a trailing newline alone leaves nothing out
+    assert a.render(tool_line("run_command", {"CommandLine": "ls\n"})) == "$ ls"
+
+
+def test_render_ends_a_command_at_any_line_break():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    # CRLF, and a bare CR that would overwrite text in a terminal
+    assert a.render(tool_line("run_command", {"CommandLine": "a\r\nb"})) == "$ a …"
+    assert a.render(tool_line("run_command", {"CommandLine": "a\rb"})) == "$ a …"
+    assert a.render(tool_line("run_command", {"CommandLine": "a\r\n"})) == "$ a"
+
+
+def test_render_cuts_a_long_value_at_200_characters():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(tool_line("read_file", {"Path": "x" * 200})) == f"read_file: {'x' * 200}"
+    assert a.render(tool_line("read_file", {"Path": "x" * 201})) == f"read_file: {'x' * 200} …"
+
+
+def test_render_returns_a_text_delta_untouched():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.render(delta_line("\n\n")) == "\n\n"
+    assert a.render(delta_line(" rende")) == " rende"
+
+
+def test_only_a_text_delta_is_a_fragment():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    assert a.is_fragment(delta_line("rende")) is True
+    assert a.is_fragment(delta_line("\n")) is True
+    assert a.is_fragment(delta_line("")) is False
+    assert a.is_fragment(tool_line("run_command", {"CommandLine": "ls"})) is False
+    assert a.is_fragment('{"event":"result","result":{"status":"ERROR","error":"boom"}}') is False
+    assert a.is_fragment("plain text line") is False
+    assert a.is_fragment("{not json") is False
+    assert a.is_fragment('{"event":"step_update","step_update":{"text_delta":5}}') is False
 
 
 def test_argv_fresh_and_resume():
@@ -544,10 +639,55 @@ def test_round_completes_when_nothing_moves(fake, tmp_path):
     assert any("text_delta" in x for x in lines)
 
 
+def test_a_whole_real_shaped_round_goes_through_the_adapter_and_the_chat(fake, tmp_path):
+    """tests/fixtures/agy_round.jsonl has the shapes of a real round, with invented ids: init at the
+    top level, split text deltas, tool steps ACTIVE then DONE or ERROR, a background task, a plain
+    status line and a result with usage."""
+    recorded = Path(__file__).parent / "fixtures" / "agy_round.jsonl"
+    wrapper = Path(fake.bin)
+    reads = wrapper.read_text().splitlines()[1]  # the limit reads still go to the fake
+    wrapper.write_text(
+        f'#!/bin/sh\ncase "$2" in /usage|/credits) {reads} ;; esac\ncat "{recorded}"\n'
+    )
+    agent = adapter(fake.bin, Reads())
+    watch = agent.tool_watch()
+    lines, sessions, shown, busy = [], [], [], []
+
+    def on_output(line):
+        lines.append(line)
+        watch.feed(line)
+        busy.append(watch.busy)
+        text = agent.render(line)
+        if text:
+            fragment = agent.is_fragment(line)
+            shown.append(gateway.render_event("output", {"text": text, "fragment": fragment}))
+
+    res = agent.run_round("go", make_ctx(tmp_path, on_output=on_output, on_session=sessions.append))
+    assert res.outcome == COMPLETED
+    assert sessions == ["conv-7f3a91"]
+    assert lines == recorded.read_text().splitlines()
+    text = "".join(shown)
+    assert "Checking the build in the background.\n" in text
+    assert "The file is missing; nothing else to do.\n" in text
+    assert "$ git status\n" in text and "manage_task: start\n" in text
+    assert "view_file: /work/project/missing.txt\n" in text
+    assert "root agent idle; waiting for 1 background task(s) to finish\n" in text
+    assert any(busy) and not watch.busy  # open steps and the task, then all closed
+    assert watch.open == set() and watch.tasks == set() and not watch.waiting
+    assert busy[lines.index("root agent idle; waiting for 1 background task(s) to finish")]
+
+
 def test_stdin_closed(fake, tmp_path):
     # The fake exits 3 if stdin yields data and 4 if it stays open: either would not be COMPLETED.
     res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path))
     assert res.outcome == COMPLETED and res.reason == ""
+
+
+def test_the_round_carries_baton_round_in_its_environment(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("BATON_ROUND", "")
+    adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path))
+    (call,) = fake.calls()
+    assert call["baton_env"]["BATON_ROUND"] == "1"
 
 
 def test_round_runs_in_the_workdir_with_the_prompt_in_argv(fake, tmp_path):
@@ -568,6 +708,31 @@ def test_session_id_from_init(fake, tmp_path, monkeypatch):
     assert seen == ["conv-42"]
 
 
+def test_session_id_from_a_nested_init_still_works(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_AGY_CONVERSATION_ID", "conv-nested")
+    monkeypatch.setenv("FAKE_AGY_INIT_SHAPE", "nested")
+    seen = []
+    res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path, on_session=seen.append))
+    assert res.outcome == COMPLETED
+    assert seen == ["conv-nested"]
+
+
+def test_top_level_id_wins_over_the_payload_one(tmp_path):
+    seen = []
+    line = json.dumps(
+        {"event": "init", "conversation_id": "top", "init": {"conversation_id": "inner"}}
+    )
+    # A stub child that prints only that init line; the round ends without a result, which is
+    # beside the point here.
+    script = tmp_path / "child.py"
+    script.write_text(f"print({line!r})\n")
+    wrapper = tmp_path / "agy"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+    wrapper.chmod(0o755)
+    adapter(str(wrapper), Reads()).run_round("go", make_ctx(tmp_path, on_session=seen.append))
+    assert seen == ["top"]
+
+
 def test_resume_argv(fake, tmp_path):
     seen = []
     adapter(fake.bin, Reads()).run_round(
@@ -578,13 +743,44 @@ def test_resume_argv(fake, tmp_path):
     assert seen == ["conv-7"]
 
 
-def test_failed_resume_sets_resume_failed(fake, tmp_path, monkeypatch):
+def test_failed_resume_without_any_step_sets_resume_failed(fake, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_AGY_RESULT_STATUS", "ERROR")
     monkeypatch.setenv("FAKE_AGY_RESULT_ERROR", "conversation not found")
     monkeypatch.setenv("FAKE_AGY_EXEC_EXIT", "1")
+    monkeypatch.setenv("FAKE_AGY_NO_STEPS", "1")
     res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path, session_id="gone"))
     assert res.outcome == TRANSIENT and res.resume_failed
     assert "conversation not found" in res.reason
+
+
+def test_a_resumed_round_that_worked_before_failing_keeps_its_session(fake, tmp_path, monkeypatch):
+    # Real case: agy ended itself with "interrupted" after many steps.
+    monkeypatch.setenv("FAKE_AGY_RESULT_STATUS", "ERROR")
+    monkeypatch.setenv("FAKE_AGY_RESULT_ERROR", "interrupted")
+    monkeypatch.setenv("FAKE_AGY_EXEC_EXIT", "1")
+    res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path, session_id="conv-7"))
+    assert res.outcome == TRANSIENT and not res.resume_failed
+    assert "interrupted" in res.reason
+
+
+def test_an_unknown_conversation_ends_the_round_as_a_failed_resume(fake, tmp_path, monkeypatch):
+    # Real agy: a warning, an init with a NEW id, then a run that lacks the objective.
+    monkeypatch.setenv("FAKE_AGY_UNKNOWN_CONVERSATION", "1")
+    seen = []
+    res = adapter(fake.bin, Reads()).run_round(
+        "again", make_ctx(tmp_path, session_id="gone", on_session=seen.append)
+    )
+    assert res.outcome == TRANSIENT and res.resume_failed
+    assert "gone" in res.reason and "conv-fresh" in res.reason
+    assert seen == []  # the new id is not saved
+
+
+def test_a_matching_conversation_id_keeps_working(fake, tmp_path):
+    seen = []
+    res = adapter(fake.bin, Reads()).run_round(
+        "again", make_ctx(tmp_path, session_id="conv-7", on_session=seen.append)
+    )
+    assert res.outcome == COMPLETED and seen == ["conv-7"]
 
 
 def test_failed_fresh_round_is_plain_transient(fake, tmp_path, monkeypatch):
@@ -999,12 +1195,20 @@ def test_read_text_sees_a_scrubbed_environment(fake, tmp_path, monkeypatch):
         ('{"event":"step_update","step_update":{"text_delta":"reading the code"}}', True),
         ('{"event":"result","result":{"status":"ERROR","error":"RESOURCE_EXHAUSTED"}}', False),
         ("429 Too Many Requests", False),
+        (tool_line("run_command", {"CommandLine": "ls"}), True),
     ],
 )
 def test_only_the_agent_acting_counts_as_work(line, work):
     adapter = AntigravityAdapter(make_cfg())
     assert adapter.render(line)  # the person sees all of them
     assert adapter.is_work(line) is work
+
+
+def test_a_finished_tool_step_shows_nothing_and_is_not_work():
+    adapter = AntigravityAdapter(make_cfg())
+    line = tool_line("run_command", {"CommandLine": "ls"}, state="DONE")
+    assert adapter.render(line) is None
+    assert adapter.is_work(line) is False
 
 
 # --- a read of the wrong type must not lose the balance --------------------------------------
@@ -1179,3 +1383,118 @@ def test_the_two_ids_without_their_effort_suffix_are_allowed(tmp_path, monkeypat
     wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
     wrapper.chmod(0o755)
     assert adapter(str(wrapper), Reads()).run_round("go", make_ctx(tmp_path)).outcome == COMPLETED
+
+
+# --- the tool watch --------------------------------------------------------------------------
+
+
+def step_line(tool, state, index, conversation="c", parameters=None, output=None):
+    info = {"name": tool, "parameters": parameters or {}}
+    if output is not None:
+        info["output"] = output
+    return tool_line(
+        tool, state=state, step_index=index, conversation_id=conversation, tool_info=info
+    )
+
+
+def watch_of(*lines):
+    watch = AntigravityAdapter(make_cfg(), read=Reads()).tool_watch()
+    for line in lines:
+        watch.feed(line)
+    return watch
+
+
+def test_a_tool_step_is_busy_from_active_to_done():
+    watch = watch_of()
+    assert watch.busy is False
+    watch.feed(step_line("run_command", "ACTIVE", 4))
+    assert watch.busy is True
+    watch.feed(step_line("run_command", "DONE", 4))
+    assert watch.busy is False
+
+
+@pytest.mark.parametrize("state", ["ERROR", "CANCELLED", "FAILED"])
+def test_a_tool_step_that_ends_in_any_other_state_is_not_busy_either(state):
+    watch = watch_of(step_line("run_command", "ACTIVE", 4))
+    watch.feed(step_line("run_command", state, 4))
+    assert watch.busy is False
+
+
+def test_a_parallel_pair_of_tools_stays_busy_until_both_end():
+    watch = watch_of(step_line("read_file", "ACTIVE", 5), step_line("run_command", "ACTIVE", 6))
+    watch.feed(step_line("read_file", "DONE", 5))
+    assert watch.busy is True
+    watch.feed(step_line("run_command", "DONE", 6))
+    assert watch.busy is False
+
+
+def test_text_and_other_events_do_not_make_the_watch_busy():
+    watch = watch_of(
+        delta_line("thinking about it"),
+        json.dumps({"event": "init", "conversation_id": "c"}),
+        '{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE"}}',
+        "not json at all",
+        "[1, 2]",
+    )
+    assert watch.busy is False
+
+
+def task_done(action, status=None, task="c/task-3", output=None):
+    text = output if output is not None else f"Task: {task}\nStatus: {status}\nLog: file:///x.log\n"
+    return step_line(
+        "manage_task", "DONE", 9, parameters={"Action": action, "TaskId": task}, output=text
+    )
+
+
+def test_a_running_background_task_keeps_the_watch_busy_after_its_step_is_done():
+    watch = watch_of(task_done("status", "RUNNING"))
+    assert watch.busy is True
+    watch.feed(task_done("status", "DONE"))
+    assert watch.busy is False
+
+
+@pytest.mark.parametrize("status", ["FAILED", "CANCELLED", "TIMEOUT"])
+def test_another_terminal_status_ends_a_background_task(status):
+    watch = watch_of(task_done("status", "RUNNING"), task_done("status", status))
+    assert watch.busy is False
+
+
+def test_a_kill_ends_a_background_task():
+    killed = 'Task "c/task-3" cancelled.'
+    watch = watch_of(task_done("status", "RUNNING"), task_done("kill", output=killed))
+    assert watch.busy is False
+
+
+def test_two_background_tasks_stay_busy_until_both_end():
+    watch = watch_of(
+        task_done("status", "RUNNING", task="c/task-1"),
+        task_done("status", "RUNNING", task="c/task-2"),
+        task_done("status", "DONE", task="c/task-1"),
+    )
+    assert watch.busy is True
+    watch.feed(task_done("kill", output="cancelled", task="c/task-2"))
+    assert watch.busy is False
+
+
+def test_the_agent_waiting_for_background_tasks_is_busy_until_one_is_removed():
+    waiting = "root agent idle; waiting for 2 background task(s) to finish"
+    watch = watch_of(waiting)  # agy prints it as a plain line
+    assert watch.busy is True
+    watch.feed(task_done("status", "DONE"))
+    assert watch.busy is False
+    watch.feed(delta_line("waiting for 1 background task to finish"))  # or as a text delta
+    assert watch.busy is True
+    watch.feed(step_line("read_file", "ACTIVE", 11))
+    watch.feed(step_line("read_file", "DONE", 11))
+    assert watch.busy is False  # a new tool step: it is acting again
+
+
+def test_waiting_for_no_background_task_is_not_busy():
+    assert watch_of("root agent idle; waiting for 0 background task(s) to finish").busy is False
+
+
+def test_every_round_gets_its_own_watch():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    first = a.tool_watch()
+    first.feed(step_line("run_command", "ACTIVE", 1))
+    assert a.tool_watch().busy is False

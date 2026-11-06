@@ -59,6 +59,27 @@ def phases_off_by_default(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def goals_allowed_by_default(request, monkeypatch):
+    """A goal is refused with phases off or outside a git repository, and most tests run with
+    phases off in a plain directory. A test about the refusal is marked `refusals` and sees the
+    real rule."""
+    if request.node.get_closest_marker("refusals") is None:
+        monkeypatch.setattr("baton.runner.goal_refusal", lambda goal: "")
+
+
+@pytest.fixture(autouse=True)
+def outside_a_round():
+    """Baton's own tests run in no agent's round: the steering commands refuse under
+    `BATON_ROUND`, so a stray one is dropped (and put back afterwards)."""
+    saved = os.environ.pop("BATON_ROUND", None)
+    yield
+    if saved is not None:
+        os.environ["BATON_ROUND"] = saved
+    else:
+        os.environ.pop("BATON_ROUND", None)
+
+
+@pytest.fixture(autouse=True)
 def isolated_baton_files(tmp_path, monkeypatch):
     """No test reads the real defaults file or touches the real spend ledger."""
     monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "config" / "defaults.toml"))

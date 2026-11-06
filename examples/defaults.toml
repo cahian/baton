@@ -20,6 +20,10 @@ monthly_budget_usd = 200   # what the organization holds
 reserve_pct = 10           # kept back; the spend ceiling is 200 - 10% = 180
 budget_reset_day = 1       # day of the month the period starts, 00:00 UTC
 round_budget_usd = 5       # most one round may spend (a killed round counts all of it)
+reserve = false            # true: Claude waits for the others, and runs only while they are out
+turn_max_s = 18000         # a turn ends after this long (every agent has it): 5 hours
+turn_budget_usd = 50       # or after this much spent in the turn
+goal_budget_usd = 150      # after this much in one goal, Claude is left out until the goal changes
 key_file = "~/.config/baton/anthropic.key"   # must be a regular file, mode 600
 admin_key_file = ""        # optional: an Admin API key file, to cross-check spend with the Console
 
@@ -29,6 +33,7 @@ model = "gemini-4-argon-medium"
 build_model = "gemini-3.8-flash-high"   # must start with gemini-
 threshold_pct = 90
 poll_s = 30
+turn_max_s = 18000
 
 [agents.codex]
 enabled = true
@@ -38,6 +43,7 @@ build_model = "gpt-6.1-terra"
 build_effort = "high"
 threshold_pct = 90
 poll_s = 15
+turn_max_s = 18000
 
 # Superpowers is required (git clone https://github.com/obra/superpowers ~/.config/baton/superpowers).
 # Leave `dir` empty: only the official Claude Code plugin install and that clone are found

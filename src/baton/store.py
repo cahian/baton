@@ -46,6 +46,38 @@ def state_dir(name: str) -> Path:
     return state_base() / name
 
 
+# restart: one request for the whole gateway, not for a goal
+
+# Hidden: no goal can be named with a leading dot, so no job directory is ever this file.
+RESTART_FILE = ".restart"
+
+
+def restart_path() -> Path:
+    return state_base() / RESTART_FILE
+
+
+def request_restart(now: bool = False) -> None:
+    """Ask the gateway to restart once its running jobs are between rounds, or, with `now`, at once
+    (the jobs are resumed either way: a restart is never a stop)."""
+    if not now and restart_request() == "now":
+        return  # never downgrade
+    state_base().mkdir(parents=True, exist_ok=True, mode=0o700)
+    _atomic_write(restart_path(), "now\n" if now else "soon\n")
+
+
+def restart_request() -> str:
+    """ "" when none, "now" when forced, otherwise "soon"."""
+    try:
+        content = restart_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return "now" if content == "now" else "soon"
+
+
+def clear_restart() -> None:
+    restart_path().unlink(missing_ok=True)
+
+
 # Directories in use, across every process: one claim file per running goal, flocked by its
 # runner for as long as it runs, so a claim ends with the process however that dies.
 WORKDIRS_DIR = ".workdirs"
@@ -167,6 +199,11 @@ class Store:
         self._stop = self.root / "stop"
         self._interrupt = self.root / "interrupt"
         self._job = self.root / "job.json"
+        self._goal = self.root / "goal.md"
+        self._goal_done = self.root / "goal.done.md"
+        self._terms_reset = self.root / "terms.reset"
+        self._first_check = self.root / "verify.first.sh"
+        self._next = self.root / "next"
         self._seq = max(self._last_seq(self._events), self._last_seq(self._rotated))
 
     # events
@@ -354,7 +391,7 @@ class Store:
     # interrupt
 
     def request_interrupt(self) -> None:
-        """Ask the runner to end the current round now."""
+        """Ask the runner to end the current round, once the tool call in flight is done."""
         _atomic_write(self._interrupt, "1\n")
 
     def take_interrupt(self) -> bool:
@@ -364,6 +401,97 @@ class Store:
         except FileNotFoundError:
             return False
         return True
+
+    # goal
+
+    def set_goal(self, text: str) -> None:
+        """Pin the goal the person fixed: every prompt opens with it until they change it. Saying
+        it again also accepts the goal's terms as they are now: the runner takes the mark."""
+        _atomic_write(self._goal, text.strip() + "\n")
+        _atomic_write(self._terms_reset, "1\n")
+
+    def take_terms_reset(self) -> bool:
+        """True, once, after the goal was set (again): its terms are to be saved as they are."""
+        try:
+            self._terms_reset.unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def read_goal(self) -> str | None:
+        """The pinned goal, "" when none is set, and None when it exists but cannot be read."""
+        try:
+            return self._goal.read_text(encoding="utf-8", errors="replace").strip()
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            return None
+
+    def goal(self) -> str:
+        """The pinned goal, "" when none is set (the goal is on while this is not empty)."""
+        return self.read_goal() or ""  # unreadable is no goal, as an unreadable handoff is none
+
+    def clear_goal(self) -> None:
+        self._goal.unlink(missing_ok=True)
+
+    def archive_goal(self) -> None:
+        """Keep a goal that ended in `goal.done.md` and leave none pinned."""
+        try:
+            os.replace(self._goal, self._goal_done)
+        except FileNotFoundError:
+            pass
+
+    def first_check_path(self) -> Path:
+        """Where the first version of the check is kept."""
+        return self._first_check
+
+    def first_check(self) -> str | None:
+        """The first version of the goal's check (`.baton/VERIFY.sh`), None when none was kept or
+        it cannot be read."""
+        try:
+            return self._first_check.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def keep_first_check(self, text: str) -> None:
+        """Keep `text` as the first version of the check, unless one is kept already."""
+        if not self._first_check.exists():
+            _atomic_write(self._first_check, text)
+
+    def drop_first_check(self) -> None:
+        """Forget the first version: a new goal begins with a check of its own."""
+        self._first_check.unlink(missing_ok=True)
+
+    # next
+
+    def request_next(self, now: bool = False) -> None:
+        """Ask for the next agent in the queue. `now` does not wait for the round to end."""
+        if not now and self._next.exists():
+            return  # a request already waits, and never downgrade a `now`
+        _atomic_write(self._next, "now\n" if now else "soon\n")
+
+    def next_pending(self) -> bool:
+        """Whether a request for the next agent waits, without taking it."""
+        return self._next.exists()
+
+    def take_next(self) -> str:
+        """The pending request, cleared: "" when none, "now" when forced, otherwise "soon"."""
+        try:
+            content = self._next.read_text(encoding="utf-8").strip()
+            self._next.unlink()
+        except FileNotFoundError:
+            return ""
+        return "now" if content == "now" else "soon"
+
+    # restart
+
+    def restart_pending(self) -> bool:
+        """Whether a restart waits for this run to hold. Only the gateway's jobs say yes: a
+        runner outside it has nothing to restart."""
+        return False
+
+    def report_held(self, held: bool) -> None:
+        """This run is, or no longer is, at a point between rounds where a restart may happen."""
 
     # lock
 

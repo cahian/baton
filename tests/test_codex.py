@@ -576,6 +576,12 @@ def test_the_allowed_models_reach_every_round_as_the_pair(fake, tmp_path, tier, 
     assert any(a.startswith("hooks.PreToolUse=") for a in call["argv"])
 
 
+def test_the_round_carries_baton_round_in_its_environment(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("BATON_ROUND", "")
+    adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path))
+    assert fake.exec_calls()[0]["baton_env"]["BATON_ROUND"] == "1"
+
+
 def test_the_hook_is_given_per_run_with_no_file_written(fake, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path))
@@ -1111,3 +1117,41 @@ def test_calls_without_an_id_are_never_deduplicated(fake, tmp_path, monkeypatch)
         fake, tmp_path, monkeypatch, [anonymous("gpt-6.1-terra"), anonymous("gpt-6.1-terra")]
     )
     assert len(seen) == 2
+
+
+# --- the tool watch --------------------------------------------------------------------------
+
+
+def item_line(kind, ident, item_type="command_execution"):
+    return json.dumps({"type": kind, "item": {"id": ident, "type": item_type, "command": "ls"}})
+
+
+def test_a_command_is_busy_from_started_to_completed():
+    watch = CodexAdapter(make_cfg()).tool_watch()
+    assert watch.busy is False
+    watch.feed(item_line("item.started", "item_1"))
+    assert watch.busy is True
+    watch.feed(item_line("item.completed", "item_1"))
+    assert watch.busy is False
+
+
+def test_a_parallel_pair_of_commands_stays_busy_until_both_end():
+    watch = CodexAdapter(make_cfg()).tool_watch()
+    watch.feed(item_line("item.started", "item_1"))
+    watch.feed(item_line("item.started", "item_2"))
+    watch.feed(item_line("item.completed", "item_1"))
+    assert watch.busy is True
+    watch.feed(item_line("item.completed", "item_2"))
+    assert watch.busy is False
+
+
+def test_an_agent_message_and_noise_are_not_a_tool():
+    watch = CodexAdapter(make_cfg()).tool_watch()
+    for line in (
+        item_line("item.started", "item_3", "agent_message"),
+        json.dumps({"type": "turn.started"}),
+        '{"type":"item.started","item":{"type":"command_execution"}}',  # no id to close it by
+        "plain stderr text",
+    ):
+        watch.feed(line)
+    assert watch.busy is False

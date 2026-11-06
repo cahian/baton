@@ -455,6 +455,12 @@ def test_key_reaches_only_its_process(env, monkeypatch):
     assert KEY not in os.environ.values()  # not in baton's own environment either
 
 
+def test_the_round_carries_baton_round_in_its_environment(env, monkeypatch):
+    monkeypatch.setenv("BATON_ROUND", "")
+    run(env)
+    assert env.calls()[0]["env"]["BATON_ROUND"] == "1"
+
+
 def test_key_is_never_on_the_command_line(env):
     run(env, session_id="abc")
     assert KEY not in json.dumps(env.calls()[0]["argv"])
@@ -514,6 +520,12 @@ def test_key_never_in_an_error_event(fakes):
 # --- availability ----------------------------------------------------------------------------
 
 
+def test_reserve_is_the_configured_one_and_off_by_default(env):
+    assert make_adapter(env).reserve is False
+    assert make_adapter(env, reserve=True).reserve is True
+    assert make_adapter(env).metered is True  # paid by use, whether or not it waits
+
+
 def test_availability_is_ok_and_describes_the_spend(env):
     avail = make_adapter(env).availability()
     assert avail.ok
@@ -523,14 +535,19 @@ def test_availability_is_ok_and_describes_the_spend(env):
 
 def test_disabled_is_unavailable(env):
     avail = make_adapter(env, enabled=False).availability()
-    assert not avail.ok and "disabled" in avail.reason
+    assert not avail.ok and "disabled" in avail.reason and avail.permanent
     assert env.calls() == []
+
+
+def test_a_round_budget_below_the_minimum_is_permanently_unavailable(env):
+    avail = make_adapter(env, round_budget_usd=Decimal("0.01")).availability()
+    assert not avail.ok and "minimum" in avail.reason and avail.permanent
 
 
 def test_wrong_mode_key_is_unavailable(env):
     env.key.chmod(0o644)
     avail = make_adapter(env).availability()
-    assert not avail.ok and "600" in avail.reason
+    assert not avail.ok and "600" in avail.reason and avail.permanent
     assert avail.until == NOW + 3600
     assert KEY not in avail.reason
 
@@ -540,6 +557,7 @@ def test_missing_key_is_unavailable_and_nonblocking(env, tmp_path):
     adapter = make_adapter(env)
     avail = adapter.availability()
     assert not avail.ok and "not found" in avail.reason and avail.until == NOW + 3600
+    assert avail.permanent  # no key: it will not run until the person adds one
 
     from baton.adapters.base import Availability
     from baton.scheduler import Scheduler
@@ -548,6 +566,7 @@ def test_missing_key_is_unavailable_and_nonblocking(env, tmp_path):
     class Other:
         name = "codex"
         metered = False
+        reserve = False
 
         def availability(self):
             return Availability(True)
@@ -675,10 +694,161 @@ def test_result_settles_actual_cost(env, monkeypatch):
     assert json.loads(env.ledger.path.read_text())["reservations"] == {}
 
 
+def test_the_result_carries_what_the_stream_reported_as_cost(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "0.125")
+    assert run(env).cost_usd == 0.125
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "12.5")
+    assert run(env).cost_usd == 12.5  # over the cap, as the ledger charges it
+
+
+def test_a_round_that_kept_its_reservation_carries_the_reservation_as_cost(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    result = run(env)
+    assert result.outcome == TRANSIENT and result.cost_usd == 10.0  # what the ledger counts
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_a_timeout_carries_the_reservation_as_cost(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    result = run(env, round_max_s=1)
+    assert result.outcome == TIMEOUT and result.cost_usd == 10.0
+
+
+def test_a_killed_round_carries_the_reservation_as_cost(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    seen = threading.Event()
+    result = run(env, should_kill=seen.is_set, on_spawn=lambda pid: seen.set())
+    assert result.cost_usd == 10.0
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_a_process_that_started_and_died_carries_the_reservation_as_cost(env, monkeypatch):
+    def boom(argv, workdir, prompt, ctx, *args, **kwargs):
+        ctx.on_spawn(1)
+        raise OSError("gone")
+
+    monkeypatch.setattr(claude_api, "run_streaming", boom)
+    result = run(env)
+    assert result.outcome == TRANSIENT and result.cost_usd == 10.0
+
+
+def test_a_round_that_never_reached_the_api_costs_nothing(env):
+    adapter = make_adapter(env, bin=str(env.root / "missing"))
+    result = run(env, adapter)
+    assert result.cost_usd == 0.0 and env.ledger.spent() == 0
+
+
+def test_the_reservation_that_shrank_is_the_cost_that_is_carried(env, monkeypatch):
+    env.ledger.reserve(Decimal("174"))  # 6 USD of the 180 ceiling are left
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    assert run(env).cost_usd == 6.0
+
+
+def test_a_failed_resume_carries_the_cost_it_reported(env, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_NO_INIT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_NO_ASSISTANT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_ERROR_TEXT", "No conversation found")
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "0.75")
+    result = run(env, session_id="gone")
+    assert result.resume_failed is True and result.cost_usd == 0.75
+
+
 def test_cost_over_the_cap_is_charged_in_full(env, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_COST", "12.5")
     run(env)
     assert env.ledger.spent() == Decimal("12.5")
+
+
+def resumed_round(env, monkeypatch, total, last, saved):
+    """A resumed round of session s1 that reports `total`, after one that reported `last`."""
+    monkeypatch.setenv("FAKE_CLAUDE_COST", total)
+    return run(
+        env,
+        session_id="s1",
+        session_total=None if last is None else Decimal(last),
+        on_session_total=lambda session, amount: saved.append((session, amount)),
+    )
+
+
+def test_a_resumed_round_is_charged_what_it_added_to_the_sessions_total(env, monkeypatch):
+    saved = []
+    first = resumed_round(env, monkeypatch, "5", None, saved)  # no saved total: the whole figure
+    second = resumed_round(env, monkeypatch, "10", "5", saved)
+    third = resumed_round(env, monkeypatch, "15", "10", saved)
+    assert [first.cost_usd, second.cost_usd, third.cost_usd] == [5.0, 5.0, 5.0]
+    assert env.ledger.spent() == Decimal("15")  # real spend, not 5 + 10 + 15
+    assert saved == [("s1", Decimal("5")), ("s1", Decimal("10")), ("s1", Decimal("15"))]
+
+
+def charged_sequence(env, monkeypatch, totals):
+    """The charge of each resumed round that reports the next total, each one handed the total
+    the runner would have saved: the last non-zero one."""
+    saved, last, charges = [], None, []
+    for total in totals:
+        before = len(saved)
+        charges.append(resumed_round(env, monkeypatch, total, last, saved).cost_usd)
+        if len(saved) > before:
+            last = str(saved[-1][1])
+    return charges, saved
+
+
+@pytest.mark.parametrize(
+    "totals,charges",
+    [
+        (["40", "45", "0", "50"], [40.0, 5.0, 0.0, 5.0]),  # a zero (a crash) is ignored
+        (["40", "45", "3", "8"], [40.0, 5.0, 3.0, 5.0]),  # a lower one is a restarted counter
+    ],
+)
+def test_a_zero_total_is_ignored_and_a_restarted_counter_is_charged_whole(
+    env, monkeypatch, totals, charges
+):
+    got, saved = charged_sequence(env, monkeypatch, totals)
+    assert got == charges
+    assert env.ledger.spent() == Decimal(str(sum(charges)))
+    assert all(total > 0 for _, total in saved)  # a zero is never saved
+
+
+def test_a_killed_round_saves_no_total_and_counts_its_grant(env, monkeypatch):
+    saved = []
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    result = run(
+        env,
+        session_id="s1",
+        session_total=Decimal("5"),
+        on_session_total=lambda session, amount: saved.append((session, amount)),
+    )
+    assert saved == [] and result.cost_usd == 10.0
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_the_turn_limit_trips_at_the_real_fifty_dollars_of_a_resumed_session(
+    tmp_path, monkeypatch, env
+):
+    from test_runner import CLAUDE_FIRST, Fake, World, done, make_goal
+
+    from baton.runner import run_goal
+    from baton.store import Store
+
+    work = tmp_path / "work"
+    work.mkdir()
+    world, store = World(), Store(tmp_path / "state")
+    monkeypatch.setenv("FAKE_CLAUDE_STEP", "5")
+    monkeypatch.setenv("FAKE_CLAUDE_TOTALS", str(tmp_path / "totals.json"))
+    codex = Fake("codex")
+    codex.script = [done(work)]
+    claude = make_adapter(env)
+    goal = make_goal(tmp_path, work, order=CLAUDE_FIRST)
+    # Claude's rounds report 5, 10, 15 ... for one session: each one really spent 5.
+    assert (
+        run_goal(goal, {"codex": codex, "claude_api": claude}, store, world.clock, world.sleep) == 0
+    )
+    rounds = [e for e in store.events() if e["kind"] == "round_end" and e["agent"] == "claude_api"]
+    assert len(rounds) == 10 and {e["cost_usd"] for e in rounds} == {5.0}
+    assert env.ledger.spent() == Decimal("50")
+    (rotation,) = [e for e in store.events() if e["kind"] == "rotation"]
+    assert rotation["reason"] == "USD 50"
+    assert store.load_state()["session_totals"] == {"sess-1": "50"}
 
 
 def test_budget_cap_reached_settles_and_counts_as_completed(env, monkeypatch):
@@ -1400,3 +1570,58 @@ def test_a_round_cut_off_by_its_budget_is_bounded_but_still_completed_for_the_sc
 
 def test_a_normal_round_is_not_bounded(env):
     assert run(env).bounded is False
+
+
+# --- the tool watch --------------------------------------------------------------------------
+
+
+def assistant_blocks(*blocks):
+    return json.dumps({"type": "assistant", "message": {"role": "assistant", "content": blocks}})
+
+
+def user_blocks(*blocks):
+    return json.dumps({"type": "user", "message": {"role": "user", "content": blocks}})
+
+
+def use(ident, name="Bash"):
+    return {"type": "tool_use", "id": ident, "name": name, "input": {"command": "ls"}}
+
+
+def returned(ident):
+    return {"type": "tool_result", "tool_use_id": ident, "content": "ok"}
+
+
+def new_watch(env):
+    return make_adapter(env).tool_watch()
+
+
+def test_a_tool_use_is_busy_until_its_result_comes_back(env):
+    watch = new_watch(env)
+    assert watch.busy is False
+    watch.feed(assistant_blocks({"type": "text", "text": "running it"}, use("toolu_1")))
+    assert watch.busy is True
+    watch.feed(user_blocks(returned("toolu_1")))
+    assert watch.busy is False
+
+
+def test_a_parallel_pair_of_tool_uses_stays_busy_until_both_return(env):
+    watch = new_watch(env)
+    watch.feed(assistant_blocks(use("toolu_1"), use("toolu_2", "Read")))
+    watch.feed(user_blocks(returned("toolu_2")))
+    assert watch.busy is True
+    watch.feed(user_blocks(returned("toolu_1")))
+    assert watch.busy is False
+
+
+def test_text_only_events_and_noise_are_not_busy(env):
+    watch = new_watch(env)
+    for line in (
+        assistant_blocks({"type": "text", "text": "hello"}),
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "assistant", "message": "not a dict"}),
+        json.dumps({"type": "user", "message": {"content": "just a string"}}),
+        assistant_blocks("junk", {"type": "tool_use", "name": "Bash"}),  # no id to close it by
+        "plain stderr text",
+    ):
+        watch.feed(line)
+    assert watch.busy is False

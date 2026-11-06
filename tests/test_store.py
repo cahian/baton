@@ -11,6 +11,11 @@ from baton.store import (
     StateError,
     Store,
     WorkdirBusy,
+    clear_restart,
+    request_restart,
+    restart_path,
+    restart_request,
+    state_base,
     state_dir,
     workdir_conflict,
     workdir_lock,
@@ -293,3 +298,123 @@ def test_a_claim_that_cannot_be_read_counts_as_busy(tmp_path):
         base = store_mod.state_base() / store_mod.WORKDIRS_DIR
         next(base.glob("*.claim")).write_text("{ not json")
         assert workdir_conflict(tmp_path / "anything") is not None
+
+
+def test_no_goal_until_one_is_set(st):
+    assert st.goal() == ""
+    st.set_goal("  ship the parser\nand its tests \n")
+    assert st.goal() == "ship the parser\nand its tests"
+    assert (st.root / "goal.md").read_text(encoding="utf-8").strip() == st.goal()
+
+
+def test_a_goal_set_again_replaces_the_old_one_atomically(st):
+    st.set_goal("one")
+    st.set_goal("two")
+    assert st.goal() == "two"
+    assert [p.name for p in st.root.iterdir() if p.name.startswith(".goal")] == []
+
+
+def test_a_blank_goal_counts_as_none(st):
+    st.set_goal("x")
+    (st.root / "goal.md").write_text(" \n\n", encoding="utf-8")
+    assert st.goal() == ""
+
+
+def test_clear_goal_is_safe_with_none(st):
+    st.clear_goal()
+    st.set_goal("x")
+    st.clear_goal()
+    assert st.goal() == "" and not (st.root / "goal.md").exists()
+
+
+def test_archive_goal_moves_it_aside_for_the_record(st):
+    st.archive_goal()  # nothing to move
+    assert not (st.root / "goal.done.md").exists()
+    st.set_goal("done work")
+    st.archive_goal()
+    assert st.goal() == ""
+    assert (st.root / "goal.done.md").read_text(encoding="utf-8").strip() == "done work"
+    st.set_goal("second goal")
+    st.archive_goal()
+    assert (st.root / "goal.done.md").read_text(encoding="utf-8").strip() == "second goal"
+
+
+def test_next_is_taken_once_and_remembers_now(st):
+    assert st.take_next() == ""
+    st.request_next(False)
+    assert st.take_next() == "soon"
+    assert st.take_next() == ""
+    st.request_next(True)
+    assert st.take_next() == "now"
+
+
+def test_read_goal_tells_no_goal_from_a_goal_that_cannot_be_read(st):
+    assert st.read_goal() == ""  # none set
+    st.set_goal("ship it")
+    assert st.read_goal() == "ship it"
+    st.clear_goal()
+    (st.root / "goal.md").mkdir()  # whatever makes it unreadable
+    assert st.read_goal() is None
+    assert st.goal() == ""  # the old reading, unchanged
+
+
+def test_next_pending_looks_without_taking(st):
+    assert st.next_pending() is False
+    st.request_next(False)
+    assert st.next_pending() is True and st.next_pending() is True
+    assert st.take_next() == "soon" and st.next_pending() is False
+
+
+def test_a_later_plain_next_does_not_downgrade_a_pending_next_now(st):
+    st.request_next(True)
+    st.request_next(False)
+    assert st.take_next() == "now"
+    st.request_next(False)
+    st.request_next(True)  # but an upgrade is kept
+    assert st.take_next() == "now"
+
+
+def test_an_unreadable_goal_file_counts_as_no_goal(st):
+    (st.root / "goal.md").mkdir()  # reading it is an OSError, not a missing file
+    assert st.goal() == ""
+
+
+def test_the_first_version_of_the_check_is_kept_once_and_can_be_dropped(st):
+    assert st.first_check() is None
+    st.keep_first_check("fps >= 30\n")
+    st.keep_first_check("fps >= 3\n")  # a later version never replaces it
+    assert st.first_check() == "fps >= 30\n"
+    assert (st.root / "verify.first.sh").read_text() == "fps >= 30\n"
+    st.drop_first_check()
+    assert st.first_check() is None
+    st.drop_first_check()  # nothing to drop is fine
+    st.keep_first_check("new goal\n")
+    assert st.first_check() == "new goal\n"
+
+
+def test_a_restart_request_is_a_file_in_the_state_base_and_never_a_job_s(st):
+    assert restart_request() == "" and restart_path().parent == state_base()
+    assert restart_path().name == ".restart"  # no goal name can start with a dot
+    request_restart()
+    assert restart_request() == "soon" and restart_path().read_text() == "soon\n"
+    request_restart(now=True)
+    assert restart_request() == "now"
+    clear_restart()
+    clear_restart()  # nothing to remove is not an error
+    assert restart_request() == ""
+    request_restart()
+    assert not st.restart_pending()  # a plain store (a `baton run`) never holds for it
+    st.report_held(True)  # and has nobody to tell
+
+
+def test_a_goal_named_restart_does_not_meet_the_request_file(st):
+    state_dir("restart").mkdir(parents=True)  # a job with the name of the old file
+    request_restart()
+    assert restart_request() == "soon" and state_dir("restart").is_dir()
+    clear_restart()
+    assert state_dir("restart").is_dir()
+
+
+def test_a_restart_request_that_cannot_be_read_is_none(st):
+    restart_path().mkdir(parents=True)  # whatever sits there, reading it never raises
+    assert restart_request() == ""

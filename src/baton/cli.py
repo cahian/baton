@@ -14,17 +14,27 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from baton import runner as runner_module
 from baton.adapters.antigravity import AntigravityAdapter
 from baton.adapters.base import Adapter
 from baton.adapters.claude_api import ClaudeApiAdapter, ledger_for, make_cost_report
 from baton.adapters.codex import CodexAdapter
 from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_goal_ref
 from baton.doctor import run_checks
-from baton.gateway import DEFAULT_PORT, opencode_config, serve
-from baton.runner import preempted_sentence, run_goal
+from baton.gateway import DEFAULT_PORT, build_goal, opencode_config, serve
+from baton.proc import ROUND_VARIABLE
+from baton.runner import pin_goal, preempted_sentence, run_goal
 from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
-from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
+from baton.store import (
+    AlreadyRunning,
+    StateError,
+    Store,
+    request_restart,
+    restart_path,
+    state_base,
+    state_dir,
+)
 
 STATUS_EVENTS = 8
 
@@ -197,6 +207,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 # status, say, stop
 
 
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
 def _when(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -231,7 +247,7 @@ def _event_line(event: dict) -> str:
     stamp = datetime.fromtimestamp(float(event.get("ts", 0)), UTC).strftime("%H:%M:%S")
     if event.get("kind") == "round_end" and event.get("outcome") == "preempted":
         return f"  {stamp} {preempted_sentence(event)}"
-    skip = {"ts", "seq", "kind", "text", "tail", "agents"}
+    skip = {"ts", "seq", "kind", "text", "fragment", "tail", "agents"}
     details = " ".join(
         f"{k}={v}" for k, v in event.items() if k not in skip and v not in (None, "")
     )
@@ -288,6 +304,14 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
             print(f"    reason: {info['reason']}")
         if info.get("usage"):
             print(f"    usage: {json.dumps(info['usage'], sort_keys=True)}")
+    turn = state.get("turn")
+    if isinstance(turn, dict) and turn.get("agent") and _number(turn.get("worked_s")) is not None:
+        worked, spent = _number(turn["worked_s"]), _number(turn.get("spent")) or 0.0
+        print(f"turn: {turn['agent']}, {worked / 3600:.1f} hours worked, USD {spent:.2f} spent")
+    dropped = state.get("dropped")
+    if isinstance(dropped, list) and any(isinstance(a, str) for a in dropped):
+        names = ", ".join(a for a in dropped if isinstance(a, str))
+        print(f"left out of the queue for this goal: {names}")
     phase = state.get("phase")
     if isinstance(phase, dict) and isinstance(phase.get("phase"), str):
         print(f"phase: {phase['phase']} (review cycles used: {phase.get('cycles', 0)})")
@@ -295,7 +319,7 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
     if frees is not None:
         print(
             f"preemption cap: Claude was ended {MAX_PREEMPTS_PER_DAY} times in the last 24 hours "
-            f"to give way to a plan agent, so it is not ended again before {_when(frees)}"
+            f"to give way to another agent, so it is not ended again before {_when(frees)}"
         )
     if state.get("verify_warning"):
         print(f"warning: {state['verify_warning']}")
@@ -372,9 +396,68 @@ def cmd_say(args: argparse.Namespace) -> int:
     store.say(text)
     if args.now:
         store.request_interrupt()
-        print("note added; the current round is interrupted")
+        print("note added; it reaches the agent after the current tool call or in the next round")
     else:
         print("note added; it is delivered with the next round")
+    return 0
+
+
+def _job_workdir(store: Store) -> Path | None:
+    """The directory a job's job.json names, for filing a big goal there."""
+    try:
+        record = store.load_job()
+    except StateError:
+        return None
+    directory = record.get("workdir") if record else None
+    return Path(directory) if isinstance(directory, str) and directory else None
+
+
+def _goal_refusal(name: str, ref: GoalRef | None, workdir: Path | None) -> str:
+    """Why this goal may not be set, "" when it may. Whatever cannot be read here is the run's to
+    report, not a reason to refuse."""
+    try:
+        if ref is not None:
+            goal = load_goal(ref.path)
+        elif workdir is not None:
+            goal = build_goal(name, workdir, "a goal")
+        else:
+            return ""
+    except GoalError:
+        return ""
+    return runner_module.goal_refusal(goal)
+
+
+def cmd_goal(args: argparse.Namespace) -> int:
+    name, ref = _resolve(args.goal_target)
+    text = " ".join(args.text).strip()
+    if args.off == bool(text):
+        _err("give the goal's text, or --off to clear it (not both)")
+        return 2
+    store = Store(state_dir(name))
+    if args.off:
+        store.clear_goal()
+        print("goal cleared; the next round's prompt no longer carries it")
+    else:
+        workdir = ref.workdir if ref else _job_workdir(store)
+        refusal = _goal_refusal(name, ref, workdir)
+        if refusal:
+            _err(refusal)
+            return 2
+        if workdir is None:
+            store.set_goal(text)  # nowhere to file a big one: pinned whole
+        else:
+            pin_goal(store, workdir, text, time.time())
+        print("goal set; every prompt from the next round opens with it")
+    return 0
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    name, _ = _resolve(args.goal)
+    store = Store(state_dir(name))
+    store.request_next(now=args.now)
+    if args.now:
+        store.request_interrupt()
+    print("next requested" + (" now: after the current tool call" if args.now else ""))
     return 0
 
 
@@ -383,6 +466,17 @@ def cmd_stop(args: argparse.Namespace) -> int:
     store = Store(state_dir(name))
     store.request_stop(now=args.now)
     print("stop requested" + (" now" if args.now else " after the current round"))
+    return 0
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    request_restart(now=args.now)
+    when = (
+        "without waiting for the jobs" if args.now else "once every running job is between rounds"
+    )
+    print(f"restart requested ({restart_path()}): the gateway restarts {when}")
+    print("jobs are resumed after it; launchd brings the service back, and with no gateway running")
+    print("the request is dropped at the next start")
     return 0
 
 
@@ -466,14 +560,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("say", help="leave a note for the next round")
     p.add_argument("goal", help="goal file, or a job name such as session-<id>")
-    p.add_argument("--now", action="store_true", help="also interrupt the current round")
+    p.add_argument(
+        "--now", action="store_true", help="also end the current round after its tool call"
+    )
     p.add_argument("text", nargs="+", help="the note")
     p.set_defaults(func=cmd_say)
+
+    p = sub.add_parser("goal", help="fix the goal every prompt opens with, or clear it")
+    p.add_argument(
+        "goal_target", metavar="goal", help="goal file, or a job name such as session-<id>"
+    )
+    p.add_argument("--off", action="store_true", help="clear the goal instead of setting one")
+    p.add_argument("text", nargs="*", help="the goal")
+    p.set_defaults(func=cmd_goal)
+
+    p = sub.add_parser("next", help="ask for the next agent in the queue")
+    p.add_argument("goal", help="goal file, or a job name such as session-<id>")
+    p.add_argument(
+        "--now", action="store_true", help="also end the current round after its tool call"
+    )
+    p.set_defaults(func=cmd_next)
 
     p = sub.add_parser("stop", help="request a stop")
     p.add_argument("goal", help="goal file, or a job name such as session-<id>")
     p.add_argument("--now", action="store_true", help="kill the current round")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("restart", help="restart the gateway once its jobs are between rounds")
+    p.add_argument(
+        "--now", action="store_true", help="do not wait for the jobs to be between rounds"
+    )
+    p.set_defaults(func=cmd_restart)
 
     p = sub.add_parser("install-service", help="run `baton serve` under launchd (macOS)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -485,8 +602,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# The commands that steer a goal: an agent's own shell has no business running them.
+STEERING = ("cmd_goal", "cmd_next", "cmd_restart", "cmd_stop")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if os.environ.get(ROUND_VARIABLE) and args.func.__name__ in STEERING:
+        _err("refused: this runs inside an agent's round, and only the person steers a goal")
+        return 2
     try:
         return args.func(args)
     except GoalError as exc:

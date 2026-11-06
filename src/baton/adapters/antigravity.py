@@ -33,6 +33,7 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    ToolWatch,
     check_subagent,
     find_model,
     tier_config,
@@ -374,6 +375,36 @@ def _parse_event(line: str) -> dict | None:
     return event if isinstance(event, dict) else None
 
 
+# A tool line shows at most this much of its value: a command can be a whole script.
+BRIEF_CHARS = 200
+
+
+def _brief(value: str) -> str:
+    stripped = value.strip()
+    shown = stripped.splitlines()[0][:BRIEF_CHARS]  # any break, a bare \r would overwrite text
+    return shown if shown == stripped else f"{shown} …"
+
+
+def _tool_line(step: dict) -> str | None:
+    """One line for a tool step as it starts (ACTIVE; its DONE shows nothing), or None."""
+    name = step.get("tool_name")
+    if step.get("step_type") != "tool" or step.get("state") != "ACTIVE":
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    info = step.get("tool_info")
+    params = info.get("parameters") if isinstance(info, dict) else None
+    if not isinstance(params, dict):
+        params = {}
+    command = params.get("CommandLine")
+    if name == "run_command" and isinstance(command, str) and command.strip():
+        return f"$ {_brief(command)}"
+    for value in params.values():
+        if isinstance(value, str) and value.strip():
+            return f"{name}: {_brief(value)}"
+    return name
+
+
 # The tools that start or manage a subagent, as `step_update` names them.
 SUBAGENT_TOOLS = ("define_subagent", "invoke_subagent", "manage_subagents")
 
@@ -401,9 +432,81 @@ def _payload(event: dict) -> dict:
     return inner if isinstance(inner, dict) else {}
 
 
+# What agy says when the only thing keeping it alive is background tasks.
+_WAITING_RE = re.compile(r"waiting for (\d+) background task", re.IGNORECASE)
+_TASK_LINE_RE = re.compile(r"^Task: *(\S+)", re.MULTILINE)
+_STATUS_LINE_RE = re.compile(r"^Status: *(\S+)", re.MULTILINE)
+
+
+class _ToolWatch(ToolWatch):
+    """A tool step is open from its ACTIVE to any other state. A background task outlives its step:
+    `manage_task` reports it RUNNING until it is DONE, ends in another status or is killed. And
+    agy says when it only waits for tasks, which holds until a task goes or a tool starts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tasks: set[str] = set()
+        self.waiting = False
+
+    @property
+    def busy(self) -> bool:
+        return bool(self.open) or bool(self.tasks) or self.waiting
+
+    def feed(self, line: str) -> None:
+        event = _parse_event(line)
+        if event is None:
+            self._waiting_text(line)  # agy prints it as a plain line
+            return
+        if event.get("event") != "step_update":
+            return
+        step = _payload(event)
+        delta = step.get("text_delta")
+        if isinstance(delta, str):
+            self._waiting_text(delta)
+            return
+        name = step.get("tool_name")
+        index = step.get("step_index")
+        if not isinstance(name, str) or not name or index is None:
+            return
+        key = (step.get("conversation_id"), index)
+        state = step.get("state")
+        if state == "ACTIVE":
+            self.open.add(key)
+            self.waiting = False
+        elif isinstance(state, str):
+            self.open.discard(key)  # DONE, or ERROR and the like: real logs have both
+            if state == "DONE" and name == "manage_task":
+                self._task(step)
+
+    def _waiting_text(self, text: str) -> None:
+        found = _WAITING_RE.search(text)
+        if found and int(found.group(1)) > 0:
+            self.waiting = True
+
+    def _task(self, step: dict) -> None:
+        info = step.get("tool_info")
+        info = info if isinstance(info, dict) else {}
+        params = info.get("parameters")
+        params = params if isinstance(params, dict) else {}
+        output = info.get("output")
+        output = output if isinstance(output, str) else ""
+        named = _TASK_LINE_RE.search(output)
+        given = params.get("TaskId")
+        task = named.group(1) if named else given if isinstance(given, str) else ""
+        status = _STATUS_LINE_RE.search(output)
+        if not task:
+            return
+        if params.get("Action") == "kill" or (status and status.group(1) != "RUNNING"):
+            self.tasks.discard(task)
+            self.waiting = False
+        elif status:
+            self.tasks.add(task)
+
+
 class AntigravityAdapter:
     name = "antigravity"
     metered = False
+    reserve = False
     # Seconds between the runner's checks; the limits are read every cfg.poll_s of poll_clock.
     tick_s = 1.0
 
@@ -432,7 +535,9 @@ class AntigravityAdapter:
 
     def availability(self) -> Availability:
         if not self.cfg.enabled:
-            return Availability(False, reason="antigravity is disabled in the goal file")
+            return Availability(
+                False, reason="antigravity is disabled in the goal file", permanent=True
+            )
         now = self._wall_clock()
         try:
             return _evaluate(self._read(), self.cfg.threshold_pct, now).avail
@@ -464,11 +569,12 @@ class AntigravityAdapter:
         guard = Guard(self.cfg, self._read, _evaluate, self._poll_clock, self._wall_clock)
         problems: deque[str] = deque(maxlen=MAX_PROBLEMS)
         reported = False
+        worked = False  # this attempt printed a step: whatever ends it, it did work
         final: dict | None = None
         subagents: set[tuple] = set()
 
         def on_line(line: str) -> RoundResult | None:
-            nonlocal reported, final
+            nonlocal reported, worked, final
             event = _parse_event(line)
             if event is None:
                 if line.strip():
@@ -476,13 +582,24 @@ class AntigravityAdapter:
                 return None
             kind = event.get("event")
             if kind == "init" and not reported:
-                cid = _payload(event).get("conversation_id")
-                if isinstance(cid, str) and cid:
-                    reported = True
-                    ctx.on_session(cid)
+                # agy puts the id at the top level of init; the payload is the older place.
+                for cid in (event.get("conversation_id"), _payload(event).get("conversation_id")):
+                    if isinstance(cid, str) and cid:
+                        reported = True
+                        if ctx.session_id is not None and cid != ctx.session_id:
+                            # An id agy does not know is not an error to it: it starts a new
+                            # conversation and runs, but a resumed prompt lacks the objective.
+                            return RoundResult(
+                                TRANSIENT,
+                                reason=f"conversation {ctx.session_id} not found; agy began {cid}",
+                                resume_failed=True,
+                            )
+                        ctx.on_session(cid)
+                        break
             elif kind == "result":
                 final = _payload(event)
             elif kind == "step_update":
+                worked = True
                 return self._subagent(event, ctx, subagents)
             return None
 
@@ -495,7 +612,7 @@ class AntigravityAdapter:
             )
             if exit_.stopped is not None:
                 return exit_.stopped
-            return self._outcome(exit_.timed_out, final, problems, ctx)
+            return self._outcome(exit_.timed_out, final, problems, ctx, worked)
 
         return run_guarded(guard, ctx, self.cfg.bin, start)
 
@@ -518,7 +635,12 @@ class AntigravityAdapter:
         return check_subagent(self.cfg, ctx, name, model, enforce=True)
 
     def _outcome(
-        self, timed_out: bool, final: dict | None, problems: deque[str], ctx: RoundContext
+        self,
+        timed_out: bool,
+        final: dict | None,
+        problems: deque[str],
+        ctx: RoundContext,
+        worked: bool,
     ) -> RoundResult:
         if timed_out:
             return RoundResult(TIMEOUT, reason="round exceeded its time limit")
@@ -534,13 +656,26 @@ class AntigravityAdapter:
         refusal = classify(text, self._wall_clock())
         if refusal is not None:
             return refusal
-        if ctx.session_id is not None:
+        # A resumed round that never started a step failed to resume; one that worked and was then
+        # cut off (agy's own "interrupted") keeps its conversation and what it did.
+        if ctx.session_id is not None and not worked:
             return RoundResult(TRANSIENT, reason=f"resume failed: {summary}", resume_failed=True)
         return RoundResult(TRANSIENT, reason=summary)
+
+    def tool_watch(self) -> ToolWatch:
+        return _ToolWatch()
 
     def is_work(self, line: str) -> bool:
         event = _parse_event(line)
         return event is not None and event.get("event") == "step_update" and bool(self.render(line))
+
+    def is_fragment(self, line: str) -> bool:
+        """A text delta can end mid-word, so it is joined with the next one, not put on a line."""
+        event = _parse_event(line)
+        if event is None or event.get("event") != "step_update":
+            return False
+        delta = _payload(event).get("text_delta")
+        return isinstance(delta, str) and bool(delta)
 
     def render(self, line: str) -> str | None:
         event = _parse_event(line)
@@ -551,7 +686,9 @@ class AntigravityAdapter:
         body = _payload(event)
         if kind == "step_update":
             delta = body.get("text_delta")
-            return delta if isinstance(delta, str) and delta else None
+            if isinstance(delta, str) and delta:
+                return delta  # a fragment: never stripped, a space or a newline can be all of it
+            return _tool_line(body)
         if kind == "result" and body.get("status") != "SUCCESS":
             error = body.get("error")
             return f"error: {error}" if isinstance(error, str) and error else None

@@ -7,6 +7,7 @@ import shlex
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -39,16 +40,21 @@ class RoundResult:
     # COMPLETED only: the round was cut off by its own cap, so its work is not finished. The
     # scheduler treats it as completed; a phase must not advance on it, nor a goal finish.
     bounded: bool = False
+    # What the round cost, in USD, when the agent reports it (claude_api does): 0 otherwise.
+    cost_usd: float = 0.0
 
 
 @dataclass(frozen=True)
 class Availability:
-    """Whether an agent may run now. Unknown means not ok."""
+    """Whether an agent may run now. Unknown means not ok. `permanent` says a no that waiting does
+    not end: the agent is disabled, has no usable key, or its settings cannot run a round. It
+    differs from being out of quota, which ends by itself."""
 
     ok: bool
     until: float | None = None
     reason: str = ""
     usage: dict = field(default_factory=dict)
+    permanent: bool = False
 
 
 @dataclass
@@ -62,6 +68,11 @@ class RoundContext:
     on_spawn: Callable[[int], None]
     session_id: str | None = None
     on_session: Callable[[str], None] = lambda _: None
+    # Claude reports its cost as the session's total so far. What the session had reported by the
+    # end of its last round (None for a session with no saved total), so a round is charged only
+    # for what it added; and told, as (session, total), the total a round reports.
+    session_total: Decimal | None = None
+    on_session_total: Callable[[str, Decimal], None] = lambda session, total: None
     # "strong" (plan, review and the plain relay) or "build": which of the two models runs.
     tier: str = "strong"
     # Told, with the tool and the model when the stream shows it, of every subagent a round starts.
@@ -151,11 +162,31 @@ def find_model(obj: object, depth: int = 2) -> str | None:
     return None
 
 
+class ToolWatch:
+    """The tool calls of one round that have started and not yet ended, read from its stream.
+
+    The runner feeds it every output line and asks `busy` before it ends a round for a note: an
+    interrupt then waits for the tool, so a command is not cut off halfway. A line it does not
+    understand changes nothing. Adapters subclass it and say what a start and an end look like."""
+
+    def __init__(self) -> None:
+        self.open: set[object] = set()
+
+    @property
+    def busy(self) -> bool:
+        return bool(self.open)
+
+    def feed(self, line: str) -> None:
+        raise NotImplementedError
+
+
 class Adapter(Protocol):
     name: str
-    # True for an agent paid by use, with no reset that would ever stop it: it runs only while
-    # no plan agent can, and a plan agent coming back ends its round.
+    # True for an agent paid by use, with no reset that would ever stop it. It only means budgets.
     metered: bool
+    # True for an agent that waits for the others: it runs only while no other agent can, and
+    # another coming back ends its round.
+    reserve: bool
 
     def availability(self) -> Availability: ...
 
@@ -166,4 +197,9 @@ class Adapter(Protocol):
     def is_work(self, line: str) -> bool:
         """True when `line` shows the agent acting on its prompt. An error message or noise that
         `render` also shows does not count: a round that only said that never read the notes."""
+        ...
+
+    def tool_watch(self) -> ToolWatch | None:
+        """A new watch for one round, or None when the stream does not show tool calls. The
+        runner reads it with getattr: an adapter without it is interrupted at once."""
         ...

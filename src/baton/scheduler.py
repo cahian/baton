@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from baton.adapters.base import (
@@ -20,6 +21,7 @@ from baton.adapters.base import (
     Availability,
     RoundResult,
 )
+from baton.config import TURN_MAX_S
 from baton.store import StateError, Store
 
 # (first delay, ceiling) in seconds
@@ -45,6 +47,15 @@ MAX_COOLDOWN_S = 8 * 24 * 3600
 # A round ended for a subagent on a model outside the pair leaves the agent available, but this
 # many in a row (in one run) rest it, with the backoff of a failing agent, until it completes one.
 SUBAGENT_STRIKES = 3
+
+
+@dataclass(frozen=True)
+class TurnLimits:
+    """What ends an agent's turn, and what keeps it out of a goal. A budget of None is none."""
+
+    turn_max_s: int = TURN_MAX_S
+    turn_budget_usd: float | None = None
+    goal_budget_usd: float | None = None
 
 
 def _num(value: Any) -> float | None:
@@ -75,6 +86,19 @@ def preempt_cap_frees_at(raw: Any, now: float) -> float | None:
     return window[-MAX_PREEMPTS_PER_DAY] + PREEMPT_WINDOW_S
 
 
+def _span(seconds: int) -> str:
+    """A turn's length as the person reads it: `5 hours`, `90 minutes`."""
+    for size, unit in ((3600, "hour"), (60, "minute")):
+        if seconds % size == 0:
+            n = seconds // size
+            return f"{n} {unit}" + ("" if n == 1 else "s")
+    return f"{seconds} seconds"
+
+
+def _usd(amount: float) -> str:
+    return f"USD {amount:.2f}".rstrip("0").rstrip(".")
+
+
 def read_availability(adapter: Adapter) -> Availability:
     """The adapter's availability; an agent that cannot be read is an unavailable one."""
     try:
@@ -86,22 +110,24 @@ def read_availability(adapter: Adapter) -> Availability:
 class Scheduler:
     """Decides which agent runs next.
 
-    Plan agents (included usage that comes back at a reset) come first. The current plan agent
-    keeps working until it is unavailable; only then does the next one in `order` take over,
-    wrapping around, and a plan agent that comes back never preempts another that is working. A
-    metered agent (paid by use, nothing that would ever stop it) is a fallback wherever it stands
-    in `order`: it is picked only while no plan agent is available. While one runs, the runner
-    reads the plan agents with `plan_ready_to_check` and `record_read`, and ends the metered round
-    when one is back; `record` gives that round (`preempted`) no cooldown. A plan agent that
-    reads ok but whose next round fails within `PREEMPT_PROOF_S` (and not as completed or
-    timeout) is blocked: `plan_ready_to_check` leaves it out, so it stops costing a metered round
-    per attempt, until a round of it completes, times out or lasts that long. `pick` still tries
-    it at a round boundary. An agent that carries that mark and reads not available in `pick`
-    (the watcher saw it ok, the read there said no) is blocked at once, as if its round had
-    failed. As a backstop, `MAX_PREEMPTS_PER_DAY` preemptions in 24 hours make
-    `plan_ready_to_check` return nothing, so the watcher stops reading and killing.
-    With everyone exhausted `pick` returns None and
-    `next_wake` says when to look again.
+    The queue is the agents that do not `reserve`, in `order`. The current one keeps working
+    until it is unavailable, its turn is over (`turn_over`, ended by the runner with `rotate`) or
+    the person asks for the next; only then does the next one in `order` take over, wrapping
+    around, and an agent that comes back never preempts another that is working. An agent that
+    reserves (a metered one the person keeps for last) is a fallback wherever it stands in
+    `order`: it is picked only while no queue agent is available. While one runs, the runner
+    reads the queue agents with `plan_ready_to_check` and `record_read`, and ends the reserve
+    round when one is back; `record` gives that round (`preempted`) no cooldown. A turn is the
+    time an agent's rounds have worked since it took over, and what they spent; an agent
+    `drop`ped is out of the queue until the goal changes. A queue agent that reads ok but whose
+    next round fails within `PREEMPT_PROOF_S` (and not as completed or timeout) is blocked:
+    `plan_ready_to_check` leaves it out, so it stops costing a reserve round per attempt, until a
+    round of it completes, times out or lasts that long. `pick` still tries it at a round
+    boundary. An agent that carries that mark and reads not available in `pick` (the watcher saw
+    it ok, the read there said no) is blocked at once, as if its round had failed. As a
+    backstop, `MAX_PREEMPTS_PER_DAY` preemptions in 24 hours make `plan_ready_to_check` return
+    nothing, so the watcher stops reading and killing. With everyone exhausted `pick` returns
+    None and `next_wake` says when to look again.
 
     Cooldowns live in memory first. They are written to the store when `save` is called and
     after `record`, and a store that cannot be read or written never resets them. The runner's
@@ -115,6 +141,7 @@ class Scheduler:
         adapters: Mapping[str, Adapter],
         store: Store,
         clock: Callable[[], float] = time.time,
+        limits: Mapping[str, TurnLimits] | None = None,
     ) -> None:
         self.order = [name for name in dict.fromkeys(order) if name in adapters]
         if not self.order:
@@ -122,19 +149,30 @@ class Scheduler:
         self._adapters = adapters
         self._store = store
         self._clock = clock
+        self._limits = limits or {}
         self._lock = threading.RLock()
         self._agents: dict[str, dict] = {name: self._blank() for name in self.order}
         self.current: str = self.order[0]
         self._preempts: list[float] = []
+        self._turn: dict = self._no_turn()
+        self._dropped: set[str] = set()
         saved = store.load_state()  # StateError is the caller's to survive
         if saved.get("current") in self._agents:
             self.current = saved["current"]
         self._preempts = preempts_in_window(saved.get("preempts"), clock())
+        self._restore_turn(saved.get("turn"))
+        dropped = saved.get("dropped")
+        if isinstance(dropped, list):
+            self._dropped = {n for n in dropped if isinstance(n, str) and n in self._agents}
         stored = saved.get("agents")
         if isinstance(stored, dict):
             for name, raw in stored.items():
                 if name in self._agents and isinstance(raw, dict):
                     self._restore(self._agents[name], raw)
+
+    @staticmethod
+    def _no_turn() -> dict:
+        return {"agent": "", "worked_s": 0.0, "spent": 0.0}
 
     @staticmethod
     def _blank() -> dict:
@@ -146,6 +184,7 @@ class Scheduler:
             "usage": {},
             "blocked": False,
             "after_preempt": False,
+            "goal_spent": 0.0,
             "subagent_n": 0,  # in a row, in this run: not written to state.json
         }
 
@@ -162,6 +201,22 @@ class Scheduler:
             agent["usage"] = raw["usage"]
         agent["blocked"] = raw.get("blocked") is True
         agent["after_preempt"] = raw.get("after_preempt") is True
+        spent = _num(raw.get("goal_spent"))
+        agent["goal_spent"] = spent if spent is not None and spent > 0 else 0.0
+
+    def _restore_turn(self, raw: Any) -> None:
+        """The turn saved in state.json. A damaged one is no turn; one from before turns counted
+        worked time (it has `started`) keeps its spend and has worked nothing."""
+        if not isinstance(raw, dict):
+            return
+        agent = raw.get("agent")
+        if not isinstance(agent, str) or agent not in self._agents:
+            return
+        worked = _num(raw.get("worked_s")) if "worked_s" in raw else 0.0
+        spent = _num(raw.get("spent"))
+        if worked is None or worked < 0 or spent is None or spent < 0:
+            return
+        self._turn = {"agent": agent, "worked_s": worked, "spent": spent}
 
     def _known(self, until: Any, now: float) -> float | None:
         """`until` as a usable reset time, or None when it is missing, past or nonsense."""
@@ -173,16 +228,43 @@ class Scheduler:
     # choosing
 
     def _plan_names(self) -> list[str]:
-        return [n for n in self.order if not self._adapters[n].metered]
+        """The queue: the agents that do not reserve and are not dropped, in `order`."""
+        return [n for n in self.order if not self._adapters[n].reserve and n not in self._dropped]
+
+    def _start_in(self, queue: list[str]) -> int:
+        """Where in `queue` the walk begins: at the current agent, or, when that one is dropped,
+        at the first agent after its place in `order`, and else at the top."""
+        if self.current in queue:
+            return queue.index(self.current)
+        if self.current in self._dropped:
+            at = self.order.index(self.current)
+            for i, name in enumerate(queue):
+                if self.order.index(name) > at:
+                    return i
+        return 0
 
     def _candidates(self) -> list[str]:
-        """The plan agents, from the current one when it is a plan agent and else from the start
-        of `order`, wrapping around; then the metered agents, in `order`."""
+        """The queue, from the current agent (see `_start_in`), wrapping around; then the reserve
+        agents, in `order`. A dropped agent is in neither."""
         plan = self._plan_names()
-        if self.current in plan:
-            at = plan.index(self.current)
-            plan = plan[at:] + plan[:at]
-        return plan + [n for n in self.order if self._adapters[n].metered]
+        at = self._start_in(plan)
+        plan = plan[at:] + plan[:at]
+        return plan + [
+            n for n in self.order if self._adapters[n].reserve and n not in self._dropped
+        ]
+
+    def _begin(self, name: str) -> None:
+        """`name` is the agent that runs now: a turn of its own starts unless it already holds
+        the current one."""
+        self.current = name
+        if self._turn["agent"] != name:
+            self._turn = {"agent": name, "worked_s": 0.0, "spent": 0.0}
+
+    def new_turn(self, name: str) -> None:
+        """Start `name`'s turn over: nothing worked, nothing spent."""
+        with self._lock:
+            self._turn = {"agent": name, "worked_s": 0.0, "spent": 0.0}
+            self._save_quietly()
 
     def _apply(self, agent: dict, avail: Availability) -> None:
         """Write a read of `agent` into its state: ready, or resting until its reset (or, when
@@ -202,25 +284,25 @@ class Scheduler:
 
         `avoid` names the agent a round should not go to, if another plan agent can take it (a
         review is better done by someone other than the builder). When it is the agent that would
-        be returned and another plan agent reads available, that one is returned for this round
+        be returned and another queue agent reads available, that one is returned for this round
         only: `current` stays where it was, so the next ordinary round continues as before. A
-        metered agent is never returned because of `avoid`."""
+        reserve agent is never returned because of `avoid`."""
         with self._lock:
             for name in self._candidates():
                 found = self._try(name)
                 if found is None:
                     continue
-                if avoid is None or name != avoid or self._adapters[name].metered:
-                    self.current = name
+                if avoid is None or name != avoid or self._adapters[name].reserve:
+                    self._begin(name)
                     return found
-                # The agent to avoid is the one that would run: look for another plan agent.
+                # The agent to avoid is the one that would run: look for another queue agent.
                 for other in self._candidates():
-                    if other == name or self._adapters[other].metered:
+                    if other == name or self._adapters[other].reserve:
                         continue
                     alternative = self._try(other)
                     if alternative is not None:
                         return alternative
-                self.current = name
+                self._begin(name)
                 return found
             return None
 
@@ -245,9 +327,30 @@ class Scheduler:
             agent["blocked"], agent["after_preempt"] = True, False
             self._save_quietly()
 
+    def pick_for(self, name: str) -> Adapter | None:
+        """`name`'s adapter when it is available now, else None. Reads that one agent like `pick`
+        does (and keeps the reset it reports), but moves nothing: not `current`, not the turn,
+        not `dropped`. For a round that asks one agent a question, a consensus round."""
+        with self._lock:
+            return self._try(name) if name in self._agents else None
+
+    def can_run(self, name: str) -> bool:
+        """Whether `name` can ever take a round: it is in `order`, not `dropped`, and its
+        availability is not permanent (disabled, no key, settings that cannot run a round). An
+        agent out of quota, whether or not it says when it is back, is waited for, and so is one
+        that cannot be read."""
+        with self._lock:
+            if name not in self._agents or name in self._dropped:
+                return False
+            try:
+                avail = self._adapters[name].availability()
+            except Exception:
+                return True
+            return avail.ok or not avail.permanent
+
     def plan_ready_to_check(self) -> list[str]:
-        """The plan agents whose cooldown has passed and that are not blocked, in `order`: the
-        ones worth reading while a metered agent runs. Moves nothing. Nothing at all once the day's
+        """The queue agents whose cooldown has passed and that are not blocked, in `order`: the
+        ones worth reading while a reserve agent runs. Moves nothing. Nothing at all once the day's
         preemptions are used up."""
         with self._lock:
             now = self._clock()
@@ -271,6 +374,92 @@ class Scheduler:
             now = self._clock()
             untils = [a["until"] for a in self._agents.values() if a["until"] > now]
             return max(min(untils), now + MIN_WAIT_S) if untils else now + MIN_WAIT_S
+
+    # turns
+
+    def note_round(
+        self, agent: str, seconds: float, usd: float, goal: bool = False, turn: bool = True
+    ) -> None:
+        """Count a round of `agent`: its time and cost go to the turn when `agent` holds it, and
+        its cost to the goal's spend when a goal is set (`goal`). A round of an agent that does
+        not hold the turn (a review it was lent for) counts for the goal alone, and so does one
+        that says it is not the turn's (`turn=False`: a consensus round)."""
+        if agent not in self._agents:
+            return
+        worked, amount = _num(seconds), _num(usd)
+        worked = worked if worked is not None and worked > 0 else 0.0
+        amount = amount if amount is not None and amount > 0 else 0.0
+        with self._lock:
+            if goal:
+                self._agents[agent]["goal_spent"] += amount
+            if turn and self._turn["agent"] == agent:
+                self._turn["worked_s"] += worked
+                self._turn["spent"] += amount
+            self._save_quietly()
+
+    def turn_reason(self, agent: str) -> str:
+        """Why the turn `agent` holds is over (`5 hours`, `USD 50`), or "" while it is not, when
+        it holds none, or when `agent` reserves: the turn of a reserve agent never ends. Worked
+        time counts first."""
+        with self._lock:
+            if self._turn["agent"] != agent or self._adapters[agent].reserve:
+                return ""
+            limits = self._limits.get(agent, TurnLimits())
+            if self._turn["worked_s"] >= limits.turn_max_s:
+                return _span(limits.turn_max_s)
+            budget = limits.turn_budget_usd
+            if budget is not None and self._turn["spent"] >= budget:
+                return _usd(budget)
+            return ""
+
+    def turn_over(self, agent: str) -> bool:
+        return bool(self.turn_reason(agent))
+
+    def rotate(self) -> str:
+        """Give the queue to the next agent in `order` that is not dropped, with a turn of its
+        own, and return its name. With no other agent in the queue it stays where it is and
+        nothing changes. An agent that cannot run is still moved to: `pick` skips it, as it skips
+        any, so the one that runs may be another (or the same one)."""
+        with self._lock:
+            queue = self._plan_names()
+            if len(queue) < 2:
+                return self.current
+            at = self._start_in(queue)
+            nxt = queue[(at + 1) % len(queue)] if self.current in queue else queue[at]
+            self._begin(nxt)
+            self._save_quietly()
+            return nxt
+
+    def goal_over(self, agent: str) -> bool:
+        """Whether `agent` has spent its goal budget (there is none for most agents)."""
+        with self._lock:
+            budget = self._limits.get(agent, TurnLimits()).goal_budget_usd
+            return (
+                agent in self._agents
+                and budget is not None
+                and self._agents[agent]["goal_spent"] >= budget
+            )
+
+    def drop(self, agent: str) -> None:
+        """Leave `agent` out of the queue until the goal changes."""
+        with self._lock:
+            if agent in self._agents:
+                self._dropped.add(agent)
+                self._save_quietly()
+
+    @property
+    def dropped(self) -> set[str]:
+        with self._lock:
+            return set(self._dropped)
+
+    def new_goal(self) -> None:
+        """The goal was set, changed or cleared: every dropped agent is back and the goal's
+        spend starts from nothing."""
+        with self._lock:
+            self._dropped.clear()
+            for agent in self._agents.values():
+                agent["goal_spent"] = 0.0
+            self._save_quietly()
 
     # outcomes
 
@@ -297,7 +486,7 @@ class Scheduler:
             self._preempts = preempts_in_window([*self._preempts, now], now)
             self._save_quietly()
             return
-        if not self._adapters[agent].metered:
+        if not self._adapters[agent].reserve:
             self._judge_preempt(state, outcome, seconds)
         if outcome in (COMPLETED, TIMEOUT):
             state.update(until=0.0, limit_n=0, transient_n=0, reason="", subagent_n=0)
@@ -361,11 +550,14 @@ class Scheduler:
                     "usage": dict(raw["usage"]),
                     "blocked": raw["blocked"],
                     "after_preempt": raw["after_preempt"],
+                    "goal_spent": raw["goal_spent"],
                 }
             return {
                 "current": self.current,
                 "agents": agents,
                 "preempts": preempts_in_window(self._preempts, now),
+                "turn": dict(self._turn),
+                "dropped": [n for n in self.order if n in self._dropped],
             }
 
     def save(self) -> None:

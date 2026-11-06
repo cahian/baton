@@ -584,3 +584,159 @@ def test_the_antigravity_build_model_must_be_a_gemini(tmp_path):
 
 def test_a_repository_file_may_set_phases_and_build_models():
     check_repo_table({"phases": False, "agents": {"codex": {"build_model": "m"}}})
+
+
+# --- one-shot goal ---------------------------------------------------------------------------
+
+
+def test_oneshot_is_off_by_default_and_can_be_turned_on(tmp_path):
+    assert load_goal(write(tmp_path, minimal())).oneshot is False
+    on = minimal().replace('objective = "Ship it."', 'objective = "x"\noneshot = true')
+    assert load_goal(write(tmp_path, on)).oneshot is True
+
+
+def test_oneshot_with_phases_off_is_refused(tmp_path):
+    bad = minimal().replace(
+        'objective = "Ship it."', 'objective = "x"\noneshot = true\nphases = false'
+    )
+    with pytest.raises(GoalError, match="oneshot needs phases"):
+        load_goal(write(tmp_path, bad))
+    ok = bad.replace("phases = false", "phases = true")
+    assert load_goal(write(tmp_path, ok)).oneshot is True
+
+
+def test_oneshot_must_be_a_boolean(tmp_path):
+    bad = minimal().replace('objective = "Ship it."', 'objective = "x"\noneshot = "yes"')
+    with pytest.raises(GoalError, match="oneshot"):
+        load_goal(write(tmp_path, bad))
+
+
+def test_a_repo_table_may_not_set_oneshot(tmp_path):
+    # It would pin text an agent wrote as the person's goal: only the person's goal file may.
+    with pytest.raises(GoalError, match="oneshot"):
+        check_repo_table({"oneshot": True})
+    check_repo_table({"phases": True})  # the rest of the table is judged elsewhere
+
+
+# --- the queue: turns and the reserve ----------------------------------------------------------
+
+
+def test_turn_settings_have_the_documented_defaults(tmp_path):
+    agents = load_goal(write(tmp_path, minimal())).agents
+    assert [agents[a].turn_max_s for a in ("codex", "antigravity", "claude_api")] == [18000] * 3
+    claude_cfg = agents["claude_api"]
+    assert claude_cfg.reserve is False
+    assert claude_cfg.turn_budget_usd == Decimal("50")
+    assert claude_cfg.goal_budget_usd == Decimal("150")
+    assert isinstance(claude_cfg.turn_budget_usd, Decimal)
+
+
+def test_turn_settings_are_read_from_a_goal_file_and_the_defaults_file(tmp_path, monkeypatch):
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\nturn_budget_usd = 20.5\nreserve = true\n")
+    text = minimal() + claude(goal_budget_usd=90, turn_max_s=3600)
+    cfg = load_goal(write(tmp_path, text)).agents["claude_api"]
+    assert (cfg.turn_budget_usd, cfg.reserve) == (Decimal("20.5"), True)  # defaults
+    assert (cfg.goal_budget_usd, cfg.turn_max_s) == (Decimal("90"), 3600)  # the goal file
+
+
+def test_turn_max_s_is_set_for_every_agent(tmp_path):
+    text = minimal() + "[agents.codex]\nturn_max_s = 600\n[agents.antigravity]\nturn_max_s = 900\n"
+    agents = load_goal(write(tmp_path, text)).agents
+    assert (agents["codex"].turn_max_s, agents["antigravity"].turn_max_s) == (600, 900)
+
+
+@pytest.mark.parametrize("agent", ["codex", "antigravity"])
+@pytest.mark.parametrize("key", ["reserve = true", "turn_budget_usd = 5", "goal_budget_usd = 5"])
+def test_only_claude_has_a_reserve_and_budgets(tmp_path, agent, key):
+    with pytest.raises(GoalError, match="unknown key"):
+        load_goal(write(tmp_path, minimal() + f"[agents.{agent}]\n{key}\n"))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "turn_max_s = 0",
+        "turn_max_s = -1",
+        "turn_max_s = 1.5",
+        'turn_max_s = "5h"',
+        "turn_max_s = true",
+        "turn_budget_usd = 0",
+        "turn_budget_usd = -5",
+        'turn_budget_usd = "50"',
+        "goal_budget_usd = 0",
+        "goal_budget_usd = nan",
+        'reserve = "yes"',
+        "reserve = 1",
+    ],
+)
+def test_invalid_turn_settings_are_rejected(tmp_path, line):
+    with pytest.raises(GoalError):
+        load_goal(write(tmp_path, minimal() + f"[agents.claude_api]\n{line}\n"))
+
+
+def test_a_repo_table_may_lower_a_turn_setting_but_not_raise_it(monkeypatch, tmp_path):
+    check_repo_table({"agents": {"claude_api": {"turn_budget_usd": Decimal("10")}}})
+    check_repo_table({"agents": {"claude_api": {"goal_budget_usd": Decimal("150")}}})  # equal
+    check_repo_table({"agents": {"codex": {"turn_max_s": 600}}})
+    with pytest.raises(GoalError, match="turn_budget_usd"):
+        check_repo_table({"agents": {"claude_api": {"turn_budget_usd": Decimal("51")}}})
+    with pytest.raises(GoalError, match="goal_budget_usd"):
+        check_repo_table({"agents": {"claude_api": {"goal_budget_usd": 151}}})
+    with pytest.raises(GoalError, match="turn_max_s"):
+        check_repo_table({"agents": {"antigravity": {"turn_max_s": 18001}}})
+
+
+def test_what_a_repo_table_may_not_raise_is_judged_against_the_defaults_file(tmp_path, monkeypatch):
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\nturn_budget_usd = 5\n")
+    check_repo_table({"agents": {"claude_api": {"turn_budget_usd": 5}}})
+    with pytest.raises(GoalError, match="turn_budget_usd"):
+        check_repo_table({"agents": {"claude_api": {"turn_budget_usd": 6}}})
+
+
+def test_a_repo_table_may_not_turn_a_reserve_off(tmp_path, monkeypatch):
+    check_repo_table({"agents": {"claude_api": {"reserve": True}}})
+    check_repo_table({"agents": {"claude_api": {"reserve": False}}})  # the default is false too
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\nreserve = true\n")
+    check_repo_table({"agents": {"claude_api": {"reserve": True}}})
+    with pytest.raises(GoalError, match="reserve"):
+        check_repo_table({"agents": {"claude_api": {"reserve": False}}})
+
+
+def test_a_repo_table_with_a_malformed_turn_setting_is_left_to_the_builder():
+    check_repo_table({"agents": {"claude_api": {"turn_budget_usd": "lots", "reserve": "x"}}})
+    check_repo_table({"agents": {"claude_api": "not a table"}})
+
+
+def test_a_repo_table_may_only_lower_the_round_budget(tmp_path, monkeypatch):
+    check_repo_table({"agents": {"claude_api": {"round_budget_usd": Decimal("2")}}})
+    check_repo_table({"agents": {"claude_api": {"round_budget_usd": 5}}})  # equal
+    with pytest.raises(GoalError, match="round_budget_usd"):
+        check_repo_table({"agents": {"claude_api": {"round_budget_usd": Decimal("170")}}})
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\nround_budget_usd = 20\n")
+    check_repo_table({"agents": {"claude_api": {"round_budget_usd": 20}}})
+    with pytest.raises(GoalError, match="round_budget_usd"):
+        check_repo_table({"agents": {"claude_api": {"round_budget_usd": 21}}})
+
+
+def test_a_repo_table_may_not_enable_an_agent_the_defaults_disable(tmp_path, monkeypatch):
+    check_repo_table({"agents": {"claude_api": {"enabled": True}}})  # on by default
+    check_repo_table({"agents": {"claude_api": {"enabled": False}}})
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\nenabled = false\n")
+    check_repo_table({"agents": {"claude_api": {"enabled": False}}})
+    with pytest.raises(GoalError, match="enabled"):
+        check_repo_table({"agents": {"claude_api": {"enabled": True}}})
+    check_repo_table({"agents": {"codex": {"enabled": True}}})  # the defaults leave codex on
+
+
+def test_a_repo_table_with_a_number_that_is_not_one_is_a_goal_error():
+    for value in (Decimal("nan"), Decimal("-nan"), Decimal("snan")):
+        with pytest.raises(GoalError, match="turn_budget_usd"):
+            check_repo_table({"agents": {"claude_api": {"turn_budget_usd": value}}})
+
+
+def test_nan_is_a_goal_error_in_a_goal_file_and_the_defaults_file(tmp_path, monkeypatch):
+    with pytest.raises(GoalError, match="turn_budget_usd"):
+        load_goal(write(tmp_path, minimal() + "[agents.claude_api]\nturn_budget_usd = nan\n"))
+    defaults(tmp_path, monkeypatch, "[agents.claude_api]\ngoal_budget_usd = nan\n")
+    with pytest.raises(GoalError, match="goal_budget_usd"):
+        load_defaults()

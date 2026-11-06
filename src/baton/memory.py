@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import textwrap
 import time
 import urllib.request
 from collections.abc import Callable
@@ -42,6 +43,14 @@ FIRST_TEXT_MAX_TERMS = 16
 # A longer "word" is more likely a token or a secret than something worth searching for.
 MAX_TERM_CHARS = 32
 MAX_HITS = 5
+# What search is asked for: this goal's own rounds are left out of what it returns, and five
+# hits from others must still be left.
+SEARCH_HITS = MAX_HITS * 6
+# When that is not enough (this goal wrote more round pages than that, all matching), the search
+# is repeated with twice as many, up to this many.
+SEARCH_HITS_LIMIT = 240
+# How near a sentence or line start must be, to begin an excerpt there.
+SNAP_CHARS = 80
 HIT_MAX_CHARS = 1200
 # Room kept for a hit in a block that is nearly full: a stub smaller than this is not worth it.
 MIN_HIT_CHARS = 120
@@ -65,8 +74,14 @@ _TERM_RE = re.compile(r"[^\W_][\w.-]{2,}")
 _NUMBER_RE = re.compile(r"[\d.-]+")
 _MARK_RE = re.compile(r"</?mark>")
 _BIND_RE = re.compile(r"^([ \t]*bind[ \t]*=).*$", re.MULTILINE)
-_LESSONS_RE = re.compile(r"^##[ \t]+lessons[ \t]*$", re.IGNORECASE | re.MULTILINE)
-_NEXT_HEADING_RE = re.compile(r"^## ", re.MULTILINE)
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$")
+_LESSONS_HEADING_RE = re.compile(r"lessons\b", re.IGNORECASE)
+_LESSONS_ITEM_RE = re.compile(
+    r"^([ \t]*)(?:[-*+]|\d{1,9}[.)])[ \t]+(\*\*[ \t]*lessons\b[^*]*\*\*)(.*)$", re.IGNORECASE
+)
+_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+_SENTENCE_END_RE = re.compile(r"[.!?] ")
+_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", re.DOTALL)
 _NOT_FOUND_RE = re.compile(r"not found", re.IGNORECASE)
 _BEGIN = "--- BEGIN BATON MEMORY ---"
 _END = "--- END BATON MEMORY ---"
@@ -212,14 +227,82 @@ class MemoryUnavailable(Exception):
     """Memory cannot be used, for a reason the person can act on. The message is the reason."""
 
 
+def _fences(lines: list[str]) -> list[int | None]:
+    """For each line, the index of the line that opened the fence it is inside (a fence line
+    included), or None. A fence closes on the same character, at least as long, with nothing but
+    blanks after it; one that never closes is not a fence."""
+    owner: list[int | None] = [None] * len(lines)
+    i = 0
+    while i < len(lines):
+        opened = _FENCE_RE.match(lines[i])
+        if opened and not (opened[1][0] == "`" and "`" in opened[2]):
+            char, size = opened[1][0], len(opened[1])
+            for j in range(i + 1, len(lines)):
+                closing = _FENCE_RE.match(lines[j])
+                if (
+                    closing
+                    and closing[1][0] == char
+                    and len(closing[1]) >= size
+                    and not closing[2].strip()
+                ):
+                    owner[i : j + 1] = [i] * (j + 1 - i)
+                    i = j
+                    break
+        i += 1
+    return owner
+
+
+def _indent(line: str) -> int:
+    """The width of a line's leading blanks, tabs counted as four columns."""
+    return len(line[: len(line) - len(line.lstrip())].expandtabs(4))
+
+
 def lessons_of(handoff: str) -> str:
-    """The `## Lessons` section of a handoff, up to the next `## ` heading, or ""."""
-    start = _LESSONS_RE.search(handoff or "")
-    if start is None:
-        return ""
-    rest = handoff[start.end() :]
-    end = _NEXT_HEADING_RE.search(rest)
-    return (rest[: end.start()] if end else rest).strip()
+    """What a handoff says under the name of lessons, in file order, or "": the body of a
+    `## Lessons` heading (and of `## Lessons ...` and `### Lessons ...`, whose heading line is
+    kept for what it says) up to the next heading of its level or above, and each list item
+    (bulleted or numbered) whose bold text starts with `Lessons` (`- **Lessons:**`,
+    `- **Lessons — x:**`) with its indented lines. Code fences are skipped. A heading or item with
+    nothing under it says nothing, and is left out."""
+    lines = (handoff or "").splitlines()
+    fence = _fences(lines)
+    blocks: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        heading = None if fence[i] is not None else _HEADING_RE.match(line)
+        if heading and len(heading[1]) in (2, 3) and _LESSONS_HEADING_RE.match(heading[2]):
+            level = len(heading[1])
+            end = i + 1
+            while end < len(lines):
+                found = None if fence[end] is not None else _HEADING_RE.match(lines[end])
+                if found and len(found[1]) <= level:
+                    break
+                end += 1
+            body = "\n".join(lines[i + 1 : end]).strip()
+            if body and heading[2].lower().rstrip(":. ") != "lessons":
+                body = f"{line}\n{body}"
+            blocks.append(body)
+            i = end
+            continue
+        item = None if fence[i] is not None else _LESSONS_ITEM_RE.match(line)
+        if item:
+            indent = _indent(line)
+            end = i + 1
+            while end < len(lines):
+                text = lines[end]
+                # What a fence that opened inside the item holds belongs to it, flush left or not.
+                inside = fence[end] is not None and i < fence[end] < end
+                if not inside and text.strip() and _indent(text) <= indent:
+                    break
+                end += 1
+            block = textwrap.dedent("\n".join(lines[i:end])).strip()
+            if item[3].strip(" \t:.;—–-") or "\n" in block:
+                blocks.append(block)
+            i = end
+            continue
+        i += 1
+    return "\n\n".join(block for block in blocks if block)
 
 
 class Memory:
@@ -255,6 +338,8 @@ class Memory:
         self._which = which
         self._down_until: float | None = None
         self._deadline = 0.0
+        # Pages are not read before this: a read failed, and the next ones would only repeat it.
+        self._no_reads_until: float | None = None
         self._lessons_written = ""
         # One reason per failure, left for the caller to report and clear.
         self.last_error = ""
@@ -281,14 +366,15 @@ class Memory:
             self._fail(f"recall failed: {_describe(exc)}")
             return ""
 
-    def remember_round(self, entry: RoundEntry) -> None:
-        """Store the page of a round. Writing the same round again replaces its page."""
+    def remember_round(self, entry: RoundEntry) -> bool:
+        """Store the page of a round, and say whether it was written. Writing the same round
+        again replaces its page."""
         self._begin()
         try:
             if not self._ready():
-                return
+                return False
             failed = entry.outcome not in NORMAL_OUTCOMES or entry.gate == "failed"
-            self._write(
+            return self._write(
                 self.round_path(entry.n),
                 self._round_body(entry),
                 tier="episodic",
@@ -296,9 +382,11 @@ class Memory:
             )
         except Exception as exc:
             self._fail(f"recording the round failed: {_describe(exc)}")
+            return False
 
     def remember_lessons(self, handoff: str) -> None:
-        """Store the handoff's `## Lessons` section, unless it is what was stored last."""
+        """Store what the handoff says under the name of lessons (see `lessons_of`), unless it
+        is what was stored last or there is nothing under the heading."""
         self._begin()
         try:
             lessons = _tail(lessons_of(handoff), LESSONS_MAX_CHARS)
@@ -499,6 +587,33 @@ class Memory:
         if not terms or not self._ready():
             return ""
         query = " OR ".join(f'"{term}"' for term in terms)
+        size = SEARCH_HITS
+        found = self._search(query, size)
+        if found is None:
+            return ""  # a project that has no page yet
+        kept = self._candidates(found, exclude)
+        # This goal's own rounds may fill a whole page of hits: ask for more while the page
+        # came back full and the others have not shown up, as long as there is time.
+        while (
+            len(kept) < MAX_HITS
+            and len(found) >= size
+            and size < SEARCH_HITS_LIMIT
+            and self._clock() < self._deadline
+        ):
+            size = min(size * 2, SEARCH_HITS_LIMIT)
+            try:
+                more = self._search(query, size)
+            except Exception as exc:
+                self._fail(f"recall failed: {_describe(exc)}")
+                break
+            if more is None:
+                break
+            found = more
+            kept = self._candidates(found, exclude)
+        return self._block(kept)
+
+    def _search(self, query: str, size: int) -> list | None:
+        """The hits of a search, or None for a project that has no page yet."""
         done = self._cli(
             "search",
             "--workspace",
@@ -507,12 +622,12 @@ class Memory:
             self.project,
             "--json",
             "-n",
-            str(MAX_HITS + 1),
+            str(size),
             query,
         )
         if done.returncode != 0:
             if _NOT_FOUND_RE.search(done.stderr or ""):
-                return ""  # a project that has no page yet
+                return None
             raise RuntimeError(f"search exited {done.returncode}: {_one_line(done.stderr)}")
         try:
             found = json.loads(done.stdout)
@@ -520,7 +635,7 @@ class Memory:
             raise RuntimeError("search printed something that is not JSON") from exc
         if not isinstance(found, list):
             raise RuntimeError("search printed JSON that is not a list")
-        return self._block(found, exclude)
+        return found
 
     @staticmethod
     def _flat(text: object) -> str:
@@ -548,25 +663,129 @@ class Memory:
             goal = parts[1].removesuffix(".md")
         return " ".join(part for part in (date, goal) if part)
 
-    def _block(self, found: list, exclude: str) -> str:
-        head = f"{HEADER}\n{_BEGIN}"
-        tail = f"\n{_END}"
-        text = head
-        hits = 0
+    def _mine(self, path: str) -> bool:
+        """A round page of this goal: the handoff already holds what it said."""
+        return path.startswith(f"rounds/{self.job}/")
+
+    def _candidates(self, found: list, exclude: str) -> list[tuple[dict, str]]:
+        """The hits that may be recalled, with their paths, in search's order."""
+        kept = []
         for item in found:
-            if hits == MAX_HITS:
-                break
             if not isinstance(item, dict):
                 continue
             path = str(item.get("path") or "")
             if exclude and (path == exclude or path.endswith("/" + exclude)):
                 continue
+            if not self._mine(path):
+                kept.append((item, path))
+        return kept
+
+    def _page_text(self, path: str) -> str:
+        """The body of a page, without its frontmatter, or "" when it has none or cannot be had.
+        A read that fails (or times out) puts page reading out of use for BACKOFF_S, with one
+        reason: the hits go on as what search said of them, and a hung server costs one wait."""
+        if not path or (self._no_reads_until is not None and self._clock() < self._no_reads_until):
+            return ""
+        try:
+            done = self._cli(
+                "read-page",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                self.project,
+                "--path",
+                path,
+                "--json",
+            )
+            if done.returncode != 0:
+                raise RuntimeError(f"read-page exited {done.returncode}: {_one_line(done.stderr)}")
+            try:
+                page = json.loads(done.stdout)
+            except ValueError as exc:
+                raise RuntimeError("read-page printed something that is not JSON") from exc
+            if not isinstance(page, dict):
+                raise RuntimeError("read-page printed JSON that is not an object")
+        except Exception as exc:
+            self._no_reads_until = self._clock() + BACKOFF_S
+            self.last_error = self.last_error or f"reading a page failed: {_describe(exc)}"
+            return ""
+        body = page.get("body")
+        return _FRONTMATTER_RE.sub("", body, count=1) if isinstance(body, str) else ""
+
+    @staticmethod
+    def _flatten(text: str) -> tuple[str, list[int]]:
+        """The text on one line, and the offsets in it where its lines began."""
+        words: list[str] = []
+        starts: list[int] = []
+        size = prev = 0
+        for found in re.finditer(r"\S+", text):
+            if words and "\n" in text[prev : found.start()]:
+                starts.append(size)
+            words.append(found.group())
+            size += len(found.group()) + 1
+            prev = found.end()
+        return " ".join(words), starts
+
+    @staticmethod
+    def _locate(flat: str, snippet: str) -> tuple[int, int]:
+        """Where the text of a search snippet (its highlights and its `…` cuts left out) is in
+        the page: (offset, length), or (-1, 0). A snippet with a `…` inside is looked up by its
+        longest piece when the whole is not found."""
+        text = " ".join(_MARK_RE.sub("", snippet).split())
+        text = re.sub(r"^(?:…|\.\.\.)\s*|\s*(?:…|\.\.\.)$", "", text)
+        pieces = sorted((p.strip() for p in text.split("…")), key=len, reverse=True)
+        for piece in (text, *(p for p in pieces if len(p) >= 3)):
+            at = flat.find(piece) if piece else -1
+            if at >= 0:
+                return at, len(piece)
+        return -1, 0
+
+    def _excerpt(self, page: str, snippet: str, width: int) -> str:
+        """`width` characters of the page, on one line: the whole page when it fits, else a
+        window around where search found its match (a third of the room before it, starting at a
+        line or sentence start when one is near), else the head."""
+        flat, line_starts = self._flatten(page)
+        width = max(width, 0)
+        if len(flat) <= width:
+            return self._flat(flat)
+        room = max(width - 1, 0)  # one for the `…` that says the window starts inside the page
+        at, size = self._locate(flat, snippet)
+        if at < 0:
+            return self._flat(flat[:width])
+        begin = max(0, at - max(room - size, 0) // 3)
+        if begin:
+            low = max(0, begin - SNAP_CHARS)
+            near = [s for s in line_starts if low <= s <= begin]
+            near += [m.end() for m in _SENTENCE_END_RE.finditer(flat, low, begin)]
+            fit = [s for s in near if at + min(size, room) <= s + room]
+            if fit:
+                begin = max(fit)
+        if begin == 0:
+            return self._flat(flat[:width])
+        return self._flat("…" + flat[begin : begin + room])
+
+    def _block(self, kept: list[tuple[dict, str]]) -> str:
+        head = f"{HEADER}\n{_BEGIN}"
+        tail = f"\n{_END}"
+        # What the project learned, and what it was told, before the log of its rounds. The
+        # sort is stable: search's own order holds within each kind.
+        kept = sorted(kept, key=lambda hit: not hit[1].startswith(("lessons/", "context/")))
+        kept = kept[:MAX_HITS]
+        text = head
+        hits = 0
+        for index, (item, path) in enumerate(kept):
+            room = self.cfg.recall_chars - len(text) - len(tail) - 1
+            if room <= 0:
+                break
             title = self._flat(item.get("title"))
             snippet = _MARK_RE.sub("", str(item.get("snippet") or ""))
-            body = self._flat(snippet)
             label = self._label(item, path, title)
-            line = f"- {f'[{label}] ' if label else ''}{title}: {body}".strip()[:HIT_MAX_CHARS]
-            room = self.cfg.recall_chars - len(text) - len(tail) - 1
+            lead = f"- {f'[{label}] ' if label else ''}{title}:"
+            # An equal share of what is left; what a short hit does not use goes to the rest.
+            limit = min(max(room // (len(kept) - index), MIN_HIT_CHARS), HIT_MAX_CHARS)
+            page = self._page_text(path)
+            body = self._excerpt(page, snippet, limit - len(lead) - 1) if page else ""
+            line = f"{lead} {body or self._flat(snippet)}".strip()[:limit]
             if room < min(MIN_HIT_CHARS, len(line)):
                 break
             text += "\n" + line[:room]

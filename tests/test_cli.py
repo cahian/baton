@@ -58,6 +58,114 @@ def test_say_without_text_is_refused(fakes, capsys):
     assert "empty" in capsys.readouterr().err
 
 
+def test_goal_sets_the_pinned_goal_of_a_goal_file_or_a_job(fakes, capsys):
+    assert main(["goal", str(fakes.goal()), "ship", "the", "parser"]) == 0
+    assert store_for(fakes).goal() == "ship the parser"
+    assert "goal set" in capsys.readouterr().out
+    assert store_for(fakes).read_inbox() == ""  # the pinned goal is in every prompt: no note
+    store_for(fakes, "session-ses_1").set_goal("old")
+    assert main(["goal", "session-ses_1", "new one"]) == 0
+    assert store_for(fakes, "session-ses_1").goal() == "new one"
+
+
+@pytest.mark.refusals
+def test_goal_is_refused_with_phases_off_and_pins_nothing(fakes, capsys):
+    assert (
+        main(["goal", str(fakes.goal()), "ship", "it"]) == 2
+    )  # the fake goal file says phases = false
+    assert "a goal needs phases, and phases = false here" in capsys.readouterr().err
+    assert store_for(fakes).goal() == ""
+
+
+@pytest.mark.refusals
+def test_goal_is_refused_in_a_directory_that_is_not_a_repository(fakes, capsys):
+    path = fakes.goal()
+    path.write_text(path.read_text().replace("phases = false", "phases = true"))
+    fakes.work.mkdir(exist_ok=True)
+    assert main(["goal", str(path), "ship", "it"]) == 2
+    assert "a goal needs a git repository" in capsys.readouterr().err
+    assert store_for(fakes).goal() == ""
+
+
+@pytest.mark.refusals
+def test_goal_is_accepted_with_phases_in_a_repository(fakes, capsys):
+    path = fakes.goal()
+    path.write_text(path.read_text().replace("phases = false", "phases = true"))
+    fakes.work.mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(fakes.work)], check=True)
+    assert main(["goal", str(path), "ship", "it"]) == 0
+    assert store_for(fakes).goal() == "ship it"
+
+
+@pytest.mark.refusals
+def test_goal_off_is_never_refused(fakes, capsys):
+    store_for(fakes).set_goal("something")
+    assert main(["goal", str(fakes.goal()), "--off"]) == 0
+    assert store_for(fakes).goal() == ""
+
+
+def test_a_big_goal_is_filed_and_only_its_start_is_pinned(fakes):
+    big = "word " * 3000
+    assert main(["goal", str(fakes.goal()), big]) == 0
+    pinned = store_for(fakes).goal()
+    assert len(pinned) < 1500 and "`.baton/notes/" in pinned
+    (path,) = list((fakes.work / ".baton" / "notes").iterdir())
+    assert path.read_text(encoding="utf-8").strip() == big.strip()
+
+
+def test_a_big_goal_for_a_job_is_filed_in_the_directory_job_json_names(fakes):
+    store = store_for(fakes, "session-ses_2")
+    store.save_job({"workdir": str(fakes.work), "session": "ses_2"})
+    assert main(["goal", "session-ses_2", "word " * 3000]) == 0
+    assert "`.baton/notes/" in store.goal()
+    assert len(list((fakes.work / ".baton" / "notes").iterdir())) == 1
+
+
+def test_goal_off_clears_it(fakes, capsys):
+    store_for(fakes).set_goal("something")
+    assert main(["goal", str(fakes.goal()), "--off"]) == 0
+    assert store_for(fakes).goal() == ""
+    assert "goal cleared" in capsys.readouterr().out
+
+
+def test_goal_needs_a_text_or_off_and_not_both(fakes, capsys):
+    goal = str(fakes.goal())
+    assert main(["goal", goal]) == 2
+    assert "goal" in capsys.readouterr().err
+    assert main(["goal", goal, "   "]) == 2
+    assert main(["goal", goal, "--off", "and", "text"]) == 2
+    assert store_for(fakes).goal() == ""
+
+
+def test_goal_for_an_unknown_job_is_refused_and_creates_nothing(fakes, capsys):
+    assert main(["goal", "session-nope", "x"]) == 2
+    assert not state_dir("session-nope").exists()
+
+
+def test_next_stores_the_request(fakes, capsys):
+    goal = str(fakes.goal())
+    assert main(["next", goal]) == 0
+    store = store_for(fakes)
+    assert store.take_interrupt() is False
+    assert store.take_next() == "soon"
+    assert "next requested" in capsys.readouterr().out
+
+
+def test_next_now_also_requests_an_interrupt(fakes):
+    assert main(["next", str(fakes.goal()), "--now"]) == 0
+    store = store_for(fakes)
+    assert store.take_interrupt() is True
+    assert store.take_next() == "now"
+
+
+def test_a_broken_defaults_file_does_not_block_goal_or_next(fakes):
+    goal = fakes.goal()
+    fakes.defaults("[agents.codex]\nthreshold_pct = 'high'\n")
+    assert main(["goal", str(goal), "still", "here"]) == 0
+    assert main(["next", str(goal)]) == 0
+    assert store_for(fakes).goal() == "still here"
+
+
 BROKEN_DEFAULTS = "[agents.codex]\nthreshold_pct = 'high'\n"
 
 
@@ -120,6 +228,20 @@ def test_say_and_stop_commands(fakes):
     assert store_for(fakes).stop_request() == "now"
     assert main(["stop", goal]) == 0  # never downgraded
     assert store_for(fakes).stop_request() == "now"
+
+
+def test_restart_asks_the_gateway_and_says_what_it_did(fakes, capsys):
+    from baton.store import restart_path, restart_request
+
+    assert main(["restart"]) == 0  # no gateway, no job: still fine, and still says what it did
+    out = capsys.readouterr().out
+    assert restart_request() == "soon" and restart_path().is_file()
+    assert "between rounds" in out and str(restart_path()) in out
+    assert main(["restart", "--now"]) == 0
+    assert restart_request() == "now"
+    assert "without waiting" in capsys.readouterr().out
+    assert main(["restart"]) == 0  # asking again never downgrades a request to now
+    assert restart_request() == "now"
 
 
 def test_status_prints_cooldowns(fakes, capsys):
@@ -187,6 +309,16 @@ def test_status_shows_memory_events_through_its_generic_line(fakes, capsys):
     out = capsys.readouterr().out
     assert "memory event=recalled hits=3 chars=900" in out
     assert "memory event=error reason=memory is unavailable: gone" in out
+
+
+def test_status_does_not_print_the_fragment_flag_of_an_output_event(fakes, capsys):
+    store = store_for(fakes)
+    store.save_state({"round": 3, "current": "antigravity", "agents": {}})
+    store.emit("output", agent="antigravity", round=3, text="rende", fragment=True)
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "output agent=antigravity round=3" in out
+    assert "fragment" not in out
 
 
 def test_status_says_when_the_daily_preemption_cap_is_active(fakes, capsys):
@@ -623,3 +755,34 @@ def test_status_says_nothing_when_verify_runs(fakes, capsys):
     store_for(fakes).save_state({"verify_warning": ""})
     assert main(["status", str(goal)]) == 0
     assert "warning" not in capsys.readouterr().out
+
+
+def test_status_shows_the_turn_and_the_dropped_agents(fakes, capsys):
+    store = store_for(fakes)
+    store.save_state(
+        {
+            "round": 9,
+            "current": "claude_api",
+            "agents": {},
+            "turn": {"agent": "claude_api", "worked_s": 9000, "spent": 12.5},
+            "dropped": ["claude_api", "codex"],
+        }
+    )
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "turn: claude_api, 2.5 hours worked, USD 12.50 spent" in out
+    assert "left out of the queue for this goal: claude_api, codex" in out
+
+
+def test_status_is_silent_about_a_turn_that_has_not_begun_or_is_damaged(fakes, capsys):
+    store = store_for(fakes)
+    for state in (
+        {"round": 1, "agents": {}},
+        {"round": 1, "agents": {}, "turn": {"agent": "", "worked_s": 0, "spent": 0}, "dropped": []},
+        {"round": 1, "agents": {}, "turn": "oops", "dropped": "oops"},
+        {"round": 1, "agents": {}, "turn": {"agent": "codex", "worked_s": "x", "spent": None}},
+    ):
+        store.save_state(state)
+        assert main(["status", str(fakes.goal())]) == 0
+        out = capsys.readouterr().out
+        assert "turn:" not in out and "left out" not in out

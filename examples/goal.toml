@@ -5,16 +5,16 @@ name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
 
-# Rotation order of the plan agents (codex, antigravity): the first available starts, and when the
-# working one runs out the next takes over, wrapping around. claude_api is paid by use, so it is a
-# fallback wherever it appears here: it runs only while both others are out, and the first plan
-# agent that comes back ends its round.
+# The queue: the first available agent starts and works until it runs out, its turn ends (5 hours,
+# or USD 50 for claude_api) or `baton: next` asks for the next one, and then the next in this order
+# takes over, wrapping around. With `reserve = true` below, claude_api instead waits for the others.
 order = ["codex", "antigravity", "claude_api"]
 round_max_s = 3600   # one round may not run longer than this
 idle_s = 1200        # nor stay silent longer than this
 snapshot = true      # commit uncommitted work locally after each round (never pushes)
 memory = true        # long-term memory through ai-memory; false turns it off for this goal
 phases = true        # plan, build and review with a strong and a working model; false: the plain relay
+oneshot = false      # true: the objective is pinned as the goal when the job first starts
 
 # The gate. The goal is finished only when this exits 0. Without it, the goal is finished as
 # soon as one round completes.
@@ -48,4 +48,8 @@ effort = "medium"
 build_model = "claude-sonnet-5-5"
 build_effort = "high"
 round_budget_usd = 5
+reserve = false          # true: claude_api runs only while the others are out
+turn_max_s = 18000       # a turn ends after this long; every agent has it
+turn_budget_usd = 50     # or after this much spent in the turn
+goal_budget_usd = 150    # after this much in one goal it is left out until the goal changes
 key_file = "~/.config/baton/anthropic.key"

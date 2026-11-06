@@ -11,6 +11,7 @@ from baton.adapters.base import COMPLETED, LIMIT, RoundResult
 from baton.gateway import render_event
 from baton.phases import (
     BUILD,
+    CONSENSUS,
     PLAN,
     REVIEW,
     TIER,
@@ -34,7 +35,7 @@ def st(phase=PLAN, **kw):
 
 
 def test_tiers():
-    assert TIER == {PLAN: "strong", BUILD: "build", REVIEW: "strong"}
+    assert TIER == {PLAN: "strong", BUILD: "build", REVIEW: "strong", CONSENSUS: "strong"}
 
 
 def test_open_tasks_only_unchecked_lines():
@@ -47,7 +48,14 @@ def test_open_tasks_only_unchecked_lines():
     "text,expected",
     [
         ("APPROVED", "approved"),
-        ("\n\n  approved, looks good\nmore", "approved"),
+        ("\n\n  approved. looks good\nmore", "approved"),
+        ("APPROVED: it is met", "approved"),
+        ("APPROVED - fine", "approved"),
+        ("APPROVED\u2014fine", "approved"),
+        ("APPROVED only if the fps is 30", "changes"),
+        ("approved, looks good", "changes"),
+        ("APPROVED but the tests are red", "changes"),
+        ("APPROVEDLY", "changes"),
         ("Approved\n", "approved"),
         ("CHANGES\n- [ ] x", "changes"),
         ("", "changes"),
@@ -57,7 +65,24 @@ def test_open_tasks_only_unchecked_lines():
         ("NOT APPROVED", "changes"),
     ],
 )
-def test_verdict(text, expected):
+def test_the_strict_verdict_of_consensus(text, expected):
+    assert verdict(text, strict=True) == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("APPROVED", "approved"),
+        ("approved, looks good", "approved"),
+        ("APPROVED only if the fps is 30", "approved"),  # a plain review reads the first word
+        ("\ufeff  Approved\n", "approved"),
+        ("CHANGES\n- [ ] x", "changes"),
+        ("", "changes"),
+        ("# Review\nAPPROVED", "changes"),
+        ("NOT APPROVED", "changes"),
+    ],
+)
+def test_the_plain_verdict_of_a_review(text, expected):
     assert verdict(text) == expected
 
 
@@ -205,6 +230,64 @@ def test_review_prompt_without_a_base_still_tells_where_to_look():
     assert "git log" in phase_prompt(REVIEW, "", "")
 
 
+def test_the_plan_prompt_asks_for_the_check_only_when_told_to():
+    assert "VERIFY.sh" not in phase_prompt(PLAN, "", "abc")
+    text = phase_prompt(PLAN, "", "abc", write_check=True)
+    assert "`.baton/VERIFY.sh`" in text and "exit 0" in text
+    assert "as the person would experience it" in text and "real setup" in text
+    assert "no rounding" in text and "stand-in" in text and "fails the check" in text
+
+
+def test_the_plan_prompt_says_where_the_check_may_write():
+    text = phase_prompt(PLAN, "", "abc", write_check=True)
+    assert "only under `.baton/` or outside the working directory" in text
+
+
+def test_the_consensus_prompt_forbids_editing_and_asks_for_real_evidence():
+    text = phase_prompt(CONSENSUS, "", "abc123")
+    assert "Phase: CONSENSUS" in text and "do not edit code" in text
+    assert "Re-run the check" in text and "real evidence" in text
+    assert ".baton/REVIEW.md" in text and "APPROVED" in text and "CHANGES" in text
+    assert "git diff abc123..HEAD" in text
+    assert "```diff" not in text  # no check diff unless there is one
+
+
+def test_the_consensus_prompt_always_carries_the_check_and_says_when_to_reject_it():
+    text = phase_prompt(
+        CONSENSUS, "", "abc", check_text="exit 0\n", check_label="`.baton/VERIFY.sh`"
+    )
+    assert "The check, `.baton/VERIFY.sh`:\n```sh\nexit 0\n```" in text
+    assert "cannot fail" in text and "stand-in" in text and "CHANGES" in text
+    long = phase_prompt(
+        CONSENSUS, "", "abc", check_text="x" * 9000, check_label="the verify command"
+    )
+    assert "x" * 6000 in long and "x" * 6001 not in long and "left out" in long
+    assert "The check, the verify command:" in long
+
+
+def test_the_consensus_prompt_shows_how_the_check_changed_and_says_to_reject_a_weaker_one():
+    text = phase_prompt(
+        CONSENSUS,
+        "",
+        "abc",
+        check_diff="-fps >= 30\n+fps >= 3",
+        first_path="/state/verify.first.sh",
+    )
+    assert "```diff\n-fps >= 30\n+fps >= 3\n```" in text
+    assert "weaker" in text and "CHANGES" in text and "/state/verify.first.sh" in text
+
+
+def test_check_diff_is_the_unified_diff_from_the_first_version():
+    assert phases.check_diff("a\nb\n", "a\nb\n") == ""
+    assert phases.check_diff("", "a\n") == ""  # no first version, nothing to compare
+    diff = phases.check_diff("fps=30\ntest\n", "fps=3\ntest\n")
+    assert "-fps=30" in diff and "+fps=3" in diff
+    assert "first version" in diff.splitlines()[0]
+    long = phases.check_diff("x\n", "\n".join(f"line {i}" for i in range(5000)))
+    assert phases.CHECK_DIFF_CHARS == 12000
+    assert len(long) <= phases.CHECK_DIFF_CHARS + 200 and "left out" in long
+
+
 # the two files
 
 
@@ -221,6 +304,29 @@ def test_clear_review_removes_the_file_and_tolerates_none(tmp_path):
     f = tmp_path / ".baton" / "REVIEW.md"
     f.write_text("APPROVED")
     assert phases.clear_review(tmp_path) is True and not f.exists()
+
+
+def test_archive_check_moves_the_script_aside_and_tolerates_none(tmp_path):
+    assert phases.archive_check(tmp_path, 0) is None
+    (tmp_path / ".baton").mkdir()
+    script = tmp_path / ".baton" / "VERIFY.sh"
+    script.write_text("exit 0\n")
+    moved = phases.archive_check(tmp_path, 1_000_000)
+    assert not script.exists() and moved is not None
+    assert moved.parent == tmp_path / ".baton" / "archive" and moved.name.endswith("-VERIFY.sh")
+    assert moved.read_text() == "exit 0\n"
+    script.write_text("exit 1\n")
+    again = phases.archive_check(tmp_path, 1_000_000)  # same second: nothing is overwritten
+    assert again != moved and moved.read_text() == "exit 0\n"
+
+
+def test_add_task_appends_a_line_once_and_keeps_the_plan(tmp_path):
+    plan = tmp_path / ".baton" / "PLAN.md"
+    phases.add_task(tmp_path, "- [ ] fix it")
+    assert plan.read_text() == "- [ ] fix it\n"
+    phases.add_task(tmp_path, "- [ ] fix it")
+    phases.add_task(tmp_path, "- [ ] and this")
+    assert plan.read_text() == "- [ ] fix it\n- [ ] and this\n"
 
 
 def test_add_review_task_appends_once(tmp_path):
@@ -242,8 +348,8 @@ pytestmark = pytest.mark.phases
 class Agent(Fake):
     """A scripted adapter that also keeps the tier of each round, and reports a session id."""
 
-    def __init__(self, name, metered=False):
-        super().__init__(name, metered)
+    def __init__(self, name, metered=False, reserve=False):
+        super().__init__(name, metered, reserve)
         self.tiers = []
 
     def run_round(self, prompt, ctx):

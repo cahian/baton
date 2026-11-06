@@ -4,11 +4,13 @@
 
 baton keeps one long coding goal moving for days by passing it between coding agents, stopping
 each one before it can spend money it should not. It works with Codex and Antigravity alone;
-Claude is an optional third, a paid backup that only joins once you save an API key for it.
+Claude is an optional third, paid by use, that only joins the queue once you save an API key for
+it. Its turn ends at USD 50 or 5 hours, whichever comes first, it is left out of a goal after USD
+150 spent in that goal, and the monthly ceiling stays above all of that.
 
 You give it a goal (an objective, a working directory and a verification command). It runs one
-agent until that agent nears its limit, hands the work to the next, and when every agent is out,
-sleeps until the earliest reset and carries on. It finishes only when the verification command
+agent until that agent nears its limit or its turn (5 hours) ends, hands the work to the next, and
+when every agent is out, sleeps until the earliest reset and carries on. It finishes only when the verification command
 exits 0; an agent saying "done" means nothing.
 
 Every agent runs through its vendor's own CLI. baton reimplements no agent. Context moves between
@@ -18,7 +20,27 @@ is resumed when its turn comes again.
 Inside a goal the work follows a cycle of plan, build and review, with a strong and a working
 model per provider (see [Phases](#phases-plan-build-review)).
 
-![How baton works: Codex and Antigravity rotate, Claude is the backup, and every goal runs plan, build, review and verify.](docs/assets/baton-diagram.png)
+```mermaid
+flowchart LR
+    subgraph queue["The queue: one agent runs at a time"]
+        direction LR
+        codex["codex"] --> antigravity["antigravity"] --> claude["claude"]
+        claude -. "turn ends: back to the first" .-> codex
+    end
+    queue --> cycle
+    subgraph cycle["Every cycle of a goal"]
+        direction LR
+        plan["plan"] --> build["build"] --> review["review"]
+    end
+    review --> check{"the check passes?"}
+    check -- "no: back to plan" --> plan
+    check -- yes --> consensus["consensus: every agent approves"]
+    consensus -- "an agent asks for changes" --> build
+    consensus -- "all approve" --> done(["done"])
+```
+
+How baton works: Codex, Antigravity and then Claude take turns; every goal runs plan, build and
+review, then the check, then consensus of every agent, and only then is it done.
 
 ## What you need
 
@@ -31,7 +53,7 @@ two projects it did not write. Everything it depends on or works with:
 | [OpenCode](https://opencode.ai) | the chat window you type in; baton shows up in it as the model `baton/auto` | only for the chat interface: `baton run` works without it | the installer on [opencode.ai](https://opencode.ai) |
 | [Codex CLI](https://github.com/openai/codex) | runs GPT models, through your plan | at least one of Codex and Antigravity, signed in to a plan | `npm install -g @openai/codex`, then sign in |
 | [Antigravity CLI](https://antigravity.google) (`agy`) | runs Gemini models, through your plan | at least one of Codex and Antigravity, signed in to a plan | the installer on antigravity.google, then sign in |
-| [Claude Code](https://claude.com/claude-code) | an optional paid backup that runs only while both others are out | optional; needs a Console API key, not a subscription | install Claude Code, then save the key (Quick start, step 3) |
+| [Claude Code](https://claude.com/claude-code) | an optional third in the queue, paid by use: a turn ends at USD 50 or 5 hours, and a goal leaves it out after USD 150 | optional; needs a Console API key, not a subscription | install Claude Code, then save the key (Quick start, step 3) |
 | [Superpowers](https://github.com/obra/superpowers) | the working methods (planning, test-driven building, verification, code review) that baton puts in every round | **required**, by design: no round runs without it (a goal waits until it is installed), and `baton doctor` fails; see [Superpowers is required](#superpowers-is-required) | `git clone https://github.com/obra/superpowers ~/.config/baton/superpowers`; it is also found automatically from the official Claude Code plugin install, and any other location needs `[superpowers] dir` |
 | [ai-memory](https://github.com/akitaonrails/ai-memory) | long-term memory across goals in the same directory | optional | download the release binary for your platform from its releases page and put it on `PATH`; do not run `ai-memory setup`, which wires global hooks (see [Long-term memory](#long-term-memory)) |
 | launchd | keeps `baton serve` running in the background on macOS | macOS only, recommended: `baton install-service` | built in to macOS; on Linux keep `baton serve` running in a terminal or tmux |
@@ -89,9 +111,11 @@ Claude is optional. Open `~/.config/baton/defaults.toml` in any text editor and 
 - **No Claude (the simplest):** change nothing, and skip step 3. Without a saved key, Claude never
   runs and baton uses Codex and Antigravity only. To switch it off for good, set `enabled = false`
   under `[agents.claude_api]`.
-- **With the Claude backup:** set `monthly_budget_usd` to the credit you actually have, and
+- **With Claude:** set `monthly_budget_usd` to the credit you actually have, and
   `budget_reset_day` to the day of the month it renews. baton stops 10% before that number. Then
-  do step 3.
+  do step 3. Claude joins the queue after the other two; its turn ends at USD 50 or 5 hours,
+  whichever comes first, and a goal leaves it out after USD 150. To keep it for last, so that it
+  runs only while the others are out, set `reserve = true` under `[agents.claude_api]`.
 
 Change `enabled` for `codex` or `antigravity` the same way if you only have one of them.
 
@@ -196,7 +220,9 @@ The answer streams in the chat like any other model. A small request is answered
 plan finds nothing to build and the cycle ends there. A line tells you each time one agent hands
 over to another, and one each time the phase changes. While it works:
 
-- **To change direction,** just send another message. It interrupts the current round.
+- **To change direction,** just send another message. It reaches the agent after its current tool
+  call (never later than five minutes after), including a message you type while a reply is
+  streaming, which OpenCode would otherwise hold until the reply ends.
 - **Closing OpenCode does not stop the work.** It keeps running in the background.
 
 ### 8. Watch it, or stop it
@@ -208,6 +234,7 @@ baton jobs                   # everything running; names look like session-<id>
 baton status session-<id>    # where it is and what it has spent
 baton stop session-<id>      # stop it
 baton doctor                 # limits and spending right now
+baton restart                # restart the gateway between rounds (see Keeping it running)
 ```
 
 ### 9. Let it run until the job is really done
@@ -245,26 +272,48 @@ adds a working model for building):
 2. **Gemini 4 Argon**, through Antigravity (`agy`).
 3. **Claude Opus 5.5**, through a Console API key (never a subscription login).
 
-Codex and Antigravity are the plan agents: their included usage comes back at a reset. Claude is
-paid by use and has no reset that would ever stop it, so it is a fallback, wherever it stands in
-`order`. **Claude runs only while both others are out.**
+That is the queue. An agent gives way to the next after **5 hours of work**, or sooner when its
+limit runs out. Only the time its rounds ran counts: a cooldown, a wait or a stopped service does
+not. Claude's turn also ends at **USD 50**, whichever comes first, and after **USD 150** spent in
+one goal (a goal is what you pin with `baton: goal`) Claude is left out of the queue until the goal
+changes. The others have no budget of their own. Claude is paid by use and has no reset that would
+ever stop it, so the ledger's monthly ceiling (see [The Claude ledger](#the-claude-ledger))
+stays above all of this.
 
-**Claude is optional.** baton works with Codex and Antigravity alone, and that is the default
-experience: until you save a key file (Quick start, step 3), Claude never runs and the rotation is
-the other two. It joins as a backup only once the key is there. To turn it off for good, set
-`enabled = false` under `[agents.claude_api]` in `defaults.toml`, or leave it out of `order` in a
-goal file. `baton doctor` reports an unconfigured Claude as one `ok` line, not a problem.
+**Claude is optional.** baton works with Codex and Antigravity alone: until you save a key file
+(Quick start, step 3), Claude never runs and the rotation is the other two. It joins the queue
+once the key is there. To turn it off for good, set `enabled = false` under `[agents.claude_api]`
+in `defaults.toml`, or leave it out of `order` in a goal file. `baton doctor` reports an
+unconfigured Claude as one `ok` line, not a problem.
 
-The first plan agent in `order` starts. The current one keeps working until it is unavailable,
-then the next plan agent takes over, wrapping around. A plan agent that comes back does not
-preempt another plan agent that is working. When both are out, Claude runs. While it does, baton
-reads the plan agents (without a model call) from their reset time onward, at most every 30
-seconds, and as soon as one is available it ends the Claude round and that agent takes over. If
-both are, the first in `order` goes first. This is not a failure: Claude gets no cooldown. A plan
-agent whose round fails within five minutes of such a takeover stops being allowed to end Claude
-rounds until it completes one. At most six Claude rounds a day are ended this way (`baton
-status` says when the cap is active). When no agent can run, baton waits for the earliest known reset.
-Change the order, or disable an agent, in the goal file.
+The first agent in `order` starts. The current one keeps working until it is unavailable, its turn
+is over, or you type `baton: next` (or `baton next`); then the next one in `order` takes over,
+wrapping around. This happens only between two rounds: a turn that ends while a round runs lets
+the round finish, and `baton: next now` ends the round at the next gap between tool calls. Each
+change is one line in the chat, `[baton] rotation: codex -> antigravity (5 hours)`, with the reason
+(`asked by the person`, `5 hours`, `USD 50`), said once the next agent actually starts. When no
+other agent can run (it is out, or has no key), the agent stays, nothing is said and its turn
+starts over. A review may go to Claude when it is the only other agent that can take it; that
+round counts in the goal's spend, not in the turn. An agent that comes back from its limit does
+not preempt another that is working. When no agent can run, baton waits for the earliest known reset, and takes a `next` that arrives meanwhile.
+
+**Reserve.** With `reserve = true` under `[agents.claude_api]`, Claude leaves the queue and waits
+for the others, wherever it stands in `order`: it runs only while every other agent is out. While
+it does, baton reads the others (without a model call) from their reset time onward, at most every
+30 seconds, and as soon as one is available it ends the Claude round and that agent takes over.
+If more than one is, the first in `order` goes first. This is not a failure: Claude gets no
+cooldown. An agent whose round fails within five minutes of such a takeover stops being allowed to
+end Claude rounds until it completes one. At most six Claude rounds a day are ended this way
+(`baton status` says when the cap is active). Without `reserve` (the default) none of this
+happens.
+
+The turn of a reserve Claude never ends. The limits are settings (`turn_max_s` for every agent, in
+seconds, default 18000; `turn_budget_usd`, default 50, and `goal_budget_usd`, default 150, for
+Claude). They go in `defaults.toml` or in a goal file. A repository's `baton.toml` may only lower
+them (and `round_budget_usd`), may not turn a `reserve` off, and may not enable an agent that
+`defaults.toml` disables. Claude reports a session's cost as a running total, so a resumed round counts only what it added to the last total baton saved for that session. A round that ends without a cost report (killed, timed out) counts its
+whole reservation against the turn and the goal, as the ledger does. Change the
+order, or disable an agent, in the goal file.
 
 ## Phases: plan, build, review
 
@@ -292,8 +341,9 @@ what that agent does and which of its two models runs. State lives in `.baton/PL
    Changes go back to build at most 2 times; a third `CHANGES` ends the cycle.
 4. **End of cycle.** The verify command runs here, and a failed run goes back to plan. It also
    runs after every 3 rounds without a phase change, whatever their outcome (a timeout resumes
-   rather than advances), and a pass finishes the goal as usual. With no verify command, the end
-   of a cycle finishes the goal.
+   rather than advances), and a pass finishes the goal as usual (with a goal set, it starts
+   [consensus](#a-goal-ends-only-when-its-check-passes-and-every-agent-approves) instead). With no
+   verify command, the end of a cycle finishes the goal.
 
 A note from a person in the middle of a cycle is delivered as before, outranks the current task,
 and changes no phase; a new message starts a new cycle at plan, and `.baton/PLAN.md` and
@@ -310,6 +360,83 @@ just before a review round and reads the verdict only after a round that complet
 tracked or new file outside `.baton/` changes), the review is void: it counts as `CHANGES`, a
 `phase` event says `reviewer changed the code`, and a task to review those changes is added to the
 plan. A reviewer editing a gitignored file is not detected.
+
+### A goal ends only when its check passes and every agent approves
+
+While a goal is set (`baton: goal <text>`, `baton goal`, or `oneshot`), a passed verify does not
+finish the job, whatever the goal file says. A goal needs phases and a git repository, because
+consensus is a phase and an approval is bound to the state of the tree. With `phases = false`, or
+outside a repository, `baton: goal` answers `[baton] a goal needs phases, and phases = false here`
+(or `a goal needs a git repository`), `baton goal` exits with that error, and `oneshot = true` with
+`phases = false` is an error in the goal file. A run that finds a goal set where it cannot do it (a
+`baton.toml` edited to `phases = false` and a restart, a `.git` that disappeared) alerts once and
+holds, as it does for a missing Superpowers: no round, nothing ends, a stop is honoured, until the
+goal is cleared (`baton: goal off`) or the setup is fixed and the job restarted.
+
+The check is `verify.command` when the goal file has one. Otherwise it is `.baton/VERIFY.sh`, which
+the plan writes: it must exit 0 only when the goal is met as the person would experience it, in the
+real setup, with no rounding, a check that measures a stand-in fails the check, and it writes only
+under `.baton/` or outside the working directory (anything else it leaves in the tree counts as a
+change to the work). With no check the gate fails with `no check`, and the plan stays in plan, with
+tasks or without, until `.baton/VERIFY.sh` exists. The gate before round 1 and the periodic one run
+only with a check that exists.
+
+- **The check is locked.** At the end of each completed plan round baton saves the script's hash,
+  and keeps its first version in the state directory (`verify.first.sh`). A gate that finds another
+  hash fails with `the check changed outside plan` and alerts, so a build round cannot weaken it
+  silently. A plan round may change it; consensus then shows every approver the diff against the
+  first version, and tells them to reject a weaker check. When a goal ends or changes, the script
+  moves to `.baton/archive/` with the lock and the first version: the next goal writes its own.
+- **Consensus.** A pass starts it: every agent in `order` that can run (not left out for its goal
+  budget, and not one that can never run: disabled, no usable key, or a `round_budget_usd` below
+  the minimum) takes a fresh, strong round, one at a time, without moving the queue or its turns,
+  and with no round tail and no preemption watch. Every approver is shown the check itself (the
+  command or the script) and told to reject one that cannot fail or measures a stand-in. It may not
+  change the tree or the check, reruns the check itself, inspects real evidence, and writes
+  `REVIEW.md` with `APPROVED` or `CHANGES` first (`APPROVED only if ...` is not an approval). An
+  agent out of quota is waited for (`waiting for <agent> to approve`, said once per reason); a round
+  that did not complete is retried, and three in a row count as one failed cycle; an agent that
+  crosses its goal budget in the meantime leaves the list, and the chat says so.
+- **An approval belongs to a state.** When the gate passes baton records the tree (HEAD and every
+  changed file outside `.baton/`) and the check's hash. After every consensus round, completed or
+  not, on a restart, and just before the goal ends, they are compared: a change rejects, consensus
+  ends and the work goes back to build, with a note naming the changed paths from `git status`. A
+  clean round's own snapshot commit moves the record along. Before it ends, baton also looks again
+  at the goal (changed or cleared ends the approval) and asks anyone who can run now and has not
+  approved. Everyone approving ends the goal: `[baton] goal achieved: check passed, approved by
+  codex, antigravity, claude_api`, and the goal is archived.
+- **The goal's terms are saved.** When a goal is first seen baton saves its terms in `state.json`
+  (`goal_terms`: the verify command, `order`, which agents are enabled, and every agent's
+  `round_budget_usd`, `turn_budget_usd` and `goal_budget_usd`, which a repository's `baton.toml` may
+  lower and so take Claude out of consensus). A later difference, from
+  a `baton.toml` an agent edited or anything else, fails the gate with `the goal's terms changed:
+  <what>` and an alert, and voids a consensus under way, until the person sets the goal again with
+  `baton: goal` or `baton goal` (the same words will do), which saves the terms as they are.
+  Consensus shows the saved verify command.
+- **The check runs once more at the end.** Just before the goal ends baton runs the check again:
+  the tree comparison cannot see what git ignores (a `dist/`, a build). A failure rejects, back to
+  build, and a goal that changes while any check runs does not get that run's result: the check runs
+  again for the new goal.
+- **A no goes back to build.** `CHANGES`, a missing verdict or a changed tree ends consensus: the
+  review becomes a note, a task goes to the plan, and the chat says `[baton] <agent> rejected:
+  back to build`. A message from the person during consensus ends it the same way, and `next` is
+  taken and dropped with a `[baton]` line.
+- **No giving up.** Every 3 cycles that end with a failed gate or a rejection, baton alerts `no
+  progress in N cycles: still working`, and carries on.
+
+**Hardening, and the trust boundary.** Every git call baton makes runs with `core.fsmonitor`,
+`core.hooksPath` and `core.pager` neutralised, so those cannot run a program inside baton. Other
+config still can: a repository's `filter.*` (clean and smudge) programs run inside git, and baton
+does not disable filters. What stops them forging an approval is the order: an approver's
+`REVIEW.md` is read before baton's next git call. The tree record
+also covers tracked files hidden with `skip-worktree` or `assume-unchanged`. Baton sets
+`BATON_ROUND=1` in every agent's environment, and the commands that steer a goal (`baton goal`,
+`next`, `restart` and `stop`) refuse to run under it, so an agent's shell cannot accept its own
+changed terms or clear the goal. This only raises the bar: agents run as the same user with full
+access to the machine, so a determined agent can still write to baton's own state directory (the
+goal file, `state.json`, `verify.first.sh`) or unset the variable. The protection is the check and
+the consensus, which guard the work and the check, not baton from the agents it runs. Helper files
+a check calls beside it are not locked either.
 
 **Subagents are allowed on the provider's two models.** A subagent may use only the strong or the
 working model of its provider, exactly, and what enforces that differs by provider.
@@ -362,7 +489,11 @@ never runs `ai-memory setup`, `install-hooks`, `install-mcp` or `run`.
 - Before every round, baton searches the project's memory with words from the last verify output
   (at most 16 of them) and the objective (the rest, up to 24 in all), and puts the best 5 hits (6000 characters at most) in the prompt, labelled as
   context that may be out of date, not as instructions. Words are taken from the end of the
-  verify output and of the objective, where the errors and the newest message are. The hits sit
+  verify output and of the objective, where the errors and the newest message are. Each hit is
+  the page itself, not search's short snippet: baton reads it and puts in the prompt the part
+  around where the search matched (the head when it cannot tell), sharing the 6000 characters
+  among the hits, 1200 at most for each. Pages that hold lessons come first, and the pages of
+  this goal's own rounds are left out, since the handoff already carries them. The hits sit
   between `--- BEGIN BATON MEMORY ---` and `--- END BATON MEMORY ---`, one line each, starting
   with the page's date and goal.
 - After a round that started a process, baton stores one page: the date, the agent, how it ended,
@@ -371,8 +502,11 @@ never runs `ai-memory setup`, `install-hooks`, `install-mcp` or `run`.
   verify has run, so a baton killed during the verify still leaves its page. A round that fails,
   times out or has a failing verify is kept as a "gotcha"; a stop, an interrupt, a takeover by
   another agent or a limit is normal rotation.
-- Agents are told to keep durable findings under a `## Lessons` heading in the handoff. When that
-  section changes, baton stores it as a pinned page that outlives the goal.
+- Agents are told to keep durable findings under a `## Lessons` heading in the handoff. baton also
+  takes `## Lessons ...` and `### Lessons ...` headings and list items that start with
+  `**Lessons`, with their indented lines (code fences are skipped). When that changes, baton
+  stores it as a pinned page that outlives the goal. Each round's page is announced in
+  `baton status` as a `memory` event `recorded`.
 - ai-memory redacts secrets before it stores anything. Memory is per directory: a project is the
   directory's name plus a short hash of its full path, and a search never leaves it.
 - The data is in `~/.local/state/baton/.ai-memory` (mode 700), with its own config and its own
@@ -409,7 +543,8 @@ and a warning in `baton doctor`.
 
 - One memory call, starting the server included, is given 8 seconds in all. After any failure
   (server dead, garbage output) baton skips memory for 300 seconds, so a broken memory costs a
-  round one short wait at most. A missing binary costs nothing and says nothing; `baton doctor`
+  round one short wait at most. A page that cannot be read does not stop memory: for 300 seconds
+  the hits are search's snippets instead of pages. A missing binary costs nothing and says nothing; `baton doctor`
   warns. Failures show in `baton status` as `memory` events, never in the chat.
 - If you change `port` while the old server is still running, baton starts no second one: it says
   so, in `baton status` and `baton doctor`, and you stop the old server (or set the old port
@@ -462,7 +597,7 @@ budget is baton's own:
   steps, so a round can pass it slightly and the reserve covers that. If the ceiling would be passed, the round shrinks to what is left, and below
   5 USD the agent is unavailable until the next period.
 - A round that ends without a result keeps its whole reservation counted. Crashes overcount and
-  never undercount. So does a round ended because a plan agent came back: it has no result, and
+  never undercount. So does a round ended because another agent came back (`reserve = true`): it has no result, and
   whatever it spent before is counted as the whole 5 USD. The ledger drifts high, never low, and
   the small default keeps that drift small. A corrupt ledger makes the agent unavailable; it is never recreated silently.
 - Optionally, `admin_key_file` points to an Admin API key. baton then also reads the Console cost
@@ -486,6 +621,15 @@ budget is baton's own:
   but a balance drop it causes still stops baton's round.
 - **Antigravity's output when its quota actually runs out has not been observed.** The limit reads
   are expected to stop it first.
+- **Masking is by pattern.** Before it is shown, kept in the round tail or put in the log of events,
+  the agent's output has the value of `Bearer ...` and of `token`, `api_key`, `secret`, `password`
+  and `passwd` assignments (also in a longer name such as `DB_PASSWORD`) and the well-known token
+  shapes (`sk-`, `ghp_`, `AKIA`, `xoxb-`) replaced by `[masked]`. A quoted value is masked from 8
+  characters, spaces included. An unquoted value is masked only when it holds a digit or a symbol
+  other than `.`, `_`, `-`, so code such as `password = self.password` is left alone: **an unquoted
+  value of letters only is not caught.** A placeholder (`$TOKEN`, `${TOKEN}`, `<token>`) is never
+  masked. A secret in another shape, or split across two streamed fragments, is not caught either,
+  and the raw round log keeps what the agent printed. The next agent is told what `[masked]` is.
 - **A response held open for days through OpenCode is untested** beyond seconds. The job does not
   depend on it: `baton jobs` and `baton status session-<id>` show where it is, and a new message
   in the session reattaches the stream.
@@ -525,6 +669,10 @@ monthly_budget_usd = 200   # what the organization holds
 reserve_pct = 10           # kept back; the spend ceiling is 200 - 10% = 180
 budget_reset_day = 1       # day of the month the period starts, 00:00 UTC
 round_budget_usd = 5       # most one round may spend (a killed round counts all of it)
+reserve = false            # true: Claude waits for the others, and runs only while they are out
+turn_max_s = 18000         # a turn ends after this long (every agent has it): 5 hours
+turn_budget_usd = 50       # or after this much spent in the turn
+goal_budget_usd = 150      # after this much in one goal, Claude is left out until the goal changes
 key_file = "~/.config/baton/anthropic.key"
 admin_key_file = ""        # optional Admin API key file, to cross-check spend
 
@@ -576,6 +724,7 @@ name = "example"
 workdir = "/path/to/project"
 objective = "Make the build pass on all platforms."
 phases = true   # false keeps the plain relay, with the strong model for every round
+oneshot = false # true pins the objective as the goal when the job first starts
 
 [verify]
 command = "./check.sh"
@@ -586,13 +735,24 @@ The verification command runs through the shell in the working directory. Exit 0
 goal; anything else, including a timeout, means not done, and its output goes to the next round.
 Without `verify.command`, the goal is finished when a cycle ends (a round, with `phases = false`).
 
+A goal the person fixes (`goal.md` in the state directory, set from OpenCode or with `baton goal`) opens
+every prompt, fresh or resumed, with `Goal, fixed by the person. It does not change until the person
+changes it:` and its text. It is on while that file is not empty. A goal over 8000 characters goes to
+a file under `.baton/notes/` once, and only its first 1000 characters and the file's name are pinned.
+`oneshot = true` pins the objective as the goal once, at a job's first start (state.json remembers it),
+so a restart never brings back one that was cleared. Only a goal file you pass to `baton run` may set
+it: a repository's `baton.toml` is refused, as it would pin text an agent wrote.
+
 Between rounds each agent gets the same context: the repository, its commits, `.baton/HANDOFF.md`
 (kept current by the agents), the last gate output and the tail of the previous round. `.baton/`
-lives in the working directory and is added to `.git/info/exclude`. With `ai-memory` installed, what
-earlier goals learned in the directory is added too (see [Long-term memory](#long-term-memory);
-`memory = false` turns it off). After each round baton commits
+lives in the working directory and is added to `.git/info/exclude`. A handoff over 16000 characters
+is cut in the middle: its first 4000 and its last 12000 are kept, with a line saying how much was
+left out. From OpenCode, an over-long conversation keeps the person's messages first, newest first,
+each cut to its first 8000 characters, and gives assistant messages the room that is left, each
+gap marked with `...`. With `ai-memory` installed, what earlier goals learned in the directory is
+added too (see [Long-term memory](#long-term-memory); `memory = false` turns it off). After each round baton commits
 uncommitted work locally as `baton: snapshot round <n> (<agent>)` so a hard stop loses nothing. It
-never pushes (`snapshot = false` turns the commits off).
+never pushes (`snapshot = false` turns the commits off). `.baton/`, `__pycache__/` and `*.pyc` are kept out of it through `.git/info/exclude`.
 
 ### `baton.toml`
 
@@ -631,18 +791,40 @@ and context on its side.
 
 Each OpenCode session becomes a job that runs in its own thread inside `baton serve`, independent of
 the HTTP connection. A dropped connection never stops it, and a new message in the session becomes
-a note that interrupts the running round. A message gets at least one round, even if the gate
+a note that ends the running round once its current tool call is done (after five minutes at the
+latest). A message typed while the reply streams, which OpenCode queues in its database and posts
+only when the reply ends, is read from there every 2 seconds (read-only, and any failure is
+silent), delivered as a note at once, and not delivered again when OpenCode later posts it. Every
+conversation of the job reads every note, not only the first one to take it, and a note over 8000
+characters goes to a file under `.baton/notes/` in the directory, with its first 1000 characters
+and the file's name in the prompt. A message gets at least one round, even if the gate
 already passes. A request that repeats what was already accepted, as a client's retry does, attaches
 to the stream and interrupts nothing, so it costs no round. `baton jobs` lists every job, and
-`baton status`, `baton say` and `baton stop` accept its name (`session-<id>`) in place of a goal
-file. The stream shows the agents' text, one line per rotation, a sentence when a returning plan
-agent ends a Claude round, waits and gate results, and when no agent can run it says why, for
+`baton status`, `baton say`, `baton goal`, `baton next` and `baton stop` accept its name (`session-<id>`) in place of a goal
+file. The stream shows the agents' text, one line per rotation, a sentence when a returning
+agent ends a reserve Claude round, waits and gate results, and when no agent can run it says why, for
 each one. Title requests are answered locally and spend nothing. The
 working directory is read from OpenCode's own database (`~/.local/share/opencode/opencode.db`, or
 the path in `BATON_OPENCODE_DB`); baton never guesses one.
 
 One runner works in a directory at a time, across `baton run` and `baton serve`. A directory inside
 or around a running one counts as busy, since the two would commit each other's work.
+
+### Commands in the chat
+
+A message that starts with `baton:` (any case) is a command, not work. They never start with `/`,
+which belongs to OpenCode. Text that only contains these words is an ordinary message.
+
+| Message | What it does |
+|---|---|
+| `baton: goal <text>` | Fix the goal (the rest of the message, over any number of lines). With no job running it starts one with `<text>` as the objective; with one running it is also a note, so the next round reads it. Chat: `[baton] goal set`. |
+| `baton: goal off` | Clear the goal, from the next round's prompt, and leave the note `The person cleared the goal.` for the agent. Chat: `[baton] goal cleared`. |
+| `baton: next` | Ask for the next agent in the queue after this round. It is stored for the rotation to take. With no job running baton answers in one line and stores nothing. |
+| `baton: next now` | The same, and the round ends after its current tool call. |
+
+A command typed while the reply streams goes through the same parsing when baton reads it from
+OpenCode's queue, and neither a retry of one nor OpenCode's later post of the same words runs it
+twice. Old commands are left out of the conversation a new job is briefed with.
 
 ### Keeping it running
 
@@ -665,6 +847,17 @@ agent or `node` moves. Your verification commands get that same `PATH`, so a too
 elsewhere must be called by its full path. A verification command that exits 126 or 127 can never
 pass, so baton says so once in the chat and in `baton status`, and the rounds go on.
 
+**Restarting the gateway.** `baton restart` writes a request that the running `baton serve` sees.
+Each job then holds at the next point between rounds (also inside a wait), says so once, and the
+gateway sends itself SIGTERM when every running job is held, so no round is cut off. A job in the
+middle of a round is never held, and a `baton stop` still ends a hold. The jobs are resumed after
+the restart, exactly as after any restart. Under launchd (`baton install-service`) KeepAlive brings
+the service back; without a supervisor the gateway simply exits and you start `baton serve` again.
+It works whether or not jobs run. `baton restart --now` does not wait for the jobs: it is the same
+as stopping the service, and the jobs resume. A request left over when the service starts is
+dropped. To cancel a request that is still waiting, delete the file `.restart` in the state directory
+(`~/.local/state/baton/.restart` unless `BATON_STATE_DIR` moves it): the held jobs go on at once.
+
 [`examples/baton-serve.plist`](examples/baton-serve.plist) shows the same file with placeholders,
 for writing it by hand.
 
@@ -677,8 +870,11 @@ for writing it by hand.
 | `baton serve [--port 18777]` | Start the OpenCode gateway. |
 | `baton jobs` | List every job and goal that has state: whether its runner is alive, round, current agent, last event. |
 | `baton status <goal.toml or job>` | One-shot status: rounds, cooldowns, recent events. |
-| `baton say <goal.toml or job> [--now] "note"` | Leave a note for the next round. `--now` also interrupts the current one. |
+| `baton say <goal.toml or job> [--now] "note"` | Leave a note for the next round. `--now` also ends the current one, after its tool call. |
+| `baton goal <goal.toml or job> "text"` / `--off` | Fix the goal every prompt opens with, or clear it. |
+| `baton next <goal.toml or job> [--now]` | Ask for the next agent in the queue; `--now` also ends the round after its tool call. |
 | `baton stop <goal.toml or job> [--now]` | Stop after the current round, or kill the round with `--now`. |
+| `baton restart [--now]` | Restart the gateway once every running job is between rounds; `--now` does not wait. Jobs resume. |
 | `baton opencode-config [--port 18777]` | Print the provider JSON for `opencode.json`. |
 | `baton install-service [--port 18777]` | Write the launchd plist and load it (macOS). |
 

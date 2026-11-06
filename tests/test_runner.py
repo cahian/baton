@@ -1,12 +1,16 @@
 import json
 import os
+import re
 import subprocess
 import threading
 import time
+import types
+from dataclasses import replace
+from decimal import Decimal
 
 import pytest
 
-from baton import runner
+from baton import gateway, runner
 from baton.adapters.base import (
     AUTH,
     COMPLETED,
@@ -17,6 +21,7 @@ from baton.adapters.base import (
     TRANSIENT,
     Availability,
     RoundResult,
+    ToolWatch,
 )
 from baton.config import MemoryConfig, load_goal
 from baton.memory import Memory, RoundEntry
@@ -27,6 +32,9 @@ from baton.store import (
     StateError,
     Store,
     WorkdirBusy,
+    clear_restart,
+    request_restart,
+    restart_request,
     state_base,
     workdir_conflict,
     workdir_lock,
@@ -53,9 +61,10 @@ class World:
 class Fake:
     """Scripted adapter. Each script step is `fn(agent, prompt, ctx) -> RoundResult`."""
 
-    def __init__(self, name, metered=False):
+    def __init__(self, name, metered=False, reserve=False):
         self.name = name
         self.metered = metered
+        self.reserve = reserve
         self.avail = Availability(True)
         self.script = []
         self.prompts = []
@@ -81,6 +90,18 @@ def done(workdir):
 
     def step(agent, prompt, ctx):
         (workdir / "DONE").write_text("x")
+        return RoundResult(COMPLETED)
+
+    return step
+
+
+def done_and_stop(work, store):
+    """Step that satisfies the gate and asks for a stop: a goal that is set does not end on the
+    pass (consensus does), and these tests are about what comes before that."""
+
+    def step(agent, prompt, ctx):
+        (work / "DONE").write_text("x")
+        store.request_stop()
         return RoundResult(COMPLETED)
 
     return step
@@ -268,7 +289,7 @@ def test_state_error_is_survived_and_cooldowns_are_kept(tmp_path, work, agents, 
     flaky = FlakyStore(tmp_path / "flaky")
 
     def limit_then_break_store(agent, prompt, ctx):
-        flaky.fail_loads = 3  # record's save, the next iteration's saves
+        flaky.fail_loads = 4  # the saves of record and note_round, and the next iteration's
         return RoundResult(LIMIT, until=world.now + 3600)
 
     agents["codex"].script = [limit_then_break_store]
@@ -335,6 +356,101 @@ def test_stop_during_wait_wakes_early(go, agents, store, world):
     assert 20 <= sum(world.sleeps) <= 30
 
 
+# a restart of the gateway
+
+
+class GatewayStore(Store):
+    """What the gateway's job store adds: it sees the restart request and hears when held."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.reports: list[bool] = []
+
+    def restart_pending(self):
+        return restart_request() != ""
+
+    def report_held(self, held):
+        self.reports.append(held)
+
+
+@pytest.fixture
+def gstore(tmp_path):
+    return GatewayStore(tmp_path / "state")
+
+
+def test_a_restart_holds_the_run_before_it_picks_an_agent(go, agents, work, gstore, world):
+    request_restart()
+    agents["codex"].script = [done(work)]
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        assert agents["codex"].prompts == []  # nothing runs while it is held
+        if len(world.sleeps) >= 3:
+            clear_restart()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert len(world.sleeps) == 3 and len(agents["codex"].prompts) == 1
+    held = [e for e in gstore.events() if e["kind"] == "held"]
+    assert len(held) == 1  # said once, however long it holds
+    assert gstore.reports == [True, False]
+    assert "baton restart" in gateway.render_event("held", held[0])
+
+
+def test_a_restart_never_holds_a_round_that_is_running(go, agents, work, gstore, world):
+    def ask_for_a_restart(agent, prompt, ctx):
+        assert gstore.reports == []
+        request_restart()  # in the middle of the round: it ends first
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [ask_for_a_restart, done(work)]
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        clear_restart()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert len(agents["codex"].prompts) == 2
+    assert gstore.reports == [True, False]
+
+
+def test_a_stop_ends_the_hold_and_is_honoured(go, agents, gstore, world):
+    request_restart()
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        gstore.request_stop()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert agents["codex"].prompts == [] and kinds(gstore)[-1] == "stopped"
+    assert gstore.reports[0] is True and gstore.reports[-1] is False
+    assert restart_request() == "soon"  # the restart itself is the gateway's to clear
+
+
+def test_a_run_in_a_long_wait_counts_as_held(go, agents, gstore, world):
+    agents["codex"].script = [result(LIMIT, until=world.now + 7200)]
+    agents["antigravity"].script = [result(LIMIT, until=world.now + 7200)]
+    seen = []
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        if sum(world.sleeps) >= 10:
+            request_restart()
+        if sum(world.sleeps) >= 30:
+            seen.append(list(gstore.reports))
+            gstore.request_stop()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert seen == [[True]]  # held inside the wait, which goes on
+    assert sum(world.sleeps) < 60
+
+
+def test_a_run_outside_the_gateway_ignores_a_restart(go, agents, work, store):
+    request_restart()
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "held" not in kinds(store) and len(agents["codex"].prompts) == 1
+
+
 # no verify command
 
 
@@ -394,6 +510,16 @@ def test_prompt_contains_objective_gate_tail_handoff_and_rules(tmp_path, work, g
         assert needle in prompt, needle
 
 
+def test_the_prompt_says_what_masked_is_only_with_a_tail(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    args = dict(gate_tail="", notes="", handoff="", resumed=False)
+    with_tail = build_prompt(goal, round_tail="password=[masked]", **args)
+    assert "Tail of the previous round" in with_tail
+    head = with_tail.split("Tail of the previous round", 1)[1].split("\n", 1)[0]
+    assert "[masked]" in head and "credential" in head and len(head) < 200
+    assert "[masked]" not in build_prompt(goal, round_tail="", **args)
+
+
 def test_previous_round_tail_reaches_next_agent(go, agents, work, world):
     agents["codex"].script = [
         say(["# hidden", "I was halfway through the parser"], result(LIMIT, until=world.now + 3600))
@@ -450,6 +576,47 @@ def test_resume_failure_reruns_fresh_and_clears_id(tmp_path, work, go, agents, s
     assert store.load_state()["round"] == 5
 
 
+def test_a_sessions_total_is_saved_handed_back_and_forgotten_with_the_session(
+    go, agents, work, store
+):
+    seen = []
+
+    def report(session, total):
+        def step(agent, prompt, ctx):
+            seen.append(ctx.session_total)
+            ctx.on_session(session)
+            ctx.on_session_total(session, Decimal(total))
+            return RoundResult(COMPLETED)
+
+        return step
+
+    def lost(agent, prompt, ctx):
+        seen.append(ctx.session_total)
+        ctx.on_session_total(ctx.session_id, Decimal("99"))
+        return RoundResult(TRANSIENT, reason="resume failed: gone", resume_failed=True)
+
+    agents["codex"].script = [report("s1", "5"), report("s1", "10"), lost, done(work)]
+    assert go() == 0
+    # none for a fresh session, then what it last reported; a failed resume keeps nothing
+    assert seen == [None, Decimal("5"), Decimal("10")]
+    assert store.load_state()["session_totals"] == {}
+
+
+def test_a_state_without_session_totals_loads_and_charges_the_whole_figure(go, agents, work, store):
+    store.save_state({"workdir": str(work), "sessions": {"codex": "c1"}, "round": 3})
+    seen = []
+
+    def step(agent, prompt, ctx):
+        seen.append((ctx.session_id, ctx.session_total))
+        ctx.on_session_total("c1", Decimal("2.5"))
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [step, done(work)]
+    assert go() == 0
+    assert seen == [("c1", None)]
+    assert store.load_state()["session_totals"] == {"c1": "2.5"}
+
+
 # interrupts
 
 
@@ -493,6 +660,135 @@ def test_interrupt_requested_between_rounds_does_not_kill_the_next_one(go, agent
 
     agents["codex"].script = [check, done(work)]
     assert go() == 0
+
+
+# the interrupt waits for a tool
+
+
+class Watching(Fake):
+    """A Fake whose stream shows tools: the line `start` opens one, `end` closes it."""
+
+    def tool_watch(self):
+        class Watch(ToolWatch):
+            def feed(self, line):
+                if line == "boom":
+                    raise RuntimeError("cannot read this")
+                if line == "start":
+                    self.open.add("t")
+                elif line == "end":
+                    self.open.discard("t")
+
+        return Watch()
+
+
+def kills(ctx, times=5):
+    return [ctx.should_kill() for _ in range(times)]
+
+
+def test_an_interrupt_waits_for_the_running_tool_to_end(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_session("sess-w")
+        ctx.on_output("start")
+        store.say("use sqlite")
+        store.request_interrupt()
+        seen["during"] = kills(ctx)
+        ctx.on_output("end")
+        seen["after"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert seen["during"] == [False] * 5 and seen["after"] is True
+    assert agents["codex"].sessions == [None, "sess-w"]
+    assert "use sqlite" in agents["codex"].prompts[1]
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert ends[0]["interrupted"] is True
+
+
+def test_an_interrupt_with_no_tool_running_ends_the_round_at_once(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        ctx.on_output("end")
+        store.request_interrupt()
+        seen["now"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert seen["now"] is True
+
+
+def test_an_interrupt_waits_for_a_tool_at_most_message_wait_s(go, agents, work, store, world):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        store.request_interrupt()
+        seen["early"] = ctx.should_kill()  # the wait begins here
+        world.now += runner.MESSAGE_WAIT_S - 1
+        seen["almost"] = ctx.should_kill()
+        world.now += 1
+        seen["capped"] = ctx.should_kill()  # the tool is still running
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert (seen["early"], seen["almost"], seen["capped"]) == (False, False, True)
+
+
+def test_stop_now_ends_the_round_even_in_the_middle_of_a_tool(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        store.request_stop(now=True)
+        seen["killed"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first]
+    assert go() == 0
+    assert seen["killed"] is True
+
+
+def test_a_watch_that_fails_is_dropped_and_the_interrupt_ends_the_round(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        ctx.on_output("boom")  # the watch raises: this round is no longer watched
+        store.request_interrupt()
+        seen["killed"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert seen["killed"] is True
+
+
+def test_an_interrupt_still_waiting_when_the_agent_ends_by_itself_leaves_the_note(
+    go, agents, work, store
+):
+    agents["codex"] = Watching("codex")
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        store.say("read this one")
+        store.request_interrupt()
+        ctx.should_kill()
+        return RoundResult(COMPLETED)  # it finished on its own
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert "read this one" in agents["codex"].prompts[1]
 
 
 # restart
@@ -693,6 +989,150 @@ def test_output_events_only_for_rendered_lines(go, agents, work, store):
     assert [e["text"] for e in outs] == ["visible"]
 
 
+def test_a_credential_in_the_output_is_masked_in_the_event_and_the_next_prompt(
+    go, agents, work, store, world
+):
+    secret = "hunter2hunter"
+    agents["codex"].script = [
+        say(["$ ls", f"password={secret}"], result(LIMIT, until=world.now + 3600))
+    ]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    outs = [e["text"] for e in store.events() if e["kind"] == "output"]
+    assert outs == ["$ ls", "password=[masked]"]
+    assert secret not in agents["antigravity"].prompts[0]
+    assert "password=[masked]" in agents["antigravity"].prompts[0]
+
+
+class Streaming(Fake):
+    """An adapter that streams fragments: a line starting with `~` is one, the rest are whole."""
+
+    def render(self, line):
+        return line.lstrip("~") or None
+
+    def is_fragment(self, line):
+        return line.startswith("~")
+
+
+def shown(store):
+    """What a person reads: the output events joined the way the gateway joins them."""
+    return "".join(
+        gateway.render_event("output", e) for e in store.events() if e["kind"] == "output"
+    )
+
+
+def streaming_run(go, store, work, steps):
+    agents = {"codex": Streaming("codex"), "antigravity": Streaming("antigravity")}
+    agents["codex"].script = steps
+    agents["antigravity"].script = [done(work)]
+    assert go(adapters=agents) == 0
+    return agents
+
+
+def test_fragments_are_joined_into_one_line(go, work, store):
+    streaming_run(go, store, work, [say(["~rende", "~rização\n"], done(work))])
+    outs = [e for e in store.events() if e["kind"] == "output"]
+    assert [(e["text"], e.get("fragment")) for e in outs] == [
+        ("rende", True),
+        ("rização\n", True),
+    ]
+    assert shown(store) == "renderização\n"
+
+
+def test_a_whole_line_after_a_fragment_closes_the_line_first(go, work, store):
+    streaming_run(go, store, work, [say(["~abc", "$ ls"], done(work))])
+    outs = [e for e in store.events() if e["kind"] == "output"]
+    assert [(e["text"], e.get("fragment")) for e in outs] == [
+        ("abc", True),
+        ("\n", True),
+        ("$ ls", None),
+    ]
+    assert shown(store) == "abc\n$ ls\n"
+
+
+def test_a_round_ending_on_a_fragment_closes_the_line_before_round_end(go, work, store):
+    streaming_run(go, store, work, [say(["~abc"], result(LIMIT, until=1_000_000.0 + 3600))])
+    events = [e for e in store.events() if e["kind"] in ("output", "round_end")]
+    assert [e["kind"] for e in events[:3]] == ["output", "output", "round_end"]
+    assert events[1]["text"] == "\n" and events[1]["fragment"] is True
+    assert shown(store) == "abc\n"
+
+
+def test_a_round_ending_on_a_complete_fragment_adds_no_newline(go, work, store):
+    streaming_run(go, store, work, [say(["~abc\n"], done(work))])
+    assert shown(store) == "abc\n"
+
+
+def test_an_adapter_that_raises_after_a_fragment_still_closes_the_line(go, work, store):
+    def boom(agent, prompt, ctx):
+        ctx.on_output("~abc")
+        raise RuntimeError("adapter bug")
+
+    streaming_run(go, store, work, [boom])
+    events = [e for e in store.events() if e["kind"] in ("output", "error")]
+    assert [e["kind"] for e in events] == ["output", "output", "error"]
+    assert shown(store).startswith("abc\n")
+
+
+def test_round_tail_holds_the_joined_text(go, work, store):
+    def last(agent, prompt, ctx):
+        ctx.on_output("~half a sent")
+        ctx.on_output("~ence")
+        return RoundResult(LIMIT, until=1_000_000.0 + 3600)
+
+    agents = streaming_run(go, store, work, [last])
+    prompt = agents["antigravity"].prompts[0]
+    assert "half a sentence\n" in prompt
+    assert "half a sent\n" not in prompt
+
+
+def test_a_secret_split_across_fragments_is_masked_in_the_tail_and_in_memory(
+    tmp_path, go, work, store, memory
+):
+    def last(agent, prompt, ctx):
+        ctx.on_output("~the password=hun")  # each piece is too short to be a secret
+        ctx.on_output("~ter2hunter now\n")
+        return RoundResult(LIMIT, until=1_000_000.0 + 3600)
+
+    agents = streaming_run(go, store, work, [last])
+    prompt = agents["antigravity"].prompts[0]
+    assert "password=[masked] now" in prompt and "hunter2hunter" not in prompt
+    (entry,) = [r for r in memory.mem().rounds if r.agent == "codex" and r.gate == "none"]
+    assert "password=[masked] now" in entry.round_tail and "hunter2hunter" not in entry.round_tail
+
+
+def test_a_failed_resume_starts_the_fresh_attempt_on_a_clean_line(go, work, store):
+    store.save_state({"workdir": str(work), "sessions": {"codex": "stale"}, "round": 4})
+
+    def failing_resume(agent, prompt, ctx):
+        ctx.on_output("~cut o")
+        return RoundResult(TRANSIENT, reason="resume failed: gone", resume_failed=True)
+
+    steps = [failing_resume, say(["~fresh\n"], done(work))]
+    streaming_run(go, store, work, steps)
+    assert shown(store) == "cut o\nfresh\n"
+
+
+def test_an_adapter_without_is_fragment_gets_the_events_it_always_did(go, agents, work, store):
+    agents["codex"].script = [say(["one", "two"], done(work))]
+    assert go() == 0
+    outs = [e for e in store.events() if e["kind"] == "output"]
+    assert outs == [e for e in outs if "fragment" not in e]
+    assert [e["text"] for e in outs] == ["one", "two"]
+
+
+def test_an_is_fragment_that_raises_gives_no_output(go, work, store):
+    class Broken(Streaming):
+        def is_fragment(self, line):
+            raise ValueError("bad")
+
+    agents = {"codex": Broken("codex"), "antigravity": Streaming("antigravity")}
+    agents["codex"].script = [say(["~abc"], done(work))]
+    agents["antigravity"].script = [done(work)]
+    assert go(adapters=agents) == 0
+    assert [e for e in store.events() if e["kind"] == "output"] == []
+
+
 def test_state_json_carries_rotation_and_runner_state(go, agents, work, store, world):
     agents["codex"].script = [result(LIMIT, until=world.now + 3600)]
     agents["antigravity"].script = [done(work)]
@@ -714,6 +1154,27 @@ def test_baton_dir_created_and_excluded(go, agents, work):
     assert exclude.splitlines().count(".baton/") == 1
     assert go() == 0
     assert (work / ".git" / "info" / "exclude").read_text().splitlines().count(".baton/") == 1
+
+
+def test_pycache_and_pyc_are_excluded_beside_baton(go, work):
+    subprocess.run(["git", "init", "-q", str(work)], check=True)
+    exclude = work / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    exclude.write_text(".baton/")  # an older baton wrote only this, and no final newline
+    (work / "DONE").write_text("x")
+    assert go() == 0
+    assert go() == 0
+    lines = exclude.read_text().splitlines()
+    assert [lines.count(x) for x in (".baton/", "__pycache__/", "*.pyc")] == [1, 1, 1]
+    (work / "pkg" / "__pycache__").mkdir(parents=True)
+    (work / "pkg" / "__pycache__" / "a.cpython-313.pyc").write_bytes(b"x")
+    (work / "b.pyc").write_bytes(b"x")
+    ignored = subprocess.run(
+        ["git", "-C", str(work), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "pyc" not in ignored and "__pycache__" not in ignored
 
 
 def test_non_git_workdir_is_fine(go, work):
@@ -1745,9 +2206,9 @@ FALLBACK = '"codex", "antigravity", "claude_api"'
 
 @pytest.fixture
 def fallback(tmp_path, work, store, agents, world, monkeypatch):
-    """Codex and Antigravity are out until t0 + 3600; claude_api (metered) is next to run."""
+    """Codex and Antigravity are out until t0 + 3600; claude_api (reserve) is next to run."""
     monkeypatch.setattr(runner, "PREEMPT_POLL_S", 0.02)
-    agents["claude_api"] = Fake("claude_api", metered=True)
+    agents["claude_api"] = Fake("claude_api", metered=True, reserve=True)
     for name in ("codex", "antigravity"):
         agents[name].avail = Availability(False, until=world.now + 3600, reason="used up")
     goal = make_goal(tmp_path, work, order=FALLBACK)
@@ -2315,6 +2776,7 @@ class FakeMemory:
         raises: Exception | None = None
         error_on_recall = ""
         on_recall = None
+        writes = True  # whether a round's page was written
 
     built: list["FakeMemory"] = []
 
@@ -2347,6 +2809,7 @@ class FakeMemory:
         if self.plan.raises:
             raise self.plan.raises
         self.rounds.append(entry)
+        return self.plan.writes
 
     def remember_lessons(self, handoff):
         if self.plan.raises:
@@ -2429,7 +2892,7 @@ def test_no_hits_means_no_block_and_no_event(go, agents, work, store, memory):
     agents["codex"].script = [done(work)]
     go()
     assert "Memory from earlier" not in agents["codex"].prompts[0]
-    assert memory_events(store) == []
+    assert [e for e in memory_events(store) if e["event"] == "recalled"] == []
 
 
 def test_memory_is_recalled_before_every_round_excluding_the_page_before(go, agents, work, memory):
@@ -2511,6 +2974,21 @@ def test_a_round_is_recorded_after_its_gate_with_the_gate_result(
     assert rounds[1].outcome == COMPLETED
     assert rounds[1].round_tail.strip() == "round one talking"
     assert isinstance(rounds[1].seconds, float)
+
+
+def test_a_written_page_is_announced_with_its_round(tmp_path, go, agents, work, store, memory):
+    agents["codex"].script = [result(COMPLETED)]
+    go(make_goal(tmp_path, work, verify=None))
+    recorded = [e for e in memory_events(store) if e["event"] == "recorded"]
+    assert [e["round"] for e in recorded] == [1]
+    assert recorded[0]["path"] == f"rounds/{memory.mem().job}/r1.md"
+
+
+def test_a_page_that_was_not_written_is_not_announced(tmp_path, go, agents, work, store, memory):
+    memory.writes = False
+    agents["codex"].script = [result(COMPLETED)]
+    go(make_goal(tmp_path, work, verify=None))
+    assert [e for e in memory_events(store) if e["event"] == "recorded"] == []
 
 
 def test_without_a_verify_command_a_round_is_recorded_at_once(
@@ -2752,6 +3230,58 @@ def test_the_handoff_is_read_from_disk_after_the_round_without_the_prompt_cut(
     assert mem.lessons == [long_handoff]  # so the lessons at the top survive the 16000 cut
 
 
+def handoff_of(work, text, limit=True):
+    # read_handoff only needs the goal's workdir.
+    (work / ".baton").mkdir(exist_ok=True)
+    (work / ".baton" / "HANDOFF.md").write_text(text)
+    stub = types.SimpleNamespace(goal=types.SimpleNamespace(workdir=work))
+    return runner._Run.read_handoff(stub, limit=limit)
+
+
+def test_a_handoff_within_the_limit_is_returned_unchanged(work):
+    for size in (10, runner.HANDOFF_MAX_CHARS):
+        text = "h" * size
+        assert handoff_of(work, text) == text
+
+
+def test_a_long_handoff_keeps_its_top_and_its_end_and_says_what_it_left_out(work):
+    head = "## Objective\n- ship it, authorised by the person\n" + "H" * 5000
+    middle = "m" * 30000
+    tail = "- next: run the tests\nEND"
+    text = head + middle + tail
+    shown = handoff_of(work, text)
+    keep_tail = runner.HANDOFF_MAX_CHARS - runner.HANDOFF_HEAD_CHARS
+    assert shown.startswith(text[: runner.HANDOFF_HEAD_CHARS])
+    assert shown.endswith(text[-keep_tail:]) and shown.endswith("END")
+    left_out = len(text) - runner.HANDOFF_MAX_CHARS
+    (marker,) = [x for x in shown.splitlines() if "left out" in x]
+    assert f"{left_out} characters" in marker and "HANDOFF.md" in marker
+    assert len(shown) <= runner.HANDOFF_MAX_CHARS + len(marker) + 2
+
+
+def test_a_handoff_one_over_the_limit_leaves_out_one_character(work):
+    shown = handoff_of(work, "a" * (runner.HANDOFF_MAX_CHARS + 1))
+    assert "1 characters" in shown
+
+
+def test_the_whole_handoff_is_still_available_unlimited(work):
+    text = "top\n" + "x" * 50000 + "\nbottom"
+    assert handoff_of(work, text, limit=False) == text
+
+
+def test_the_prompt_carries_the_top_of_a_long_handoff(go, agents, work):
+    def writes(agent, prompt, ctx):
+        (work / ".baton").mkdir(exist_ok=True)
+        text = "OBJECTIVE-AT-THE-TOP\n" + "x" * 30000 + "\nLAST-LINE"
+        (work / ".baton" / "HANDOFF.md").write_text(text)
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [writes, done(work)]
+    go()
+    prompt = agents["codex"].prompts[1]
+    assert "OBJECTIVE-AT-THE-TOP" in prompt and "LAST-LINE" in prompt
+
+
 def test_lessons_are_offered_after_every_record(go, agents, work, store, memory):
     agents["codex"].script = [result(COMPLETED), done(work)]
     agents["antigravity"].script = [result(COMPLETED)]
@@ -2882,3 +3412,883 @@ def test_with_the_real_memory_over_fakes_the_round_is_recalled_and_recorded(
     assert len(fake.of("write-page")) >= 1
     for call in [*fake.runs, *fake.popens]:
         assert "ANTHROPIC_API_KEY" not in call["env"] and "OPENAI_API_KEY" not in call["env"]
+
+
+# every conversation reads every note
+
+
+def worked_then_limit(world, note=None, store=None, session=None, rest=600):
+    """A round that works and then runs out of quota, optionally leaving a note behind it."""
+
+    def step(agent, prompt, ctx):
+        if session:
+            ctx.on_session(session)
+        ctx.on_output("working")
+        if note:
+            store.say(note)
+        return RoundResult(LIMIT, until=world.now + rest)
+
+    return step
+
+
+def test_a_resumed_session_reads_a_note_another_session_consumed(go, agents, work, store, world):
+    agents["codex"].script = [
+        worked_then_limit(world, "N1: use sqlite", store, session="c1"),
+        done(work),
+    ]
+    agents["antigravity"].script = [worked_then_limit(world, rest=1200)]
+    assert go() == 0
+    assert "N1: use sqlite" in agents["antigravity"].prompts[0]  # unread: it took it
+    assert agents["codex"].sessions == [None, "c1"]
+    assert "N1: use sqlite" in agents["codex"].prompts[1]  # and the other conversation reads it too
+
+
+def test_a_session_that_read_a_note_does_not_read_it_again(go, agents, work, store, world):
+    store.say("N0: first")
+    agents["codex"].script = [
+        worked_then_limit(world, "N1: second", store, session="c1"),
+        worked_then_limit(world, session="c1"),
+        done(work),
+    ]
+    agents["antigravity"].script = [worked_then_limit(world, rest=1200)]
+    assert go() == 0
+    assert "N0: first" in agents["codex"].prompts[0]
+    # codex has read N0 already; N1 is new to it
+    assert "N0: first" not in agents["codex"].prompts[1]
+    assert "N1: second" in agents["codex"].prompts[1]
+    assert "N1: second" not in agents["codex"].prompts[2]
+
+
+def test_a_fresh_session_starts_at_the_newest_note(go, agents, work, store, world):
+    store.say("N0: old")
+    agents["codex"].script = [worked_then_limit(world, session="c1")]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert "N0: old" in agents["codex"].prompts[0]
+    assert "N0: old" not in agents["antigravity"].prompts[0]  # its objective holds the talk
+
+
+def test_the_note_log_and_marks_are_in_state_json(go, agents, work, store, world):
+    store.say("N0: first")
+    agents["codex"].script = [worked_then_limit(world, "N1: second", store, session="c1")]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    state = store.load_state()
+    assert [(e["seq"], e["text"].strip()) for e in state["note_log"]] == [
+        (1, "N0: first"),
+        (2, "N1: second"),
+    ]
+    assert state["note_seen"] == {"codex": 1, "antigravity": 2}
+
+
+def test_the_note_log_keeps_the_last_fifty(go, agents, work, store):
+    old = [{"seq": n, "text": f"note {n}\n\n"} for n in range(1, 61)]
+    store.save_state({"workdir": str(work), "note_log": old, "note_seen": {"codex": 60}})
+    store.say("note 61")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    log = store.load_state()["note_log"]
+    assert len(log) == 50 and log[0]["seq"] == 12 and log[-1]["seq"] == 61
+
+
+def test_a_state_without_the_new_keys_loads(go, agents, work, store):
+    store.save_state({"workdir": str(work), "sessions": {"codex": "c1"}, "notes": "kept\n\n"})
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "kept" in agents["codex"].prompts[0]  # no mark: only the unread ones
+    assert agents["codex"].sessions == ["c1"]
+
+
+def test_a_mark_does_not_move_when_the_round_never_ran(go, agents, work, store, world):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "note_log": [{"seq": 1, "text": "OLD\n\n"}],
+            "note_seen": {"codex": 0},
+        }
+    )
+    seen = {}
+
+    def peek(agent, prompt, ctx):
+        seen.update(store.load_state())
+        return RoundResult(LIMIT, until=world.now + 3600)
+
+    agents["codex"].script = [refused(TRANSIENT, reason="no spawn"), done(work)]
+    agents["antigravity"].script = [peek]
+    assert go() == 0
+    assert "OLD" in agents["codex"].prompts[0]
+    assert seen["note_seen"]["codex"] == 0
+    assert "OLD" in agents["codex"].prompts[1]  # the retry still reads it
+    assert store.load_state()["note_seen"]["codex"] == 1
+
+
+def test_the_old_notes_of_a_resumed_session_come_before_a_new_one(go, agents, work, store):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "note_log": [{"seq": 1, "text": "ONE\n\n"}, {"seq": 2, "text": "TWO\n\n"}],
+            "note_seen": {"codex": 0},
+        }
+    )
+    store.say("THREE")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    prompt = agents["codex"].prompts[0]
+    assert prompt.index("ONE") < prompt.index("TWO") < prompt.index("THREE")
+    assert prompt.count("TWO") == 1
+
+
+def test_an_old_carried_note_is_not_lost_to_a_new_message_after_the_upgrade(
+    go, agents, work, store
+):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "notes": "OLD UNREAD NOTE",  # a state from before the log: no note_log, no note_seen
+        }
+    )
+    store.say("NEW MESSAGE")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    prompt = agents["codex"].prompts[0]
+    assert agents["codex"].sessions == ["c1"]
+    assert prompt.index("OLD UNREAD NOTE") < prompt.index("NEW MESSAGE")
+    assert [e["text"].strip() for e in store.load_state()["note_log"]] == [
+        "OLD UNREAD NOTE",
+        "NEW MESSAGE",
+    ]
+
+
+# large notes
+
+
+def test_a_large_note_goes_to_a_file_and_the_prompt_keeps_its_start(go, agents, work, store, world):
+    body = "".join(f"line {n:05d} of the person's long brief\n" for n in range(400))
+    assert len(body) > runner.NOTE_INLINE_CHARS
+    store.say(body)
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    prompt = agents["codex"].prompts[0]
+    assert body[: runner.NOTE_HEAD_CHARS].strip() in prompt
+    assert body[runner.NOTE_HEAD_CHARS + 200 :][:100] not in prompt
+    files = list((work / ".baton" / "notes").glob("*.md"))
+    assert len(files) == 1
+    assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{8}\.md", files[0].name)
+    assert files[0].read_text(encoding="utf-8").strip() == body.strip()
+    assert f".baton/notes/{files[0].name}" in prompt and "read" in prompt.lower()
+    # the notes in state.json (and so in every later prompt) are the short form as well
+    assert len(store.load_state()["note_log"][0]["text"]) < runner.NOTE_INLINE_CHARS
+
+
+def test_a_note_at_the_limit_stays_in_the_prompt(go, agents, work, store):
+    body = "x" * runner.NOTE_INLINE_CHARS
+    store.say(body)
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert body in agents["codex"].prompts[0]
+    assert not (work / ".baton" / "notes").exists()
+
+
+def test_a_large_note_that_cannot_be_filed_stays_whole(go, agents, work, store):
+    (work / ".baton").mkdir(exist_ok=True)
+    (work / ".baton" / "notes").write_text("a file where the directory should be")
+    body = "y" * (runner.NOTE_INLINE_CHARS + 500)
+    store.say(body)
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert body in agents["codex"].prompts[0]
+
+
+def test_a_session_started_by_a_round_that_read_nothing_gets_a_mark_at_once(
+    go, agents, work, store, world
+):
+    store.say("N0: seen by nobody")
+
+    def silent(agent, prompt, ctx):
+        ctx.on_session("c1")  # a process that said nothing: no mark moves with the round
+        return RoundResult(TRANSIENT, reason="died")
+
+    agents["codex"].script = [silent]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert store.load_state()["note_seen"]["codex"] == 1  # the newest note when it began
+
+
+def test_a_saved_session_with_no_mark_starts_at_zero(go, agents, work, store):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "note_log": [{"seq": 1, "text": "ONE\n\n"}],
+        }
+    )
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "ONE" in agents["codex"].prompts[0]
+
+
+# the pinned goal
+
+PINNED = "Goal, fixed by the person. It does not change until the person changes it:\n"
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_a_pinned_goal_opens_every_prompt(tmp_path, work, resumed):
+    goal = make_goal(tmp_path, work)
+    prompt = build_prompt(
+        goal, "gate out", "a note", "the handoff", "tail", resumed, pinned_goal="ship it\nwell"
+    )
+    assert prompt.startswith(PINNED + "ship it\nwell\n\n")
+    assert prompt.index("ship it") < prompt.index("gate out") < prompt.index("a note")
+
+
+def test_no_pinned_goal_changes_nothing_in_the_prompt(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    for resumed in (False, True):
+        plain = build_prompt(goal, "g", "n", "h", "t", resumed)
+        assert plain == build_prompt(goal, "g", "n", "h", "t", resumed, pinned_goal="  \n")
+        assert "fixed by the person" not in plain
+
+
+@pytest.mark.phases
+def test_a_goal_in_the_store_reaches_the_first_prompt(go, agents, work, store):
+    store.set_goal("the fixed goal")
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go() == 0
+    assert agents["codex"].prompts[0].startswith(PINNED + "the fixed goal\n")
+
+
+@pytest.mark.phases
+def test_goal_off_takes_effect_from_the_next_rounds_prompt(go, agents, work, store):
+    store.set_goal("the fixed goal")
+
+    def person_turns_it_off(agent, prompt, ctx):
+        store.clear_goal()  # while the round runs: this round's prompt is already built
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [person_turns_it_off, done_and_stop(work, store)]
+    assert go() == 0
+    first, second = agents["codex"].prompts
+    assert "the fixed goal" in first and "fixed by the person" not in second
+
+
+@pytest.mark.phases
+def test_a_goal_set_mid_run_reaches_the_next_round_resumed_or_not(go, agents, work, store):
+    def person_sets_it(agent, prompt, ctx):
+        store.set_goal("set while running")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [person_sets_it, done_and_stop(work, store)]
+    assert go() == 0
+    first, second = agents["codex"].prompts
+    assert "fixed by the person" not in first
+    assert second.startswith(PINNED + "set while running\n")
+
+
+@pytest.mark.phases
+def test_oneshot_pins_the_objective_as_the_goal_at_start(tmp_path, work, go, agents, store):
+    goal = make_goal(tmp_path, work, top="oneshot = true")
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go(goal) == 0
+    assert store.goal() == OBJECTIVE
+    assert agents["codex"].prompts[0].startswith(PINNED + OBJECTIVE + "\n")
+
+
+@pytest.mark.phases
+def test_oneshot_keeps_a_goal_that_is_already_set(tmp_path, work, go, agents, store):
+    store.set_goal("the person's own")
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == "the person's own"
+
+
+@pytest.mark.phases
+def test_oneshot_does_not_bring_back_a_goal_the_person_cleared(tmp_path, work, go, agents, store):
+    # A restart that comes before round 1 has no rounds to go by: the state says it was pinned.
+    store.save_state({"oneshot_pinned": True})
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == ""
+    assert "fixed by the person" not in agents["codex"].prompts[0]
+
+
+@pytest.mark.phases
+def test_oneshot_pins_once_and_says_so_in_state_json(tmp_path, work, go, agents, store):
+    goal = make_goal(tmp_path, work, top="oneshot = true", verify="")
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go(goal) == 0
+    assert store.load_state()["oneshot_pinned"] is True
+    store.clear_goal()  # the person turns it off, and the job starts again at once
+    assert go(goal) == 0
+    assert store.goal() == ""
+
+
+@pytest.mark.phases
+def test_a_state_without_the_flag_pins_at_the_first_start(tmp_path, work, go, agents, store):
+    store.save_state({"round": 0, "workdir": str(work)})  # as an older baton wrote it
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == OBJECTIVE
+
+
+@pytest.mark.phases
+def test_a_goal_that_was_already_set_counts_as_the_pin(tmp_path, work, go, agents, store):
+    store.set_goal("the person's own")
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    store.clear_goal()
+    assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
+    assert store.goal() == ""
+
+
+@pytest.mark.phases
+def test_a_big_oneshot_objective_is_filed_and_only_its_start_is_pinned(
+    tmp_path, work, go, agents, store
+):
+    big = "word " * 3000
+    goal = replace(make_goal(tmp_path, work), objective=big, oneshot=True)
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert go(goal) == 0
+    pinned = store.goal()
+    assert len(pinned) < 1500 and "`.baton/notes/" in pinned
+    (name,) = [p for p in (work / ".baton" / "notes").iterdir()]
+    assert name.read_text(encoding="utf-8").strip() == big.strip()
+
+
+def test_without_oneshot_no_goal_is_pinned(go, agents, work, store):
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert store.goal() == ""
+    assert "fixed by the person" not in agents["codex"].prompts[0]
+
+
+# the queue: turns end, and the person can ask for the next agent
+
+HOURS = 3600
+CLAUDE_FIRST = '"claude_api", "codex"'
+
+
+def rotations(store):
+    return [e for e in store.events() if e["kind"] == "rotation"]
+
+
+def after(world, seconds, then=None):
+    """A round that takes `seconds` on the world's clock."""
+
+    def step(agent, prompt, ctx):
+        world.now += seconds
+        return then(agent, prompt, ctx) if then else RoundResult(COMPLETED)
+
+    return step
+
+
+def costing(usd, then=None):
+    def step(agent, prompt, ctx):
+        return (
+            replace(then(agent, prompt, ctx), cost_usd=usd)
+            if then
+            else RoundResult(COMPLETED, cost_usd=usd)
+        )
+
+    return step
+
+
+def claude_world(agents):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    return agents
+
+
+def test_round_end_carries_the_cost_of_the_round(go, agents, work, store):
+    agents["codex"].script = [result(COMPLETED, cost_usd=1.25), done(work)]
+    assert go() == 0
+    costs = [e["cost_usd"] for e in store.events() if e["kind"] == "round_end"]
+    assert costs == [1.25, 0.0]
+
+
+def test_a_failed_resume_counts_its_first_attempt_too(go, agents, work, store):
+    def first(agent, prompt, ctx):
+        ctx.on_session("sid-1")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [
+        first,
+        result(TRANSIENT, resume_failed=True, cost_usd=0.5),
+        result(COMPLETED, cost_usd=1.0),
+        done(work),
+    ]
+    assert go() == 0
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert ends[1]["cost_usd"] == 1.5
+
+
+def test_a_turn_over_by_time_rotates_after_the_round(go, agents, work, store, world):
+    agents["codex"].script = [after(world, 5 * HOURS)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "codex",
+        "antigravity",
+        "5 hours",
+    )
+    order = [
+        e["kind"] for e in store.events() if e["kind"] in ("round_end", "rotation", "round_start")
+    ]
+    assert order == ["round_start", "round_end", "rotation", "round_start", "round_end"]
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "codex",
+        "antigravity",
+    ]
+
+
+def test_the_round_after_a_rotation_does_not_show_a_second_line(go, agents, work, store, world):
+    agents["codex"].script = [after(world, 5 * HOURS), done(work)]
+    agents["antigravity"].script = [after(world, 5 * HOURS)]
+    assert go() == 0
+    starts = [e for e in store.events() if e["kind"] == "round_start"]
+    shown = [gateway.render_event("round_start", e) for e in starts]
+    assert not any("rotation" in text for text in shown)
+    assert len(rotations(store)) == 2
+    assert "[baton] rotation: codex -> antigravity (5 hours)" in gateway.render_event(
+        "rotation", rotations(store)[0]
+    )
+
+
+def test_a_change_of_agent_without_a_rotation_event_still_shows_its_line(
+    go, agents, work, store, world
+):
+    agents["codex"].script = [result(LIMIT, until=world.now + 3600)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert rotations(store) == []
+    start = [e for e in store.events() if e["kind"] == "round_start"][1]
+    assert "rotation: codex -> antigravity" in gateway.render_event("round_start", start)
+
+
+def test_a_turn_over_by_budget_rotates_and_says_the_amount(tmp_path, work, store, agents, world):
+    claude_world(agents)
+    agents["claude_api"].script = [costing(50.0)]
+    agents["codex"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order=CLAUDE_FIRST)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "claude_api",
+        "codex",
+        "USD 50",
+    )
+    assert "(USD 50)" in gateway.render_event("rotation", event)
+
+
+def test_the_turn_limits_come_from_the_goal(tmp_path, work, store, agents, world):
+    top = "\n[agents.codex]\nturn_max_s = 600\n"
+    agents["codex"].script = [after(world, 600)]
+    agents["antigravity"].script = [done(work)]
+    goal = make_goal(tmp_path, work, top=top)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store)[0]["reason"] == "10 minutes"
+
+
+def test_a_turn_not_over_keeps_the_agent(go, agents, work, store, world):
+    agents["codex"].script = [after(world, 5 * HOURS - 100), done(work)]
+    assert go() == 0
+    assert rotations(store) == [] and len(agents["antigravity"].prompts) == 0
+
+
+def test_the_turn_survives_a_restart(go, agents, work, store, world):
+    def first(agent, prompt, ctx):
+        world.now += 3 * HOURS
+        store.request_stop()  # the first run ends after this round
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, say(["x"]), after(world, 2 * HOURS)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert store.load_state()["turn"]["agent"] == "codex"
+    assert go() == 0  # the second run: 3 + 2 hours on the same turn
+    assert [e["reason"] for e in rotations(store)] == ["5 hours"]
+
+
+def test_next_asked_during_a_round_rotates_when_it_ends(go, agents, work, store):
+    def asks(agent, prompt, ctx):
+        store.request_next()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [asks]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "codex",
+        "antigravity",
+        "asked by the person",
+    )
+    assert store.take_next() == ""  # taken
+
+
+def test_next_now_ends_the_round_and_rotates(go, agents, work, store):
+    def asks(agent, prompt, ctx):
+        store.request_next(now=True)
+        store.request_interrupt()
+        for _ in range(100):
+            if ctx.should_kill():
+                return RoundResult(COMPLETED, reason="stop requested")
+        raise AssertionError("the interrupt never reached the round")
+
+    agents["codex"].script = [asks]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    first_end = [e for e in store.events() if e["kind"] == "round_end"][0]
+    assert first_end["interrupted"] is True
+    assert rotations(store)[0]["reason"] == "asked by the person"
+    assert len(agents["codex"].prompts) == 1
+
+
+def test_next_asked_between_rounds_is_taken_before_the_next_round(go, agents, work, store):
+    store.request_next()
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert agents["codex"].prompts == []
+    assert rotations(store)[0]["reason"] == "asked by the person"
+    assert store.take_next() == ""
+
+
+def test_next_asked_while_the_job_waits_is_taken(go, agents, work, store, world):
+    t0 = world.now
+    agents["codex"].script = [result(LIMIT, until=t0 + 3600), done(work)]
+    agents["antigravity"].script = [result(LIMIT, until=t0 + 7200)]
+    asked = []
+
+    def sleep(seconds):
+        if not asked:
+            asked.append(True)
+            store.request_next()
+        world.sleep(seconds)
+
+    assert go(sleep=sleep) == 0
+    assert [e["reason"] for e in rotations(store)] == ["asked by the person"]
+    assert store.take_next() == ""
+    assert sum(world.sleeps) < 3600 + 20  # the wait went on only as long as it had to
+
+
+def test_with_one_usable_agent_next_is_taken_and_nothing_is_said(
+    tmp_path, work, store, agents, world
+):
+    store.request_next()
+    agents["codex"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order='"codex"')
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store) == [] and store.take_next() == ""
+    assert len(agents["codex"].prompts) == 1
+
+
+def test_with_one_usable_agent_a_long_turn_stays_quiet(tmp_path, work, store, agents, world):
+    agents["codex"].script = [after(world, 6 * HOURS), done(work)]
+    goal = make_goal(tmp_path, work, order='"codex"')
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store) == [] and len(agents["codex"].prompts) == 2
+
+
+GOAL_CAPS = "\n[agents.claude_api]\nturn_budget_usd = 500\n"
+
+
+def goal_world(tmp_path, work, agents):
+    claude_world(agents)
+    return make_goal(tmp_path, work, order=CLAUDE_FIRST, top=GOAL_CAPS)
+
+
+@pytest.mark.phases
+def test_crossing_the_goal_budget_drops_the_agent_and_alerts(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [costing(100.0), costing(60.0)]
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "claude_api",
+        "claude_api",
+        "codex",
+    ]
+    alerts = [e for e in store.events() if e["kind"] == "alert"]
+    assert len(alerts) == 1 and "claude_api" in alerts[0]["message"]
+    assert "150" in alerts[0]["message"]
+    state = store.load_state()
+    assert state["dropped"] == ["claude_api"]
+    assert state["agents"]["claude_api"]["goal_spent"] == 160.0
+
+
+def test_the_goal_budget_only_applies_while_a_goal_is_set(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    agents["claude_api"].script = [costing(100.0), costing(60.0), done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e for e in store.events() if e["kind"] == "alert"] == []
+    assert store.load_state().get("dropped") == []
+    assert len(agents["codex"].prompts) == 0
+
+
+@pytest.mark.phases
+def test_a_new_goal_brings_the_dropped_agent_back_and_clears_its_spend(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [costing(160.0), done_and_stop(work, store)]
+
+    def changes_goal(agent, prompt, ctx):
+        store.set_goal("make it small")
+        return RoundResult(LIMIT, until=world.now + 3600)
+
+    agents["codex"].script = [changes_goal]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "claude_api",
+        "codex",
+        "claude_api",
+    ]
+    state = store.load_state()
+    assert state["dropped"] == [] and state["agents"]["claude_api"]["goal_spent"] == 0
+
+
+@pytest.mark.phases
+def test_clearing_the_goal_also_brings_the_agent_back(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [costing(160.0), done_and_stop(work, store)]
+
+    def clears_goal(agent, prompt, ctx):
+        store.clear_goal()
+        return RoundResult(LIMIT, until=world.now + 3600)
+
+    agents["codex"].script = [clears_goal]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["dropped"] == []
+    assert agents["claude_api"].script == []  # it ran its second round
+
+
+@pytest.mark.phases
+def test_a_dropped_agent_stays_dropped_across_a_restart_with_the_same_goal(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+
+    def spends_and_stops(agent, prompt, ctx):
+        store.request_stop()
+        return RoundResult(COMPLETED, cost_usd=160.0)
+
+    agents["claude_api"].script = [spends_and_stops]
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["dropped"] == ["claude_api"]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert len(agents["claude_api"].prompts) == 1  # not asked again for this goal
+    assert len(agents["codex"].prompts) == 1
+
+
+def test_an_agent_that_does_not_reserve_is_never_ended_for_another(
+    tmp_path, work, store, agents, world
+):
+    claude_world(agents)
+    ran = []
+
+    def claude(agent, prompt, ctx):
+        ran.append(ctx.should_kill())
+        return RoundResult(COMPLETED)
+
+    agents["claude_api"].script = [claude, claude, done(work)]
+    goal = make_goal(tmp_path, work, order=CLAUDE_FIRST)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert ran == [False, False]
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == ["claude_api"] * 3
+
+
+# a rotation is announced when the agent that takes over is not the one that gave way
+
+
+def says_nothing_and_restarts(store, expected_worked_s):
+    assert rotations(store) == []
+    starts = [e for e in store.events() if e["kind"] == "round_start"]
+    assert not any(e.get("announced") for e in starts)
+    assert store.load_state()["turn"]["worked_s"] == expected_worked_s
+
+
+def test_a_turn_over_with_claude_unavailable_says_nothing_and_starts_the_turn_over(
+    tmp_path, work, store, agents, world
+):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    agents["claude_api"].avail = Availability(False, until=world.now + 10**6, reason="no key file")
+    agents.pop("antigravity")
+    agents["codex"].script = [after(world, 5 * HOURS), after(world, HOURS), done(work)]
+    goal = make_goal(tmp_path, work, order='"codex", "claude_api"')
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    says_nothing_and_restarts(store, HOURS)  # the second turn has worked one hour
+    assert len(agents["codex"].prompts) == 3
+
+
+def test_a_turn_over_with_the_others_cooling_says_nothing_and_starts_the_turn_over(
+    go, agents, work, store, world
+):
+    agents["antigravity"].avail = Availability(False, until=world.now + 10**6, reason="used up")
+    agents["codex"].script = [after(world, 5 * HOURS), after(world, HOURS), done(work)]
+    assert go() == 0
+    says_nothing_and_restarts(store, HOURS)
+
+
+def test_a_reserve_claude_that_ran_a_long_time_is_not_rotated(tmp_path, work, store, agents, world):
+    agents["claude_api"] = Fake("claude_api", metered=True, reserve=True)
+    for name in ("codex", "antigravity"):
+        agents[name].avail = Availability(False, until=world.now + 10**6, reason="used up")
+    agents["claude_api"].script = [costing(80.0, after(world, 6 * HOURS)), done(work)]
+    goal = make_goal(tmp_path, work, order=FALLBACK)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store) == []
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == ["claude_api"] * 2
+
+
+def test_the_rotation_names_the_agent_that_took_over_not_the_one_rotated_to(
+    tmp_path, work, store, agents, world
+):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    agents["antigravity"].avail = Availability(False, until=world.now + 10**6, reason="used up")
+    agents["codex"].script = [after(world, 5 * HOURS)]
+    agents["claude_api"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order=FALLBACK)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "codex",
+        "claude_api",
+        "5 hours",
+    )
+    starts = [e for e in store.events() if e["kind"] == "round_start"]
+    assert starts[1]["agent"] == "claude_api" and starts[1]["announced"] is True
+
+
+def test_a_rotation_waits_for_the_agent_that_takes_over_when_none_can_run(
+    go, agents, work, store, world
+):
+    t0 = world.now
+    agents["codex"].script = [after(world, 5 * HOURS, result(LIMIT, until=t0 + 6 * HOURS))]
+    agents["antigravity"].script = [done(work)]
+    back = t0 + 5 * HOURS + 60
+    agents["antigravity"].availability = lambda: (
+        Availability(True) if world.now >= back else Availability(False, until=back, reason="out")
+    )
+    assert go() == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"]) == ("codex", "antigravity")
+    kinds_seen = [e["kind"] for e in store.events() if e["kind"] in ("wait", "rotation")]
+    assert kinds_seen.index("wait") < kinds_seen.index("rotation")  # said once somebody took over
+
+
+@pytest.mark.phases
+def test_the_cost_of_a_round_that_kept_its_reservation_counts_in_the_goal(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [
+        costing(100.0),
+        costing(60.0),
+    ]  # a kill or a timeout would carry 5
+    agents["codex"].script = [done_and_stop(work, store)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["agents"]["claude_api"]["goal_spent"] == 160.0
+
+
+def test_spend_is_not_counted_for_the_goal_while_none_is_set(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    agents["claude_api"].script = [costing(100.0), done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["agents"]["claude_api"]["goal_spent"] == 0
+
+
+@pytest.mark.phases
+def test_a_goal_set_during_a_round_does_not_charge_the_money_spent_before_it(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+
+    def sets_goal(agent, prompt, ctx):
+        store.set_goal("first goal")
+        return RoundResult(COMPLETED, cost_usd=3.0)
+
+    agents["claude_api"].script = [costing(160.0), sets_goal, done_and_stop(work, store)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e for e in store.events() if e["kind"] == "alert"] == []
+    assert store.load_state()["dropped"] == []
+
+
+@pytest.mark.phases
+def test_a_goal_that_cannot_be_read_changes_nothing(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+
+    def unreadable_then_back(agent, prompt, ctx):
+        (store.root / "goal.md").unlink()
+        (store.root / "goal.md").mkdir()  # a read error, not "no goal"
+        return RoundResult(LIMIT, until=world.now + 60)
+
+    def readable_again(agent, prompt, ctx):
+        (store.root / "goal.md").rmdir()
+        store.set_goal("make it fast")
+        return RoundResult(LIMIT, until=world.now + 60)
+
+    agents["claude_api"].script = [costing(160.0)]
+    agents["codex"].script = [unreadable_then_back, readable_again, done_and_stop(work, store)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "claude_api",
+        "codex",
+        "codex",
+        "codex",
+    ]  # claude stayed out of the queue through the read error, and after the goal came back
+    assert store.load_state()["dropped"] == ["claude_api"]
+
+
+def test_a_next_that_cannot_be_taken_does_not_spin_the_wait(go, agents, work, store, world):
+    t0 = world.now
+    agents["codex"].script = [result(LIMIT, until=t0 + 1800), done(work)]
+    agents["antigravity"].script = [result(LIMIT, until=t0 + 3600)]
+    store.request_next()
+
+    def broken():
+        raise PermissionError("cannot take it")
+
+    store.take_next = broken  # the file stays, and next_pending keeps saying yes
+    assert go() == 0
+    assert kinds(store).count("wait") <= 3  # not one per step of the wait
+
+
+def test_a_next_asked_after_the_turn_ended_does_not_rotate_a_second_time(
+    tmp_path, work, store, agents, world
+):
+    """The verify gate runs between the end of the turn and the next pick: a `next` that comes
+    then joins the rotation already decided."""
+    ask = f"echo soon > {store.root / 'next'}"
+    mark = tmp_path / "ran"
+    verify = f"if [ -f {mark} ]; then {ask}; fi; touch {mark}; test -f {work}/DONE"
+    agents["codex"].script = [after(world, 6 * HOURS), done(work)]
+    agents["antigravity"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order='"codex", "antigravity"', verify=verify)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"]) == ("codex", "antigravity")
+    assert event["reason"] == "asked by the person"  # the latest reason
+    assert len(agents["codex"].prompts) == 1 and len(agents["antigravity"].prompts) == 1
+
+
+def test_a_next_after_the_turn_ended_does_not_skip_an_agent(tmp_path, work, store, agents, world):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    ask = f"echo soon > {store.root / 'next'}"
+    mark = tmp_path / "ran"
+    verify = f"if [ -f {mark} ]; then {ask}; fi; touch {mark}; test -f {work}/DONE"
+    agents["codex"].script = [after(world, 6 * HOURS)]
+    agents["antigravity"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order=FALLBACK, verify=verify)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [(e["previous"], e["agent"]) for e in rotations(store)] == [("codex", "antigravity")]
+    assert agents["claude_api"].prompts == []  # paid Claude did not start early

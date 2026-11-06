@@ -41,6 +41,7 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    ToolWatch,
     check_subagent,
     claude_allowed_models,
     subagent_guard_command,
@@ -236,6 +237,16 @@ def _cost(value: object) -> Decimal | None:
     return number if number.is_finite() and number >= 0 else None
 
 
+def _added(total: Decimal, last: Decimal | None) -> Decimal:
+    """What a round added to its session: the total is cumulative, so only the part past the
+    total the session had reported before counts. A session with no saved total is charged the
+    whole figure, and so is a total below the saved one (not zero): a restarted counter. A zero
+    (a crash may report one) adds nothing."""
+    if total == 0:
+        return Decimal(0)
+    return total if last is None or total < last else total - last
+
+
 def _summary(text: str) -> str:
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     return (lines[-1] if lines else "")[:300]
@@ -255,7 +266,10 @@ class _Stream:
         self.has_result = False
         self.is_error = False
         self.subtype = ""
-        self.cost: Decimal | None = None
+        self.session = ""  # the id the init event gave
+        self.total: Decimal | None = None  # the session's total so far, as reported
+        self.cost: Decimal | None = None  # what this round added to it: what the ledger charges
+        self.kept: Decimal | None = None  # the reservation the ledger went on counting
         self.result_text = ""
         self.kinds: set[str] = set()
         self.subagents: set[str] = set()  # tool uses whose model was seen
@@ -402,6 +416,25 @@ def _fmt(value: Decimal) -> str:
     return format(value.normalize() if value == value.to_integral_value() else value, "f")
 
 
+class _ToolWatch(ToolWatch):
+    """A tool is open from the `tool_use` block of an assistant event to the `tool_result` block
+    of a user event, by id."""
+
+    def feed(self, line: str) -> None:
+        event = _parse(line)
+        if event is None or event.get("type") not in ("assistant", "user"):
+            return
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                self.open.add(block["id"])
+            elif block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+                self.open.discard(block["tool_use_id"])
+
+
 class ClaudeApiAdapter:
     name = "claude_api"
     metered = True
@@ -422,6 +455,10 @@ class ClaudeApiAdapter:
         self._wall_clock = wall_clock
 
     @property
+    def reserve(self) -> bool:
+        return self.cfg.reserve
+
+    @property
     def ceiling(self) -> Decimal:
         return self.ledger.ceiling
 
@@ -438,17 +475,20 @@ class ClaudeApiAdapter:
 
     def availability(self) -> Availability:
         if not self.cfg.enabled:
-            return Availability(False, reason="claude_api is disabled in the goal file")
+            return Availability(
+                False, reason="claude_api is disabled in the goal file", permanent=True
+            )
         now = self._wall_clock()
         try:
             read_key(Path(self.cfg.key_file))
         except KeyFileError as exc:
-            return Availability(False, until=now + NO_KEY_RETRY_S, reason=str(exc))
+            return Availability(False, until=now + NO_KEY_RETRY_S, reason=str(exc), permanent=True)
         if self.cfg.round_budget_usd < MIN_GRANT_USD:
             return Availability(
                 False,
                 until=now + NO_KEY_RETRY_S,
                 reason=f"round_budget_usd is below the minimum round of {MIN_GRANT_USD} USD",
+                permanent=True,
             )
         try:
             if self.ledger.exhausted():
@@ -507,6 +547,16 @@ class ClaudeApiAdapter:
         return argv
 
     def run_round(self, prompt: str, ctx: RoundContext) -> RoundResult:
+        stream = _Stream()
+        result = self._run_round(prompt, ctx, stream)
+        # What the ledger counts is what the round cost: the reported cost, or, when the round
+        # ended without one and the reservation stays, the whole reservation (it overcounts).
+        cost = stream.cost if stream.cost is not None else stream.kept
+        if cost is not None:
+            result = replace(result, cost_usd=float(cost))
+        return result
+
+    def _run_round(self, prompt: str, ctx: RoundContext, stream: _Stream) -> RoundResult:
         now = self._wall_clock()
         if not self.cfg.enabled:
             return RoundResult(LIMIT, until=now + NO_KEY_RETRY_S, reason="claude_api is disabled")
@@ -538,7 +588,6 @@ class ClaudeApiAdapter:
                 reason=f"the spend ceiling leaves less than {MIN_GRANT_USD} USD for a round",
             )
         reservation_id, granted = reservation
-        stream = _Stream()
         spawned = False
 
         def on_spawn(pid: int) -> None:
@@ -581,6 +630,7 @@ class ClaudeApiAdapter:
             )
         except OSError as exc:
             if spawned:
+                stream.kept = granted
                 return RoundResult(
                     TRANSIENT, reason=f"runner failed after start: {type(exc).__name__}"
                 )
@@ -593,6 +643,8 @@ class ClaudeApiAdapter:
             self._settle(reservation_id, stream.cost)
         elif self._never_reached_the_api(exit_, stream):
             self._release(reservation_id)
+        else:
+            stream.kept = granted
         if exit_.stopped is not None:
             if exit_.stopped.outcome == COMPLETED and (stream.is_error or stream.kinds):
                 # The stop (a plan agent is back, a stop request) landed after the API had
@@ -632,6 +684,7 @@ class ClaudeApiAdapter:
             session = event.get("session_id")
             if not stream.session_reported and isinstance(session, str) and session:
                 stream.session_reported = True
+                stream.session = session
                 ctx.on_session(session)
         elif kind in ("assistant", "user", "stream_event") and not stream.verified:
             return RoundResult(
@@ -648,9 +701,13 @@ class ClaudeApiAdapter:
             stream.is_error = event.get("is_error") is True
             subtype = event.get("subtype")
             stream.subtype = subtype if isinstance(subtype, str) else ""
-            cost = _cost(event.get("total_cost_usd"))
-            if cost is not None:
-                stream.cost = cost if stream.cost is None else max(stream.cost, cost)
+            total = _cost(event.get("total_cost_usd"))
+            if total is not None:
+                stream.total = total if stream.total is None else max(stream.total, total)
+                stream.cost = _added(stream.total, ctx.session_total)
+                session = stream.session or ctx.session_id
+                if session and stream.total > 0:  # a zero says nothing about the session
+                    ctx.on_session_total(session, stream.total)
             texts = []
             if isinstance(event.get("result"), str):
                 texts.append(event["result"])
@@ -795,6 +852,9 @@ class ClaudeApiAdapter:
         return RoundResult(TRANSIENT, reason=summary)
 
     # rendering
+
+    def tool_watch(self) -> ToolWatch:
+        return _ToolWatch()
 
     def is_work(self, line: str) -> bool:
         event = _parse(line)

@@ -11,6 +11,11 @@ A prompt (`-p <text> --output-format stream-json ...`) prints JSON lines. Every 
 `FAKE_AGY_CALLS` (argv and cwd, one JSON object per line). Knobs:
   FAKE_AGY_CONVERSATION_ID  id announced in the init event (default conv-1; the id passed with
                             --conversation wins when present)
+  FAKE_AGY_INIT_SHAPE       "nested" puts the id inside the init payload, as an older fake did;
+                            the real agy sends it at the top level of the event (the default)
+  FAKE_AGY_UNKNOWN_CONVERSATION  when set, a --conversation id is treated as unknown, as real agy
+                            does: a warning on stderr, an init with a NEW id, then a normal run
+  FAKE_AGY_NO_STEPS         when set, no step_update is printed (a round that did no work)
   FAKE_AGY_TEXT             text of the agent's text_delta (default "working on it")
   FAKE_AGY_EXEC_SLEEP       seconds to stay alive before the result event
   FAKE_AGY_EXEC_EXIT        exit code (default 0)
@@ -68,23 +73,36 @@ def prompt_cmd(argv: list[str]) -> None:
     calls = os.environ.get("FAKE_AGY_CALLS")
     if calls:
         with open(calls, "a") as fh:
-            fh.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
+            record = {
+                "argv": argv,
+                "cwd": os.getcwd(),
+                "baton_env": {k: v for k, v in os.environ.items() if k.startswith("BATON")},
+            }
+            fh.write(json.dumps(record) + "\n")
     conversation = os.environ.get("FAKE_AGY_CONVERSATION_ID", "conv-1")
     if "--conversation" in argv:
         conversation = argv[argv.index("--conversation") + 1]
-    emit({"event": "init", "init": {"conversation_id": conversation, "model": "fake", "cwd": "."}})
-    emit(
-        {
-            "event": "step_update",
-            "step_update": {
-                "conversation_id": conversation,
-                "step_index": 1,
-                "state": "ACTIVE",
-                "step_type": "agent_response",
-                "text_delta": os.environ.get("FAKE_AGY_TEXT", "working on it"),
-            },
-        }
-    )
+        if os.environ.get("FAKE_AGY_UNKNOWN_CONVERSATION"):
+            sys.stderr.write(f'warning: conversation "{conversation}" not found\n')
+            conversation = "conv-fresh"
+    init = {"model": "fake", "cwd": "."}
+    if os.environ.get("FAKE_AGY_INIT_SHAPE") == "nested":
+        emit({"event": "init", "init": {"conversation_id": conversation, **init}})
+    else:
+        emit({"event": "init", "conversation_id": conversation, "init": init})
+    if not os.environ.get("FAKE_AGY_NO_STEPS"):
+        emit(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": conversation,
+                    "step_index": 1,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": os.environ.get("FAKE_AGY_TEXT", "working on it"),
+                },
+            }
+        )
     for extra in json.loads(os.environ.get("FAKE_AGY_EXTRA", "[]")):
         emit(extra)
     raw = os.environ.get("FAKE_AGY_RAW_LINE")

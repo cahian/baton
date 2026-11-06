@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -58,9 +59,109 @@ PUT_TIMEOUT_S = 0.05
 STOP_LOG_BYTES = 16 * 1024 * 1024
 # How long reading continues once the group is dead, to reach EOF.
 JOIN_S = 0.5
+# Set in every agent's environment: the commands that steer a goal refuse to run under it.
+ROUND_VARIABLE = "BATON_ROUND"
 # What replaces a credential that a child printed, and the shortest value worth hiding.
 REDACTED = b"[redacted]"
 MIN_SECRET_CHARS = 8
+
+
+# What replaces the value of a credential in text that is shown or kept (an agent's output).
+MASKED = "[masked]"
+# The longest value masked: a longer line cannot cost more than this per credential.
+MAX_VALUE_CHARS = 4096
+_MAX = str(MAX_VALUE_CHARS)
+_MIN = str(MIN_SECRET_CHARS)
+_TOKEN_RES = (
+    re.compile(r"(?<![\w/-])sk-[A-Za-z0-9_-]{20," + _MAX + "}"),
+    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20," + _MAX + "}"),
+    re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![0-9A-Z])"),
+    re.compile(r"(?<![A-Za-z0-9])xox[a-z]-[A-Za-z0-9-]{10," + _MAX + "}"),
+)
+_BEARER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(Bearer[ \t]+)([A-Za-z0-9._~+/=-]{" + _MIN + "," + _MAX + "})", re.I
+)
+# `name = value`, found one identifier at a time: a name is a run of word characters that starts
+# where a run starts, so a long line is read once. Whether the name is one that holds a credential
+# is decided on the name alone.
+_HEAD_RE = re.compile(r"(?<![A-Za-z0-9_-])(?P<name>[A-Za-z0-9_-]++)(?:\\?[\"'])?[ \t]*[=:][ \t]*")
+_NAME_RE = re.compile(
+    r"[A-Za-z0-9_-]*?(?:token|api[_-]?key|secret|password|passwd)(?:[_-][A-Za-z0-9_-]*)?", re.I
+)
+_QUOTE_RE = re.compile(r"\\?[\"']")
+_UNQUOTED_RE = re.compile(r"[^\s&#\"']{1," + _MAX + "}")
+_PLACEHOLDER_RE = re.compile(
+    r"\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[\w .-]+>|[xX*.]+"
+)
+# An unquoted value is taken for a credential only when it holds a digit or one of these: letters
+# with . _ - are names of things (`self.password`, `settings.DB_PASSWORD`, `AuthToken`). Digits
+# alone are a number (`token_budget=10000000`).
+_SECRET_SYMBOLS = frozenset("!@$%^*+=~|?")
+_TRAILING = ",);]"
+
+
+def _secret_like(value: str) -> bool:
+    return not value.isdigit() and any(c.isdigit() or c in _SECRET_SYMBOLS for c in value)
+
+
+def _mask_named(text: str) -> str:
+    """Mask the value of `token`, `api_key`, `secret`, `password` and `passwd` (also inside a longer
+    name: `DB_PASSWORD`, `SECRET_KEY`). A quoted value runs to its closing quote and is masked from
+    MIN_SECRET_CHARS on; an unquoted one ends at white space, `&`, `#` or a quote, loses its
+    trailing `,);]`, and is masked only when it looks like a credential. A placeholder never is."""
+    out: list[str] = []
+    pos = 0
+    for head in _HEAD_RE.finditer(text):
+        if head.start() < pos or not _NAME_RE.fullmatch(head.group("name")):
+            continue
+        start = head.end()
+        quote = _QUOTE_RE.match(text, start)
+        if quote:
+            start += len(quote.group())
+            window = text[start : start + MAX_VALUE_CHARS]
+            newline = window.find("\n")
+            stop = start + (newline if newline >= 0 else len(window))
+            end = text.find(quote.group(), start, stop)
+            if end < 0:
+                end = stop  # an unclosed quote (a cut fragment): to the end of the line
+            value = text[start:end]
+            masked = len(value) >= MIN_SECRET_CHARS and not _PLACEHOLDER_RE.fullmatch(value)
+        else:
+            found = _UNQUOTED_RE.match(text, start)
+            if not found:
+                continue
+            value = found.group().rstrip(_TRAILING)
+            end = start + len(value)
+            masked = (
+                len(value) >= MIN_SECRET_CHARS
+                and not _PLACEHOLDER_RE.fullmatch(value)
+                and _secret_like(value)
+            )
+        if masked:
+            out += [text[pos:start], MASKED]
+            pos = end
+    return "".join(out) + text[pos:] if out else text
+
+
+def _mask_bearer(found: re.Match[str]) -> str:
+    value = found.group(2)
+    core = value.rstrip(".,;:")
+    if len(core) < MIN_SECRET_CHARS or not _secret_like(core) or _PLACEHOLDER_RE.fullmatch(core):
+        return found.group(0)
+    return found.group(1) + MASKED + value[len(core) :]
+
+
+def mask_secrets(text: str) -> str:
+    """`text` with the value of every credential in it replaced by `[masked]`, name kept: a bearer
+    token, `token`/`api_key`/`secret`/`password` given a value of at least MIN_SECRET_CHARS
+    characters, and the well-known token shapes (`sk-`, `ghp_`, `AKIA`, `xoxb-`). A placeholder
+    (`$TOKEN`, `${TOKEN}`, `<token>`, `xxxxxxxx`) is not a value. Known limit: an unquoted value of
+    letters only (with . _ -), or of digits only, is read as a name or a number in code and kept."""
+    if not text:
+        return text
+    for pattern in _TOKEN_RES:
+        text = pattern.sub(MASKED, text)
+    return _mask_named(_BEARER_RE.sub(_mask_bearer, text))
 
 
 def clean_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -294,6 +395,7 @@ def run_streaming(
         env.update(extra_env)
     if plain_env:
         env.update(plain_env)
+    env[ROUND_VARIABLE] = "1"  # last: nothing an adapter passes can unset it
     # Open the log before spawning: a failure here must not leave a running, unwatched child.
     log = ctx.log_path.open("ab")
     try:
