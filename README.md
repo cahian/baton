@@ -20,21 +20,34 @@ The default is native one-shot task execution. Baton-managed plan, build, review
 available when `phases = true` (see [Phases](#phases-plan-build-review)).
 
 ```mermaid
-flowchart LR
-    subgraph queue["The queue: one agent runs at a time"]
-        direction LR
-        codex["codex"] --> antigravity["antigravity"] --> claude["claude"]
-        claude -. "turn ends: back to the first" .-> codex
+flowchart TB
+    request["User's objective"] --> skill["Native baton-oneshot skill"]
+    skill --> choose{"Next vendor"}
+    subgraph vendors["Each vendor runs its own CLI and native workflow"]
+        codex["Codex CLI<br/>native Goal"]
+        agy["Antigravity CLI<br/>native /goal"]
+        claude["Claude Code CLI<br/>native skill, tasks, and session"]
     end
-    queue --> task["one vendor owns the whole task"]
-    task --> complete{"task complete or vendor limit reached?"}
+    choose --> codex
+    choose --> agy
+    choose --> claude
+    codex --> task["One vendor owns the whole task"]
+    agy --> task
+    claude --> task
+    task --> complete{"Complete or configured limit reached?"}
     complete -- complete --> done(["done"])
-    complete -- limit --> queue
+    complete -- limit or user switch --> transfer["Full sanitized conversation<br/>+ every vendor session ID"]
+    transfer --> choose
 ```
 
-How Baton works: one vendor works until the task is complete or its configured limit is reached.
-On a limit, Baton transfers the full sanitized conversation and native session IDs to the next
-vendor. `phases = true` opts into Baton-managed plan/build/review and consensus.
+One vendor works until the task is complete or its configured limit is reached. On a limit, Baton
+transfers the full sanitized conversation and every native session ID to the next vendor. Codex
+and Antigravity use their native persistent Goal features; Claude Code uses its native skill,
+task, and session tools because its CLI integration has no persistent Goal primitive. See the
+[Codex Goals guide](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex),
+[Antigravity `/goal` guide](https://antigravity.google/docs/commands/goal), and
+[Claude Code skills guide](https://code.claude.com/docs/en/skills). `phases = true` opts into
+Baton-managed plan/build/review and consensus.
 
 ## What you need
 
@@ -68,6 +81,22 @@ the table above; `baton doctor <goal.toml>` checks it for a phased goal. Baton f
 from the official Claude Code plugin install or `~/.config/baton/superpowers`; an install elsewhere
 needs `[superpowers] dir` in `defaults.toml`.
 
+## Install the native one-shot skill
+
+Baton includes the portable `baton-oneshot` Agent Skill. It tells each vendor to own the complete
+task in one session, use the vendor's native skills and long-running workflow, verify every
+deliverable, and leave handoffs to Baton. Install it once after installing Baton:
+
+```
+baton skills install
+```
+
+The command installs the skill in Codex, Claude Code (including the isolated config Baton uses for
+Claude API sessions), and Antigravity's shared global skill folder. Re-run it after upgrading Baton
+to refresh the skill. If a different skill already uses that name, review it first and then use
+`baton skills install --force` to replace it. The full instructions are in
+[`src/baton/skills/baton-oneshot/SKILL.md`](src/baton/skills/baton-oneshot/SKILL.md).
+
 ## Quick start: from zero to your first task
 
 This walks you through everything once, with no prior knowledge of baton. It takes about 15
@@ -84,6 +113,7 @@ needed if you choose Baton-managed phases.
 git clone https://github.com/cahian/baton.git
 cd baton
 uv tool install .
+baton skills install
 ```
 
 For phased goals only, install Superpowers with
@@ -865,6 +895,7 @@ for writing it by hand.
 | Command | What it does |
 |---|---|
 | `baton help` | Show CLI and OpenCode commands, vendor selection and Claude API setup. |
+| `baton skills install [--force]` | Install or update the native `baton-oneshot` skill for Codex, Claude Code and Antigravity. |
 | `baton doctor [goal]` | Check binaries, logins, stray API keys, live limits and Claude spend; check Superpowers for a phased goal. |
 | `baton run <goal.toml>` | Run one goal in the foreground, without OpenCode. |
 | `baton serve [--port 18777]` | Start the OpenCode gateway. |

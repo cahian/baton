@@ -27,6 +27,7 @@ from baton.proc import ROUND_VARIABLE
 from baton.runner import pin_goal, preempted_sentence, run_goal
 from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
+from baton.skill_install import SkillInstallError, install_skill
 from baton.store import (
     AlreadyRunning,
     StateError,
@@ -571,6 +572,17 @@ def cmd_help(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_skills_install(args: argparse.Namespace) -> int:
+    try:
+        actions = install_skill(force=args.force)
+    except SkillInstallError as exc:
+        _err(str(exc))
+        return 1
+    for path, action in actions:
+        print(f"{action}: {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="baton", description="Relay one coding goal between Codex, Antigravity and Claude."
@@ -583,6 +595,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("help", help="show CLI and OpenCode commands, including vendor selection")
     p.set_defaults(func=cmd_help)
+
+    p = sub.add_parser("skills", help="install Baton skills into native vendor CLIs")
+    skills = p.add_subparsers(dest="skills_command", required=True)
+    install_cmd = skills.add_parser("install", help="install the baton-oneshot skill")
+    install_cmd.add_argument(
+        "--force", action="store_true", help="replace an existing baton-oneshot skill"
+    )
+    install_cmd.set_defaults(func=cmd_skills_install)
 
     p = sub.add_parser("run", help="run one goal in the foreground")
     p.add_argument("goal", help="goal file")

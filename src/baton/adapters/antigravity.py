@@ -551,22 +551,24 @@ class AntigravityAdapter:
         tier: str = "strong",
         *,
         read_only: bool = False,
+        native_goal: bool = False,
     ) -> list[str]:
         cfg = tier_config(self.cfg, tier)
-        # A NUL byte would make exec fail; a leading slash would run a slash command instead.
+        # A NUL byte would make exec fail; in stream-json mode a slash is plain task text.
         prompt = prompt.replace("\x00", "")
-        if prompt.lstrip().startswith("/"):
+        if prompt.lstrip().startswith("/") and not native_goal:
             prompt = "Task:\n" + prompt
         argv = [
             cfg.bin,
             "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--model",
-            cfg.model,
         ]
+        if native_goal and session_id is None:
+            # Antigravity expands /goal and skills in print mode. It does not expand commands from
+            # stream-json input, so start the native goal as an argv prompt on a fresh session.
+            argv.append(prompt)
+        else:
+            argv += ["--input-format", "stream-json"]
+        argv += ["--output-format", "stream-json", "--model", cfg.model]
         if read_only:
             argv += ["--mode", "plan"]
         if cfg.full_access and not read_only:
@@ -613,11 +615,24 @@ class AntigravityAdapter:
                 return self._subagent(event, ctx, subagents)
             return None
 
-        argv = self.argv(prompt, ctx.session_id, ctx.tier, read_only=ctx.read_only)
+        native_start = ctx.native_goal and ctx.session_id is None
+        run_prompt = ctx.native_goal_prompt if native_start and ctx.native_goal_prompt else prompt
+        argv = self.argv(
+            run_prompt,
+            ctx.session_id,
+            ctx.tier,
+            read_only=ctx.read_only,
+            native_goal=native_start,
+        )
         # Send the prompt as one NDJSON user event instead of argv. OpenCode compaction may
         # include the entire chat history, which can exceed macOS's per-argument size limit.
         stdin_text = (
-            json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n"
+            None
+            if native_start
+            else (
+                json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False)
+                + "\n"
+            )
         )
 
         def start(run_ctx: RoundContext) -> RoundResult:

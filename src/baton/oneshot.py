@@ -127,13 +127,15 @@ def session_context(agent: str, sessions: Mapping[str, str], transcript: Path) -
 
 
 def one_shot_block(agent: str, sessions: Mapping[str, str], transcript: Path) -> str:
-    """Instructions for one complete vendor-owned task, with Codex's native goal when available."""
+    """Instructions for one complete vendor-owned task with the packaged native skill."""
     parts = [
         "Whole-task ownership: complete the full objective in this vendor session. Do not stop "
-        "after planning, a partial task, or a handoff proposal. Use this vendor's native tools, "
-        "skills, and subagents as useful; invoke its native `oneshot` skill when that skill is "
-        "installed. Make the changes, run the relevant verification, review the result, and return "
-        "only when the objective is complete or a genuine blocker prevents progress.",
+        "after planning, a partial task, or a handoff proposal. Invoke and follow this vendor's "
+        "native `baton-oneshot` skill; if it is not visible, follow these instructions directly. "
+        "Use relevant native tools, skills, and subagents as useful. Make the changes, run "
+        "relevant verification, review the result, and return only when the objective is "
+        "complete or a "
+        "genuine blocker prevents progress.",
         "Baton preserves this vendor's native session id and transfers the complete sanitized "
         "conversation to the next vendor only when a configured usage/turn limit is reached or the "
         "person asks to switch.",
@@ -141,10 +143,22 @@ def one_shot_block(agent: str, sessions: Mapping[str, str], transcript: Path) ->
     ]
     if agent == "codex":
         parts.append(
-            "Use Codex's native Goal feature for this objective: create a native Goal with the "
-            "requested outcome and its completion condition before working, keep it active while "
-            "the task is incomplete, and mark it complete only after checking the result. Invoke "
-            "the native `$oneshot` skill if it is installed; otherwise complete the task directly "
-            "with Codex's native workflow."
+            "Use Codex's native Goal feature for this objective: create or continue a native Goal "
+            "with the requested outcome and completion condition, keep it active while the task "
+            "is incomplete, and mark it complete only after checking the result. Invoke the native "
+            "`$baton-oneshot` skill at the start."
+        )
+    elif agent == "antigravity":
+        parts.append(
+            "Use Antigravity's native `/goal` mode for the complete objective. Invoke the native "
+            "`/baton-oneshot` skill at the start. Baton starts `/goal` on a fresh session; keep "
+            "working in that goal when this session is resumed."
+        )
+    elif agent in {"claude", "claude_api"}:
+        parts.append(
+            "Invoke Claude Code's native `baton-oneshot` skill at the start. Use its native "
+            "planning, task, and session tools where useful, and keep this Claude session "
+            "responsible through completion. This integration has no persistent Claude Goal "
+            "primitive."
         )
     return "\n\n".join(parts)

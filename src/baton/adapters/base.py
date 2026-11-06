@@ -77,8 +77,11 @@ class RoundContext:
     tier: str = "strong"
     # Summary-only requests must not write to the user's repository.
     read_only: bool = False
-    # Use Codex's native persistent Goal tool for whole-task mode.
+    # Use the vendor's native persistent goal feature for whole-task mode when available.
     native_goal: bool = False
+    # Antigravity's first native /goal prompt is sent as a CLI argument because slash commands
+    # cannot be submitted in stream-json input mode. The full task remains in the transcript.
+    native_goal_prompt: str | None = None
     # Told, with the tool and the model when the stream shows it, of every subagent a round starts.
     on_subagent: Callable[[str, str | None], None] = lambda tool, model: None
 

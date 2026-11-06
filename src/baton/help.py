@@ -6,11 +6,16 @@ BATON — ajuda rápida
 Como funciona
   Um vendor assume a tarefa inteira e continua nela até concluí-la ou atingir o limite
   configurado. Depois disso, Baton passa o histórico completo e os IDs das sessões anteriores
-  ao próximo vendor disponível. `phases = true` ativa o fluxo opcional plan/build/review do Baton.
+  ao próximo vendor disponível. A skill nativa `baton-oneshot` mantém o vendor responsável pelo
+  trabalho completo; Codex e Antigravity usam Goals nativos. Claude Code usa sua skill, tarefas e
+  sessão nativas. `phases = true` ativa o fluxo opcional plan/build/review do Baton.
 
 Comandos no terminal
   baton help
       Mostra esta ajuda.
+  baton skills install [--force]
+      Instala a skill `baton-oneshot` nas pastas nativas de Codex, Claude Code e Antigravity.
+      Repita o comando após atualizar o Baton; `--force` substitui uma skill com o mesmo nome.
   baton doctor [goal.toml]
       Verifica CLIs, autenticação, limites e configuração da Claude API.
   baton run goal.toml
@@ -44,6 +49,8 @@ Comandos no terminal
 Comandos dentro do OpenCode
   baton: help
       Mostra esta ajuda na conversa.
+  Para iniciar uma tarefa, descreva o resultado desejado normalmente. O vendor atual invoca a
+  skill `baton-oneshot` e continua até concluir ou atingir o limite configurado.
   baton: goal <texto>
   baton: goal off
   baton: next
@@ -52,6 +59,19 @@ Comandos dentro do OpenCode
   baton: use antigravity now
   baton: use claude
   baton: use claude now
+      Seleciona Claude usando a Anthropic API. `now` encerra a rodada atual depois da chamada de
+      ferramenta e troca assim que for seguro.
+
+Trocar de vendor manualmente
+  baton: next
+      Passa para o próximo vendor disponível depois da rodada atual.
+  baton: next now
+      Pede a troca e encerra a rodada atual depois da chamada de ferramenta.
+  baton: use codex|antigravity|claude [now]
+      Escolhe um vendor específico; `claude` usa a Claude API com a chave da Anthropic Console.
+  baton next <job|goal.toml> [--now]
+  baton use <job|goal.toml> <codex|antigravity|claude> [--now]
+      Os mesmos comandos no terminal. Sem `now`/`--now`, a troca espera o fim da rodada atual.
 
 Usar a Claude API diretamente
   1. Crie o diretório e salve sua chave da Anthropic Console:

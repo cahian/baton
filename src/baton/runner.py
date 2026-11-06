@@ -2300,7 +2300,20 @@ class _Run:
                 on_session_total=on_session_total,
                 tier=TIER[phase] if phase else "strong",
                 read_only=self.response_only,
-                native_goal=not self.phases and not self.response_only and agent == "codex",
+                native_goal=(
+                    not self.phases and not self.response_only and agent in {"codex", "antigravity"}
+                ),
+                native_goal_prompt=(
+                    f"/goal /baton-oneshot Complete this Baton task end to end. Read the full "
+                    f"sanitized conversation at `{transcript_path(goal.workdir, goal.name)}` "
+                    "in full, "
+                    "implement every user deliverable, and verify the result before finishing."
+                    if agent == "antigravity"
+                    and not self.phases
+                    and not self.response_only
+                    and session is None
+                    else None
+                ),
                 on_subagent=on_subagent,
             )
             self.emit(
