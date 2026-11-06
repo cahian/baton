@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -18,6 +19,7 @@ from baton.adapters.base import (
     TRANSIENT,
     Availability,
     RoundResult,
+    ToolWatch,
 )
 from baton.config import MemoryConfig, load_goal
 from baton.memory import Memory, RoundEntry
@@ -494,6 +496,135 @@ def test_interrupt_requested_between_rounds_does_not_kill_the_next_one(go, agent
 
     agents["codex"].script = [check, done(work)]
     assert go() == 0
+
+
+# the interrupt waits for a tool
+
+
+class Watching(Fake):
+    """A Fake whose stream shows tools: the line `start` opens one, `end` closes it."""
+
+    def tool_watch(self):
+        class Watch(ToolWatch):
+            def feed(self, line):
+                if line == "boom":
+                    raise RuntimeError("cannot read this")
+                if line == "start":
+                    self.open.add("t")
+                elif line == "end":
+                    self.open.discard("t")
+
+        return Watch()
+
+
+def kills(ctx, times=5):
+    return [ctx.should_kill() for _ in range(times)]
+
+
+def test_an_interrupt_waits_for_the_running_tool_to_end(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_session("sess-w")
+        ctx.on_output("start")
+        store.say("use sqlite")
+        store.request_interrupt()
+        seen["during"] = kills(ctx)
+        ctx.on_output("end")
+        seen["after"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert seen["during"] == [False] * 5 and seen["after"] is True
+    assert agents["codex"].sessions == [None, "sess-w"]
+    assert "use sqlite" in agents["codex"].prompts[1]
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert ends[0]["interrupted"] is True
+
+
+def test_an_interrupt_with_no_tool_running_ends_the_round_at_once(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        ctx.on_output("end")
+        store.request_interrupt()
+        seen["now"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert seen["now"] is True
+
+
+def test_an_interrupt_waits_for_a_tool_at_most_message_wait_s(go, agents, work, store, world):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        store.request_interrupt()
+        seen["early"] = ctx.should_kill()  # the wait begins here
+        world.now += runner.MESSAGE_WAIT_S - 1
+        seen["almost"] = ctx.should_kill()
+        world.now += 1
+        seen["capped"] = ctx.should_kill()  # the tool is still running
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert (seen["early"], seen["almost"], seen["capped"]) == (False, False, True)
+
+
+def test_stop_now_ends_the_round_even_in_the_middle_of_a_tool(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        store.request_stop(now=True)
+        seen["killed"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first]
+    assert go() == 0
+    assert seen["killed"] is True
+
+
+def test_a_watch_that_fails_is_dropped_and_the_interrupt_ends_the_round(go, agents, work, store):
+    agents["codex"] = Watching("codex")
+    seen = {}
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        ctx.on_output("boom")  # the watch raises: this round is no longer watched
+        store.request_interrupt()
+        seen["killed"] = ctx.should_kill()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert seen["killed"] is True
+
+
+def test_an_interrupt_still_waiting_when_the_agent_ends_by_itself_leaves_the_note(
+    go, agents, work, store
+):
+    agents["codex"] = Watching("codex")
+
+    def first(agent, prompt, ctx):
+        ctx.on_output("start")
+        store.say("read this one")
+        store.request_interrupt()
+        ctx.should_kill()
+        return RoundResult(COMPLETED)  # it finished on its own
+
+    agents["codex"].script = [first, done(work)]
+    assert go() == 0
+    assert "read this one" in agents["codex"].prompts[1]
 
 
 # restart
@@ -3049,3 +3180,197 @@ def test_with_the_real_memory_over_fakes_the_round_is_recalled_and_recorded(
     assert len(fake.of("write-page")) >= 1
     for call in [*fake.runs, *fake.popens]:
         assert "ANTHROPIC_API_KEY" not in call["env"] and "OPENAI_API_KEY" not in call["env"]
+
+
+# every conversation reads every note
+
+
+def worked_then_limit(world, note=None, store=None, session=None, rest=600):
+    """A round that works and then runs out of quota, optionally leaving a note behind it."""
+
+    def step(agent, prompt, ctx):
+        if session:
+            ctx.on_session(session)
+        ctx.on_output("working")
+        if note:
+            store.say(note)
+        return RoundResult(LIMIT, until=world.now + rest)
+
+    return step
+
+
+def test_a_resumed_session_reads_a_note_another_session_consumed(go, agents, work, store, world):
+    agents["codex"].script = [
+        worked_then_limit(world, "N1: use sqlite", store, session="c1"),
+        done(work),
+    ]
+    agents["antigravity"].script = [worked_then_limit(world, rest=1200)]
+    assert go() == 0
+    assert "N1: use sqlite" in agents["antigravity"].prompts[0]  # unread: it took it
+    assert agents["codex"].sessions == [None, "c1"]
+    assert "N1: use sqlite" in agents["codex"].prompts[1]  # and the other conversation reads it too
+
+
+def test_a_session_that_read_a_note_does_not_read_it_again(go, agents, work, store, world):
+    store.say("N0: first")
+    agents["codex"].script = [
+        worked_then_limit(world, "N1: second", store, session="c1"),
+        worked_then_limit(world, session="c1"),
+        done(work),
+    ]
+    agents["antigravity"].script = [worked_then_limit(world, rest=1200)]
+    assert go() == 0
+    assert "N0: first" in agents["codex"].prompts[0]
+    # codex has read N0 already; N1 is new to it
+    assert "N0: first" not in agents["codex"].prompts[1]
+    assert "N1: second" in agents["codex"].prompts[1]
+    assert "N1: second" not in agents["codex"].prompts[2]
+
+
+def test_a_fresh_session_starts_at_the_newest_note(go, agents, work, store, world):
+    store.say("N0: old")
+    agents["codex"].script = [worked_then_limit(world, session="c1")]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert "N0: old" in agents["codex"].prompts[0]
+    assert "N0: old" not in agents["antigravity"].prompts[0]  # its objective holds the talk
+
+
+def test_the_note_log_and_marks_are_in_state_json(go, agents, work, store, world):
+    store.say("N0: first")
+    agents["codex"].script = [worked_then_limit(world, "N1: second", store, session="c1")]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    state = store.load_state()
+    assert [(e["seq"], e["text"].strip()) for e in state["note_log"]] == [
+        (1, "N0: first"),
+        (2, "N1: second"),
+    ]
+    assert state["note_seen"] == {"codex": 1, "antigravity": 2}
+
+
+def test_the_note_log_keeps_the_last_fifty(go, agents, work, store):
+    old = [{"seq": n, "text": f"note {n}\n\n"} for n in range(1, 61)]
+    store.save_state({"workdir": str(work), "note_log": old, "note_seen": {"codex": 60}})
+    store.say("note 61")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    log = store.load_state()["note_log"]
+    assert len(log) == 50 and log[0]["seq"] == 12 and log[-1]["seq"] == 61
+
+
+def test_a_state_without_the_new_keys_loads(go, agents, work, store):
+    store.save_state({"workdir": str(work), "sessions": {"codex": "c1"}, "notes": "kept\n\n"})
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "kept" in agents["codex"].prompts[0]  # no mark: only the unread ones
+    assert agents["codex"].sessions == ["c1"]
+
+
+def test_a_mark_does_not_move_when_the_round_never_ran(go, agents, work, store, world):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "note_log": [{"seq": 1, "text": "OLD\n\n"}],
+            "note_seen": {"codex": 0},
+        }
+    )
+    seen = {}
+
+    def peek(agent, prompt, ctx):
+        seen.update(store.load_state())
+        return RoundResult(LIMIT, until=world.now + 3600)
+
+    agents["codex"].script = [refused(TRANSIENT, reason="no spawn"), done(work)]
+    agents["antigravity"].script = [peek]
+    assert go() == 0
+    assert "OLD" in agents["codex"].prompts[0]
+    assert seen["note_seen"]["codex"] == 0
+    assert "OLD" in agents["codex"].prompts[1]  # the retry still reads it
+    assert store.load_state()["note_seen"]["codex"] == 1
+
+
+def test_the_old_notes_of_a_resumed_session_come_before_a_new_one(go, agents, work, store):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "note_log": [{"seq": 1, "text": "ONE\n\n"}, {"seq": 2, "text": "TWO\n\n"}],
+            "note_seen": {"codex": 0},
+        }
+    )
+    store.say("THREE")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    prompt = agents["codex"].prompts[0]
+    assert prompt.index("ONE") < prompt.index("TWO") < prompt.index("THREE")
+    assert prompt.count("TWO") == 1
+
+
+# large notes
+
+
+def test_a_large_note_goes_to_a_file_and_the_prompt_keeps_its_start(go, agents, work, store, world):
+    body = "".join(f"line {n:05d} of the person's long brief\n" for n in range(400))
+    assert len(body) > runner.NOTE_INLINE_CHARS
+    store.say(body)
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    prompt = agents["codex"].prompts[0]
+    assert body[: runner.NOTE_HEAD_CHARS].strip() in prompt
+    assert body[runner.NOTE_HEAD_CHARS + 200 :][:100] not in prompt
+    files = list((work / ".baton" / "notes").glob("*.md"))
+    assert len(files) == 1
+    assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{8}\.md", files[0].name)
+    assert files[0].read_text(encoding="utf-8").strip() == body.strip()
+    assert f".baton/notes/{files[0].name}" in prompt and "read" in prompt.lower()
+    # the notes in state.json (and so in every later prompt) are the short form as well
+    assert len(store.load_state()["note_log"][0]["text"]) < runner.NOTE_INLINE_CHARS
+
+
+def test_a_note_at_the_limit_stays_in_the_prompt(go, agents, work, store):
+    body = "x" * runner.NOTE_INLINE_CHARS
+    store.say(body)
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert body in agents["codex"].prompts[0]
+    assert not (work / ".baton" / "notes").exists()
+
+
+def test_a_large_note_that_cannot_be_filed_stays_whole(go, agents, work, store):
+    (work / ".baton").mkdir(exist_ok=True)
+    (work / ".baton" / "notes").write_text("a file where the directory should be")
+    body = "y" * (runner.NOTE_INLINE_CHARS + 500)
+    store.say(body)
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert body in agents["codex"].prompts[0]
+
+
+def test_a_session_started_by_a_round_that_read_nothing_gets_a_mark_at_once(
+    go, agents, work, store, world
+):
+    store.say("N0: seen by nobody")
+
+    def silent(agent, prompt, ctx):
+        ctx.on_session("c1")  # a process that said nothing: no mark moves with the round
+        return RoundResult(TRANSIENT, reason="died")
+
+    agents["codex"].script = [silent]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert store.load_state()["note_seen"]["codex"] == 1  # the newest note when it began
+
+
+def test_a_saved_session_with_no_mark_starts_at_zero(go, agents, work, store):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "note_log": [{"seq": 1, "text": "ONE\n\n"}],
+        }
+    )
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "ONE" in agents["codex"].prompts[0]

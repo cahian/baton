@@ -354,7 +354,7 @@ class Store:
     # interrupt
 
     def request_interrupt(self) -> None:
-        """Ask the runner to end the current round now."""
+        """Ask the runner to end the current round, once the tool call in flight is done."""
         _atomic_write(self._interrupt, "1\n")
 
     def take_interrupt(self) -> bool:

@@ -29,7 +29,7 @@ from urllib.parse import quote
 from baton.adapters.base import Adapter
 from baton.config import Goal, GoalError, check_repo_table, goal_from_table
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group
-from baton.runner import preempted_sentence, run_goal
+from baton.runner import file_large_note, preempted_sentence, run_goal
 from baton.store import (
     AlreadyRunning,
     StateError,
@@ -60,6 +60,14 @@ SHUTDOWN_S = 25.0
 # this many times in a row.
 MAX_RESTARTS = 5
 SETTLE_POLL_S = 0.05
+# While a job runs, OpenCode's inbox is read this often, with this long to wait on a lock.
+INBOX_POLL_S = 2.0
+INBOX_DB_TIMEOUT_S = 1.0
+# What a note taken from the inbox waits for its echo, the later POST of the same words, before
+# it is forgotten (the person may have cancelled that message in OpenCode, which sends nothing).
+INBOX_TAKEN_TTL_S = 24 * 3600.0
+INBOX_SEEN_MAX = 500
+DELIVERED = "that message was already delivered"
 GATE_SHOWN_CHARS = 1500
 NAME_MAX_CHARS = 100
 # job.json `status`: anything but RUNNING is left alone when `baton serve` starts.
@@ -121,12 +129,45 @@ def last_user_index(messages: list) -> int | None:
     return None
 
 
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.strip().encode("utf-8", errors="replace")).hexdigest()
+
+
 def message_mark(messages: list, index: int) -> tuple[int, str]:
     """What identifies the user message at `index`: its position among the user messages, and a
     hash of its text. A retry repeats both; the same words said again come at a later position."""
     position = sum(1 for message in messages[:index] if _role(message) == "user")
-    text = _text_of(messages[index]).strip()
-    return position, hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    return position, text_hash(_text_of(messages[index]))
+
+
+def _consume_echoes(
+    messages: list, accepted: set[tuple[int, str]], taken: dict[str, dict], now: float
+) -> tuple[bool, list[tuple[int, str]]]:
+    """Match the user messages of a request, newer than what the job knows, against the notes it
+    took from OpenCode's inbox: each match uses up one of that text's `n` (an entry is dropped at
+    zero, or after INBOX_TAKEN_TTL_S). Changes `taken`. Returns whether the newest user message
+    was one of them, which makes the request the echo of a note already delivered, and the marks
+    that matched, which the job must now accept."""
+    for digest in [h for h, e in taken.items() if now - e["at"] > INBOX_TAKEN_TTL_S]:
+        del taken[digest]
+    newest = last_user_index(messages)
+    echoed = False
+    marks: list[tuple[int, str]] = []
+    # Newest first: an older message with the same words must not use up the echo's entry.
+    for index in range(len(messages) - 1, -1, -1):
+        if _role(messages[index]) != "user":
+            continue
+        mark = message_mark(messages, index)
+        entry = taken.get(mark[1])
+        if mark in accepted or entry is None:
+            continue
+        entry["n"] -= 1
+        if entry["n"] <= 0:
+            del taken[mark[1]]
+        marks.append(mark)
+        echoed = echoed or index == newest
+    marks.reverse()
+    return echoed, marks
 
 
 GAP = "..."
@@ -370,6 +411,17 @@ def compose_objective(before: list, text: str) -> str:
 # jobs
 
 
+def _notes_unread(store: Store) -> bool:
+    """True when a note is still waiting for an agent: in the inbox, or already collected into the
+    carried notes of state.json. What cannot be read counts as unread, so no note is lost."""
+    try:
+        return bool(
+            store.read_inbox().strip() or str(store.load_state().get("notes") or "").strip()
+        )
+    except (OSError, StateError):
+        return True
+
+
 class _JobStore(Store):
     """A Store that also tells its job about every event, so the stream needs no disk polling."""
 
@@ -415,6 +467,8 @@ class Job:
         context: list[dict],
         accepted: Iterable[tuple[int, str]] = (),
         restarted: bool = False,
+        inbox_seen: Iterable[str] = (),
+        inbox_taken: Mapping[str, dict] | None = None,
     ) -> None:
         self.session = session
         self.name = name
@@ -426,6 +480,12 @@ class Job:
         self.restarted = restarted  # taken up again by a new server, not started by a message
         self._accepted = set(accepted)  # the marks of every user message this session has given
         self._last_accepted: tuple[int, str] | None = None
+        # The rows of OpenCode's inbox this job took as notes, by id, and how many of each text
+        # (`n`, last taken at `at`) still wait for OpenCode to post them as requests.
+        self._inbox_seen: list[str] = list(inbox_seen)[-INBOX_SEEN_MAX:]
+        self._inbox_taken: dict[str, dict] = {h: dict(e) for h, e in (inbox_taken or {}).items()}
+        self._echoed: set[tuple[int, str]] = set()
+        self._status = RUNNING
         self._refused = False
         self._adapters_for = adapters_for
         self._cond = threading.Condition()
@@ -484,7 +544,7 @@ class Job:
             self._push(f"\n[baton] the job crashed: {type(exc).__name__}: {exc}\n")
         finally:
             with self._cond:
-                status = self._final_status()
+                status = self._status = self._final_status()
                 if self.save(status) and status == STOPPED:
                     self._clear_stop()  # before _done, so it cannot remove a newer job's stop
                 self._done = True
@@ -533,16 +593,19 @@ class Job:
 
     # what survives a restart
 
-    def save(self, status: str = RUNNING) -> bool:
-        """Write job.json, True when it was. Failing to is no reason to stop working, only to say
-        so."""
+    def save(self, status: str | None = None) -> bool:
+        """Write job.json, True when it was, with the job's own status unless `status` says one.
+        Failing to is no reason to stop working, only to say so."""
         with self._cond:
+            status = self._status if status is None else status
             record = {
                 "session": self.session,
                 "workdir": str(self.workdir),
                 "objective": self.objective(),
                 "conversation": slim_conversation(self.context),
                 "accepted": sorted(self._accepted),
+                "inbox_seen": list(self._inbox_seen),
+                "inbox_taken": {h: dict(e) for h, e in self._inbox_taken.items()},
                 "status": status,
             }
             try:
@@ -555,6 +618,11 @@ class Job:
     def knows(self, mark: tuple[int, str]) -> bool:
         with self._cond:
             return mark in self._accepted
+
+    def inbox_state(self) -> tuple[list[str], dict[str, dict]]:
+        """What a later job of this session must know of OpenCode's inbox."""
+        with self._cond:
+            return list(self._inbox_seen), {h: dict(e) for h, e in self._inbox_taken.items()}
 
     def accepted(self) -> set[tuple[int, str]]:
         with self._cond:
@@ -586,20 +654,71 @@ class Job:
                 self._end = kind
         self._push(render_event(kind, fields))
 
-    def add_note(self, text: str, mark: tuple[int, str]) -> bool:
-        """Queue a new message for the running job and end the current round, so the next one
-        reads it. False when the job is over or about to be."""
+    def add_note(self, text: str, mark: tuple[int, str] | None, row: str | None = None) -> bool:
+        """Queue a new message for the running job and end the current round once the tool in
+        flight is done, so the next one reads it. `row` is the id of the OpenCode inbox row it
+        came from, in place of a request's `mark`. A note over NOTE_INLINE_CHARS goes to a file
+        and only its start is kept, so no prompt carries it whole. False when the job is over or
+        about to be."""
         with self._cond:
             if self._done or self._closing:
                 return False
-            self.store.say(text)
-            self.store.request_interrupt()
-            self.context.append({"role": "user", "content": text})
-            self.accept(mark)
+            digest = text_hash(text)
+            short, _ = file_large_note(self.workdir, text, time.time())
+            self.store.say(short)
+            self.context.append({"role": "user", "content": short})
+            if row is not None:
+                # Right after the note is safe: nothing later may make it be taken again.
+                self._inbox_seen = [*self._inbox_seen, row][-INBOX_SEEN_MAX:]
+                entry = self._inbox_taken.setdefault(digest, {"n": 0, "at": 0.0})
+                entry.update(n=entry["n"] + 1, at=time.time())
+            try:
+                self.store.request_interrupt()
+            except OSError:
+                pass  # the note is in the inbox: the next round reads it
+            if mark is not None:
+                self.accept(mark)
+            else:
+                self.save()
         self._push(
-            "\n[baton] message received: ending the current round so the next one reads it\n\n"
+            "\n[baton] message received: it reaches the agent after the current tool call or in "
+            "the next round\n\n"
         )
         return True
+
+    def take_row(self, row_id: str, text: str) -> bool:
+        """A message OpenCode holds in its inbox for this session, delivered as a note. False
+        when this row was taken before, or the job cannot take it."""
+        with self._cond:
+            if row_id in self._inbox_seen:
+                return False
+            return self.add_note(text.strip(), None, row_id)
+
+    def echo(self, messages: list) -> bool:
+        """Account for a request's messages against the notes taken from OpenCode's inbox. True
+        when the newest one is the echo of a note already delivered: the request then says
+        nothing new, and its mark is accepted. Earlier echoes in the same request, as `promote`
+        posts all queued messages at once, are accepted too."""
+        with self._cond:
+            newest, marks = _consume_echoes(
+                messages, self._accepted, self._inbox_taken, time.time()
+            )
+            if marks:
+                self._accepted.update(marks)
+                if newest:
+                    self._echoed.add(marks[-1])
+                self.save()
+            return newest
+
+    def finished(self) -> bool:
+        """True for a job that ended with its goal met: nothing it was told is left unread. A job
+        that was stopped or crashed may still hold notes no agent has read."""
+        with self._cond:
+            return self._status == FINISHED
+
+    def echoed(self, mark: tuple[int, str]) -> bool:
+        with self._cond:
+            return mark in self._echoed
 
     def settle(self, text: str, mark: tuple[int, str], timeout: float) -> str:
         """For a job that is wrapping up: wait until it takes the note ("accepted", it went
@@ -661,12 +780,94 @@ def _marks(raw: object) -> set[tuple[int, str]]:
     }
 
 
+def _inbox_seen_ids(raw: object) -> list[str]:
+    return [e for e in (raw if isinstance(raw, list) else ()) if isinstance(e, str)]
+
+
+def _taken(raw: object) -> dict[str, dict]:
+    """The notes a job.json says were taken from OpenCode's inbox: a count and a time per hash."""
+    out: dict[str, dict] = {}
+    for digest, entry in raw.items() if isinstance(raw, dict) else ():
+        n, at = (entry.get("n"), entry.get("at")) if isinstance(entry, dict) else (None, None)
+        if (
+            isinstance(digest, str)
+            and isinstance(n, int)
+            and not isinstance(n, bool)
+            and n > 0
+            and isinstance(at, int | float)
+            and not isinstance(at, bool)
+        ):
+            out[digest] = {"n": n, "at": float(at)}
+    return out
+
+
+def _inbox_text(payload: object) -> str:
+    """The text of an inbox row's JSON payload, "" when it has none."""
+    try:
+        data = json.loads(payload) if isinstance(payload, str | bytes) else None
+    except ValueError:
+        return ""
+    text = data.get("text") if isinstance(data, dict) else None
+    # Through the same `_unquote` as the text of the request that echoes it.
+    return _unquote(text).strip() if isinstance(text, str) else ""
+
+
 class JobManager:
     def __init__(self, adapters_for: Callable[[Goal], Mapping[str, Adapter]]) -> None:
         self._adapters_for = adapters_for
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._closed = False
+        # Echoes of a note that a job which did not finish had taken: (session, mark) of the
+        # request that starts the next job, which must not say the note again.
+        self._echoes: set[tuple[str, tuple[int, str]]] = set()
+        self._poller: threading.Thread | None = None
+        self._poller_stop = threading.Event()
+
+    # OpenCode's inbox
+
+    def _watch_inbox(self) -> None:
+        """Start the thread that reads OpenCode's inbox, once. Called with the lock held."""
+        if self._poller is None or not self._poller.is_alive():
+            self._poller_stop.clear()
+            self._poller = threading.Thread(target=self._poll_loop, name="baton-inbox", daemon=True)
+            self._poller.start()
+
+    def _poll_loop(self) -> None:
+        while not self._poller_stop.wait(INBOX_POLL_S):
+            try:
+                self.poll_inbox()
+            except Exception:  # its schema is not a promised interface: retry on the next tick
+                pass
+
+    def poll_inbox(self) -> None:
+        """Take the messages typed into OpenCode while a reply streams, which it posts only when
+        that reply ends, as notes of the running job. The database is opened read-only, and
+        anything wrong with it (no file, no table, a lock) just means nothing was read."""
+        with self._lock:
+            running = [job for job in self._jobs.values() if job.is_running()]
+        db = opencode_db()
+        if not running or not db.is_file():
+            return
+        try:
+            conn = sqlite3.connect(
+                f"file:{quote(str(db))}?mode=ro", uri=True, timeout=INBOX_DB_TIMEOUT_S
+            )
+            try:
+                for job in running:
+                    rows = conn.execute(
+                        "select id, payload from session_inbox "
+                        "where session_id = ? and type = 'user' order by enqueued_seq, id",
+                        (job.session,),
+                    ).fetchall()
+                    for row_id, payload in rows:
+                        text = _inbox_text(payload)
+                        if text and isinstance(row_id, str):
+                            job.take_row(row_id, text)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return
 
     def get(self, session: str) -> Job | None:
         with self._lock:
@@ -675,31 +876,88 @@ class JobManager:
     def attach(self, session: str, messages: list) -> Job | None:
         """The session's job when this request brings no new user message, so a client that
         retries reads the stream again and changes nothing. None when the message is new. Raises
-        GatewayError for a message that a server before this one already finished with."""
+        GatewayError for a message that a server before this one already finished with, and for
+        the echo of a note already delivered to a job that is over with nothing unread: OpenCode
+        posts the messages it queued once its reply ends, and baton took them as notes when they
+        were typed. The echo of a note a job never read is not an answer: it starts the next job."""
         index = last_user_index(messages)
         if index is None:
             return None
         mark = message_mark(messages, index)
-        job = self.get(session)
-        if job is not None:
-            return job if job.knows(mark) else None
+        with self._lock:
+            job = self._jobs.get(session)
+            if job is None:
+                return self._attach_record(session, messages, mark)
+            if job.knows(mark):
+                if job.echoed(mark) and not job.is_running():
+                    return self._echo_of(session, mark, job)
+                return job
+            if job.echo(messages):
+                return self._echo_of(session, mark, job)
+            return None
+
+    def _echo_of(self, session: str, mark: tuple[int, str], job: Job) -> Job | None:
+        """What an echo is answered with: the job's stream while it runs, one line when it
+        finished or has no unread note left (a person's stop ends the reply too, and the note the
+        agent read must not start the job again). None for a job that ended with a note still
+        unread: the request goes on to start the next job, without saying the note a second
+        time."""
+        if job.is_running():
+            return job
+        if job.finished() or not _notes_unread(job.store):
+            raise GatewayError(DELIVERED)
+        self._echoes.add((session, mark))
+        return None
+
+    def _attach_record(self, session: str, messages: list, mark: tuple[int, str]) -> None:
+        """`attach` for a session with no job in memory: only its job.json is left to go by."""
+        echoed, delivered = self._echo_record(session, messages)
+        if echoed:
+            if delivered:
+                raise GatewayError(DELIVERED)
+            self._echoes.add((session, mark))
+            return None
         if mark in self._recorded_marks(session):
             raise GatewayError(
                 "this message was already handled, in a job that has ended. Send a new message "
                 "to go on."
             )
-        return None
+
+    def _echo_record(self, session: str, messages: list) -> tuple[bool, bool]:
+        """`Job.echo` on a job.json alone, which keeps its status, so a job that finished stays
+        finished: whether the newest message is an echo, and whether the answer is that it was
+        delivered (the job finished, or no note is left unread). Called with the lock held."""
+        store = Store(state_dir(job_name(session)))
+        try:
+            record = store.load_job()
+        except StateError:
+            return False, False
+        if not record:
+            return False, False
+        accepted, taken = _marks(record.get("accepted")), _taken(record.get("inbox_taken"))
+        newest, marks = _consume_echoes(messages, accepted, taken, time.time())
+        if marks:
+            record["accepted"] = sorted(accepted | set(marks))
+            record["inbox_taken"] = taken
+            try:
+                store.save_job(record)
+            except (OSError, ValueError):
+                pass  # the entry is then used up again by the next request, to the same end
+        delivered = record.get("status") == FINISHED or not _notes_unread(store)
+        return newest, delivered
 
     @staticmethod
-    def _recorded_marks(session: str) -> set[tuple[int, str]]:
-        """The marks in the session's job.json. Unreadable counts as none: a message is then
-        taken for new, which at worst repeats work, where the opposite would drop it."""
+    def _record(session: str) -> dict:
+        """The session's job.json. Unreadable counts as none: a message is then taken for new,
+        which at worst repeats work, where the opposite would drop it."""
         try:
-            record = Store(state_dir(job_name(session))).load_job()
+            return Store(state_dir(job_name(session))).load_job() or {}
         except StateError:
-            return set()
-        raw = record.get("accepted") if record else None
-        return _marks(raw)
+            return {}
+
+    @classmethod
+    def _recorded_marks(cls, session: str) -> set[tuple[int, str]]:
+        return _marks(cls._record(session).get("accepted"))
 
     def submit(self, session: str, workdir: Path, messages: list[dict]) -> Job:
         """Deliver the last user message to the session's job: as a note with an interrupt when
@@ -716,15 +974,41 @@ class JobManager:
                 if self._closed:
                     raise GatewayError("baton is shutting down, so it started nothing.")
                 old = self._jobs.get(session)
-                if old is not None and old.knows(mark):
+                # `attach` may have found the echo of a note this job never read: it is what
+                # starts the next job, so the mark the echo gave the old one is no answer.
+                echo_known = (session, mark) in self._echoes
+                if old is not None and old.knows(mark) and not echo_known:
                     return old
+                if old is not None and not echo_known and old.echo(messages):
+                    following = self._echo_of(session, mark, old)
+                    if following is not None:
+                        return following
+                if old is None:
+                    is_echo, delivered = self._echo_record(session, messages)
+                    if is_echo and delivered:
+                        raise GatewayError(DELIVERED)
+                    if is_echo:
+                        self._echoes.add((session, mark))
                 if old is None or not old.is_running():
                     self._refuse_if_busy(session, workdir)
-                    accepted = old.accepted() if old else self._recorded_marks(session)
-                    job = self._create(session, workdir, messages[:index], text, accepted)
+                    if old is not None:
+                        accepted, inbox = old.accepted(), old.inbox_state()
+                    else:
+                        record = self._record(session)
+                        accepted = _marks(record.get("accepted"))
+                        inbox = (
+                            _inbox_seen_ids(record.get("inbox_seen")),
+                            _taken(record.get("inbox_taken")),
+                        )
+                    said = (session, mark) in self._echoes  # its note is already unread in the job
+                    self._echoes.discard((session, mark))
+                    job = self._create(
+                        session, workdir, messages[:index], text, accepted, inbox, say=not said
+                    )
                     job.accept(mark)
                     self._jobs[session] = job
                     job.start()
+                    self._watch_inbox()
                     return job
                 if old.add_note(text, mark):
                     return old
@@ -782,16 +1066,23 @@ class JobManager:
         before: list,
         text: str,
         accepted: Iterable[tuple[int, str]],
+        inbox: tuple[list[str], dict[str, dict]] = ([], {}),
+        say: bool = True,
     ) -> Job:
         name = job_name(session)
+        # A huge message goes to a file, and only its start is in the objective, which travels
+        # in a command line.
+        text, _ = file_large_note(workdir, text, time.time())
         goal, resumed = self._briefing(name, workdir, before, text)
         context = [*before, {"role": "user", "content": text}]
-        job = Job(session, name, workdir, goal, self._adapters_for, context, accepted)
+        job = Job(
+            session, name, workdir, goal, self._adapters_for, context, accepted, False, *inbox
+        )
 
         # A stop or interrupt left by something earlier is not about this message.
         job.store.clear_stop()
         job.store.take_interrupt()
-        if resumed:
+        if resumed and say:
             job.store.say(text)  # the resumed prompt carries no objective, only notes
         return job
 
@@ -884,12 +1175,15 @@ class JobManager:
             conversation,
             _marks(record.get("accepted")),
             restarted=True,
+            inbox_seen=_inbox_seen_ids(record.get("inbox_seen")),
+            inbox_taken=_taken(record.get("inbox_taken")),
         )
         with self._lock:
             if self._closed:
                 return
             self._jobs[session] = job
             job.start()
+            self._watch_inbox()
 
     def shutdown(self, timeout: float = SHUTDOWN_S) -> None:
         """Stop every running job, killing its agent's process group, and wait for them. The
@@ -897,6 +1191,7 @@ class JobManager:
         with self._lock:
             self._closed = True  # from here on submit starts nothing
             jobs = list(self._jobs.values())
+        self._poller_stop.set()
         running = [j for j in jobs if j.is_running()]
         for job in running:
             job.halt()

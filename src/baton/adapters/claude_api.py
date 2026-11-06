@@ -41,6 +41,7 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    ToolWatch,
     check_subagent,
     claude_allowed_models,
     subagent_guard_command,
@@ -400,6 +401,25 @@ def make_cost_report(cfg: AgentConfig, ledger: Ledger) -> Callable[[], Decimal] 
 
 def _fmt(value: Decimal) -> str:
     return format(value.normalize() if value == value.to_integral_value() else value, "f")
+
+
+class _ToolWatch(ToolWatch):
+    """A tool is open from the `tool_use` block of an assistant event to the `tool_result` block
+    of a user event, by id."""
+
+    def feed(self, line: str) -> None:
+        event = _parse(line)
+        if event is None or event.get("type") not in ("assistant", "user"):
+            return
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                self.open.add(block["id"])
+            elif block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+                self.open.discard(block["tool_use_id"])
 
 
 class ClaudeApiAdapter:
@@ -795,6 +815,9 @@ class ClaudeApiAdapter:
         return RoundResult(TRANSIENT, reason=summary)
 
     # rendering
+
+    def tool_watch(self) -> ToolWatch:
+        return _ToolWatch()
 
     def is_work(self, line: str) -> bool:
         event = _parse(line)

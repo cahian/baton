@@ -1337,3 +1337,118 @@ def test_the_two_ids_without_their_effort_suffix_are_allowed(tmp_path, monkeypat
     wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
     wrapper.chmod(0o755)
     assert adapter(str(wrapper), Reads()).run_round("go", make_ctx(tmp_path)).outcome == COMPLETED
+
+
+# --- the tool watch --------------------------------------------------------------------------
+
+
+def step_line(tool, state, index, conversation="c", parameters=None, output=None):
+    info = {"name": tool, "parameters": parameters or {}}
+    if output is not None:
+        info["output"] = output
+    return tool_line(
+        tool, state=state, step_index=index, conversation_id=conversation, tool_info=info
+    )
+
+
+def watch_of(*lines):
+    watch = AntigravityAdapter(make_cfg(), read=Reads()).tool_watch()
+    for line in lines:
+        watch.feed(line)
+    return watch
+
+
+def test_a_tool_step_is_busy_from_active_to_done():
+    watch = watch_of()
+    assert watch.busy is False
+    watch.feed(step_line("run_command", "ACTIVE", 4))
+    assert watch.busy is True
+    watch.feed(step_line("run_command", "DONE", 4))
+    assert watch.busy is False
+
+
+@pytest.mark.parametrize("state", ["ERROR", "CANCELLED", "FAILED"])
+def test_a_tool_step_that_ends_in_any_other_state_is_not_busy_either(state):
+    watch = watch_of(step_line("run_command", "ACTIVE", 4))
+    watch.feed(step_line("run_command", state, 4))
+    assert watch.busy is False
+
+
+def test_a_parallel_pair_of_tools_stays_busy_until_both_end():
+    watch = watch_of(step_line("read_file", "ACTIVE", 5), step_line("run_command", "ACTIVE", 6))
+    watch.feed(step_line("read_file", "DONE", 5))
+    assert watch.busy is True
+    watch.feed(step_line("run_command", "DONE", 6))
+    assert watch.busy is False
+
+
+def test_text_and_other_events_do_not_make_the_watch_busy():
+    watch = watch_of(
+        delta_line("thinking about it"),
+        json.dumps({"event": "init", "conversation_id": "c"}),
+        '{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE"}}',
+        "not json at all",
+        "[1, 2]",
+    )
+    assert watch.busy is False
+
+
+def task_done(action, status=None, task="c/task-3", output=None):
+    text = output if output is not None else f"Task: {task}\nStatus: {status}\nLog: file:///x.log\n"
+    return step_line(
+        "manage_task", "DONE", 9, parameters={"Action": action, "TaskId": task}, output=text
+    )
+
+
+def test_a_running_background_task_keeps_the_watch_busy_after_its_step_is_done():
+    watch = watch_of(task_done("status", "RUNNING"))
+    assert watch.busy is True
+    watch.feed(task_done("status", "DONE"))
+    assert watch.busy is False
+
+
+@pytest.mark.parametrize("status", ["FAILED", "CANCELLED", "TIMEOUT"])
+def test_another_terminal_status_ends_a_background_task(status):
+    watch = watch_of(task_done("status", "RUNNING"), task_done("status", status))
+    assert watch.busy is False
+
+
+def test_a_kill_ends_a_background_task():
+    killed = 'Task "c/task-3" cancelled.'
+    watch = watch_of(task_done("status", "RUNNING"), task_done("kill", output=killed))
+    assert watch.busy is False
+
+
+def test_two_background_tasks_stay_busy_until_both_end():
+    watch = watch_of(
+        task_done("status", "RUNNING", task="c/task-1"),
+        task_done("status", "RUNNING", task="c/task-2"),
+        task_done("status", "DONE", task="c/task-1"),
+    )
+    assert watch.busy is True
+    watch.feed(task_done("kill", output="cancelled", task="c/task-2"))
+    assert watch.busy is False
+
+
+def test_the_agent_waiting_for_background_tasks_is_busy_until_one_is_removed():
+    waiting = "root agent idle; waiting for 2 background task(s) to finish"
+    watch = watch_of(waiting)  # agy prints it as a plain line
+    assert watch.busy is True
+    watch.feed(task_done("status", "DONE"))
+    assert watch.busy is False
+    watch.feed(delta_line("waiting for 1 background task to finish"))  # or as a text delta
+    assert watch.busy is True
+    watch.feed(step_line("read_file", "ACTIVE", 11))
+    watch.feed(step_line("read_file", "DONE", 11))
+    assert watch.busy is False  # a new tool step: it is acting again
+
+
+def test_waiting_for_no_background_task_is_not_busy():
+    assert watch_of("root agent idle; waiting for 0 background task(s) to finish").busy is False
+
+
+def test_every_round_gets_its_own_watch():
+    a = AntigravityAdapter(make_cfg(), read=Reads())
+    first = a.tool_watch()
+    first.feed(step_line("run_command", "ACTIVE", 1))
+    assert a.tool_watch().busy is False

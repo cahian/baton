@@ -1745,3 +1745,542 @@ def test_memory_events_stay_out_of_the_chat():
     """The person reads no recall and no memory failure: the event is for `baton status`."""
     assert gateway.render_event("memory", {"event": "recalled", "hits": 3, "chars": 900}) == ""
     assert gateway.render_event("memory", {"event": "error", "reason": "memory is down"}) == ""
+
+
+# a message typed while the reply streams: OpenCode's session_inbox
+
+
+def inbox_db(tmp_path):
+    return tmp_path / "opencode.db"
+
+
+def add_inbox_row(tmp_path, row_id, text, session=SESSION, kind="user", payload=None, seq=None):
+    """A row the way OpenCode queues a message typed during a reply."""
+    conn = sqlite3.connect(inbox_db(tmp_path))
+    conn.execute(
+        "create table if not exists session_inbox (id text primary key, session_id text, "
+        "type text, payload text, delivery text, enqueued_seq integer, time_created integer)"
+    )
+    body = json.dumps({"text": text}) if payload is None else payload
+    count = conn.execute("select count(*) from session_inbox").fetchone()[0]
+    conn.execute(
+        "insert into session_inbox values (?, ?, ?, ?, 'steer', ?, 1)",
+        (row_id, session, kind, body, count if seq is None else seq),
+    )
+    conn.commit()
+    conn.close()
+
+
+def user_texts(job):
+    return [m["content"] for m in job.context if m["role"] == "user"]
+
+
+def test_a_row_in_the_inbox_becomes_a_note_and_ends_the_round(gw, tmp_path):
+    gw.agents["claude_api"].script = [until_killed("working on the first")]
+    first = gw.stream("first request")
+    first.read_until("working on the first")
+    add_inbox_row(tmp_path, "row1", "also handle the empty case")
+    gw.manager.poll_inbox()
+    text = first.read_all()
+    prompts = gw.agents["claude_api"].prompts
+    assert len(prompts) == 2 and "also handle the empty case" in prompts[1]
+    assert "message received: it reaches the agent after the current tool call" in text
+    assert user_texts(gw.job()) == ["first request", "also handle the empty case"]
+    ended = [e for e in gw.events() if e["kind"] == "round_end"]
+    assert ended[0]["interrupted"] is True
+    first.close()
+
+
+def test_a_row_is_taken_once_however_often_it_is_polled(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "only once")
+    for _ in range(3):
+        gw.manager.poll_inbox()
+    assert user_texts(gw.job()) == ["go", "only once"]
+    assert gw.job().store.read_inbox().count("only once") == 1
+    release.set()
+    first.read_all()
+    first.close()
+
+
+def hash_of(text):
+    return gateway.message_mark([{"role": "user", "content": text}], 0)[1]
+
+
+def test_the_rows_taken_are_saved_in_job_json(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "remember me")
+    before = time.time()
+    gw.manager.poll_inbox()
+    record = job_json(gw.job().store.root)
+    assert record["inbox_seen"] == ["row1"]
+    assert list(record["inbox_taken"]) == [hash_of("remember me")]
+    entry = record["inbox_taken"][hash_of("remember me")]
+    assert entry["n"] == 1 and before <= entry["at"] <= time.time()
+    assert record["status"] == "running"
+    release.set()
+    first.read_all()
+    first.close()
+
+
+def test_a_restart_does_not_take_a_row_again(gw, tmp_path):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "said during the reply")
+    gw.manager.poll_inbox()
+    store = gw.job().store
+    gw.manager.shutdown(timeout=10)  # the job has not finished: it is taken up again
+    first.close()
+    gw.manager._closed = False
+    store.clear_inbox(store.read_inbox())  # the note was read before the restart
+    manager = restart(gw)
+    assert manager.recover() == 1
+    job = manager.get(SESSION)
+    manager.poll_inbox()
+    manager.poll_inbox()
+    assert wait_for(lambda: not job.is_running())
+    assert user_texts(job).count("said during the reply") == 1
+    assert "said during the reply" not in " ".join(gw.agents["claude_api"].prompts[2:])
+
+
+def test_the_post_of_a_row_already_taken_follows_the_job_with_no_second_note(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "typed during the reply")
+    gw.manager.poll_inbox()
+    # OpenCode posts the queued message with the history it holds
+    again = gw.stream("go", "typed during the reply")
+    release.set()
+    text = again.read_all()
+    assert "[baton] done" in text
+    assert len(gw.agents["claude_api"].prompts) == 2  # one round for each, no third
+    assert user_texts(gw.job()) == ["go", "typed during the reply"]
+    assert gw.job().store.read_inbox() == ""
+    assert job_json(gw.job().store.root)["inbox_taken"] == {}  # consumed once
+    first.close()
+    again.close()
+
+
+def finished_with_a_row(gw, tmp_path, text="typed during the reply"):
+    """A job that took a row as a note and finished, with the post of that row still to come."""
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", text)
+    gw.manager.poll_inbox()
+    first.read_all()
+    first.close()
+    job = gw.job()
+    assert wait_for(lambda: not job.is_running())
+    return job
+
+
+def test_an_echo_after_the_job_finished_says_so_in_one_line_and_starts_nothing(gw, tmp_path):
+    job = finished_with_a_row(gw, tmp_path)
+    rounds = len(gw.agents["claude_api"].prompts)
+    echo = gw.stream("go", "typed during the reply")
+    text = echo.read_all()
+    echo.close()
+    assert text.strip() == "[baton] that message was already delivered"
+    assert gw.manager.get(SESSION) is job
+    assert len(gw.agents["claude_api"].prompts) == rounds  # no job, no round
+    record = job_json(job.store.root)
+    assert record["status"] == "finished"  # accepting the mark does not bring it back to life
+    assert restart(gw).recover() == 0
+    assert len(gw.agents["claude_api"].prompts) == rounds
+
+
+def test_an_echo_is_answered_from_job_json_alone_and_consumed_once(gw, tmp_path):
+    job = finished_with_a_row(gw, tmp_path)
+    root = job.store.root
+    manager = restart(gw)  # nothing in memory: only job.json
+    assert manager.get(SESSION) is None
+    echo = gw.stream("go", "typed during the reply")
+    assert echo.read_all().strip() == "[baton] that message was already delivered"
+    echo.close()
+    assert manager.get(SESSION) is None  # an echo starts no job
+    record = job_json(root)
+    assert record["inbox_taken"] == {} and record["status"] == "finished"
+    # the same words said later are a message of their own, not refused for ever
+    later = gw.stream("go", "typed during the reply", "and then", "typed during the reply")
+    assert "[baton] done" in later.read_all()
+    later.close()
+    assert manager.get(SESSION) is not None
+
+
+def test_one_post_with_several_echoes_consumes_each_of_them(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "r1", "first typed")
+    add_inbox_row(tmp_path, "r2", "second typed")
+    gw.manager.poll_inbox()
+    batch = gw.stream("go", "first typed", "second typed")  # `promote`: all steer rows, one POST
+    release.set()
+    assert "[baton] done" in batch.read_all()
+    job = gw.job()
+    assert job.knows((1, hash_of("first typed"))) and job.knows((2, hash_of("second typed")))
+    assert job_json(job.store.root)["inbox_taken"] == {}
+    assert user_texts(job) == ["go", "first typed", "second typed"]
+    first.close()
+    batch.close()
+
+
+def test_the_same_words_twice_are_counted_and_consumed_twice(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "again")
+    add_inbox_row(tmp_path, "row2", "again")
+    gw.manager.poll_inbox()
+    job = gw.job()
+    assert job_json(job.store.root)["inbox_taken"][hash_of("again")]["n"] == 2
+    batch = gw.stream("go", "again", "again")
+    release.set()
+    batch.read_all()
+    assert user_texts(job) == ["go", "again", "again"]
+    assert job_json(job.store.root)["inbox_taken"] == {}
+    first.close()
+    batch.close()
+
+
+def test_an_entry_older_than_a_day_is_ignored_and_dropped(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "typed long ago")
+    gw.manager.poll_inbox()
+    job = gw.job()
+    job._inbox_taken[hash_of("typed long ago")]["at"] -= 25 * 3600
+    again = gw.stream("go", "typed long ago")  # a new message now, with the same words
+    release.set()
+    again.read_all()
+    assert user_texts(job) == ["go", "typed long ago", "typed long ago"]
+    assert job_json(job.store.root)["inbox_taken"] == {}
+    first.close()
+    again.close()
+
+
+def test_consume_echoes_counts_down_and_reports_the_newest():
+    ha, hb = hash_of("a"), hash_of("b")
+    messages = [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]
+    taken = {ha: {"n": 2, "at": 100.0}}
+    newest, marks = gateway._consume_echoes(messages, set(), taken, 100.0)
+    assert newest is False and marks == [(0, ha)] and taken == {ha: {"n": 1, "at": 100.0}}
+    taken = {ha: {"n": 1, "at": 100.0}, hb: {"n": 1, "at": 100.0}}
+    newest, marks = gateway._consume_echoes(messages, {(0, ha)}, taken, 100.0)
+    assert newest is True and marks == [(1, hb)] and taken == {ha: {"n": 1, "at": 100.0}}
+
+
+def test_a_quoted_text_is_hashed_as_the_post_reads_it(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", '"quoted words"')  # JSON-quoted, as OpenCode sometimes has it
+    gw.manager.poll_inbox()
+    echo = gw.stream("go", '"quoted words"')
+    release.set()
+    echo.read_all()
+    assert user_texts(gw.job()) == ["go", "quoted words"]
+    first.close()
+    echo.close()
+
+
+def test_a_failing_interrupt_does_not_repeat_the_note(gw, tmp_path, monkeypatch):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    job = gw.job()
+
+    def broken():
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(job.store, "request_interrupt", broken)
+    add_inbox_row(tmp_path, "row1", "said once")
+    gw.manager.poll_inbox()
+    gw.manager.poll_inbox()
+    assert user_texts(job) == ["go", "said once"] and job.store.read_inbox().count("said once") == 1
+    first.read_until("or in the next round")
+    release.set()
+    first.read_all()
+    first.close()
+
+
+def test_a_new_job_in_the_session_carries_the_inbox_state_over(gw, tmp_path):
+    job = finished_with_a_row(gw, tmp_path)
+    taken = dict(job._inbox_taken)
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "second job")]
+    later = gw.stream("something else entirely")
+    later.read_until("second job")
+    second = gw.job()
+    assert second is not job and second._inbox_seen == ["row1"] and second._inbox_taken == taken
+    gw.manager.poll_inbox()  # the row is still in the database: it is not a new one
+    assert user_texts(second) == ["something else entirely"]
+    release.set()
+    later.read_all()
+    later.close()
+
+
+def huge_note():
+    return "".join(
+        f"line {n:05d} of a very long brief that the person pasted\n" for n in range(2000)
+    )
+
+
+def test_a_huge_note_leaves_the_next_prompt_small_and_is_in_a_file(gw, tmp_path):
+    body = huge_note()
+    assert len(body) > 100_000
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", body)
+    gw.manager.poll_inbox()
+    first.read_all()
+    first.close()
+    prompts = gw.agents["claude_api"].prompts
+    assert len(prompts[1]) < 40_000
+    files = list((gw.work / ".baton" / "notes").glob("*.md"))
+    assert len(files) == 1 and files[0].read_text(encoding="utf-8").strip() == body.strip()
+    assert files[0].name in prompts[1]
+    job = gw.job()
+    assert all(len(m["content"]) < 8000 for m in job.context)
+    assert len(job_json(job.store.root)["objective"]) < 8000
+
+
+def test_a_huge_first_message_does_not_reach_the_prompt_whole(gw):
+    body = huge_note()
+    gw.stream(body).read_all()
+    prompts = gw.agents["claude_api"].prompts
+    assert len(prompts[0]) < 40_000
+    files = list((gw.work / ".baton" / "notes").glob("*.md"))
+    assert len(files) == 1 and files[0].read_text(encoding="utf-8").strip() == body.strip()
+    assert len(job_json(gw.job().store.root)["objective"]) < 8000
+
+
+def test_rows_of_other_sessions_and_other_types_are_left_alone(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "r1", "not mine", session="ses_other")
+    add_inbox_row(tmp_path, "r2", "a command", kind="command")
+    gw.manager.poll_inbox()
+    assert user_texts(gw.job()) == ["go"]
+    release.set()
+    first.read_all()
+    first.close()
+
+
+@pytest.mark.parametrize(
+    "payload", ["not json", "[1, 2]", '{"text": 5}', '{"other": "x"}', '{"text": "   "}', "null"]
+)
+def test_a_row_without_a_usable_text_is_skipped(gw, tmp_path, payload):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "r1", "", payload=payload)
+    gw.manager.poll_inbox()
+    assert user_texts(gw.job()) == ["go"]
+    release.set()
+    first.read_all()
+    first.close()
+
+
+def test_a_missing_table_database_or_lock_is_silent(gw, tmp_path, monkeypatch):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    gw.manager.poll_inbox()  # the database has no session_inbox table
+    monkeypatch.setenv("BATON_OPENCODE_DB", str(tmp_path / "nowhere.db"))
+    gw.manager.poll_inbox()  # and then no database at all
+    monkeypatch.setenv("BATON_OPENCODE_DB", str(inbox_db(tmp_path)))
+    monkeypatch.setattr(gateway, "INBOX_DB_TIMEOUT_S", 0.05)
+    add_inbox_row(tmp_path, "row1", "behind a lock")
+    locker = sqlite3.connect(inbox_db(tmp_path))
+    locker.execute("begin exclusive")
+    try:
+        gw.manager.poll_inbox()  # locked: nothing taken, nothing raised
+        assert user_texts(gw.job()) == ["go"]
+    finally:
+        locker.rollback()
+        locker.close()
+    gw.manager.poll_inbox()  # and retried: now it is taken
+    assert user_texts(gw.job()) == ["go", "behind a lock"]
+    release.set()
+    first.read_all()
+    first.close()
+
+
+def test_the_poller_reads_the_database_read_only(gw, tmp_path):
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "hands off")
+    before = inbox_db(tmp_path).read_bytes()
+    gw.manager.poll_inbox()
+    assert inbox_db(tmp_path).read_bytes() == before
+    release.set()
+    first.read_all()
+    first.close()
+
+
+def test_the_poller_thread_takes_a_row_by_itself(gw, tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway, "INBOX_POLL_S", 0.05)
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    add_inbox_row(tmp_path, "row1", "no manual poll")
+    assert wait_for(lambda: user_texts(gw.job()) == ["go", "no manual poll"])
+    release.set()
+    first.read_all()
+    first.close()
+
+
+# an echo is only an answer for a job that finished
+
+
+def stopped_with_a_note(gw, tmp_path, text="actually do this instead"):
+    """A job stopped while a note taken from the inbox was still unread."""
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    job = gw.job()
+    job.store.request_stop()  # soon: after this round
+    add_inbox_row(tmp_path, "row1", text)
+    gw.manager.poll_inbox()
+    release.set()
+    first.read_all()
+    first.close()
+    assert wait_for(lambda: not job.is_running())
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    assert not any(text in p for p in gw.agents["claude_api"].prompts)  # nobody read it
+    return job
+
+
+def notes_block(prompt):
+    return prompt.split("Notes from the person:", 1)[1]
+
+
+def test_an_echo_to_a_stopped_job_starts_it_and_the_note_is_read_once(gw, tmp_path):
+    text = "actually do this instead"
+    job = stopped_with_a_note(gw, tmp_path, text)
+    rounds = len(gw.agents["claude_api"].prompts)
+    echo = gw.stream("go", text)
+    reply = echo.read_all()
+    echo.close()
+    assert "already delivered" not in reply and "[baton] done" in reply
+    prompts = gw.agents["claude_api"].prompts[rounds:]
+    assert len(prompts) >= 1  # a round ran
+    assert notes_block(prompts[0]).count(text) == 1  # said once: not again by the echo
+    assert gw.manager.get(SESSION) is not job
+    assert Store(state_dir(gateway.job_name(SESSION))).read_inbox() == ""
+
+
+def test_an_echo_to_a_stopped_job_in_job_json_alone_starts_it_too(gw, tmp_path):
+    text = "actually do this instead"
+    stopped_with_a_note(gw, tmp_path, text)
+    rounds = len(gw.agents["claude_api"].prompts)
+    manager = restart(gw)  # only job.json is left
+    echo = gw.stream("go", text)
+    reply = echo.read_all()
+    echo.close()
+    assert "already delivered" not in reply and "[baton] done" in reply
+    prompts = gw.agents["claude_api"].prompts[rounds:]
+    assert prompts and notes_block(prompts[0]).count(text) == 1
+    assert manager.get(SESSION) is not None
+
+
+def test_an_older_message_with_the_same_words_does_not_use_up_the_echo(gw, tmp_path):
+    finished_with_a_row(gw, tmp_path, "continue")
+    rounds = len(gw.agents["claude_api"].prompts)
+    echo = gw.stream("continue", "go", "continue")  # `continue` is also an older message
+    assert echo.read_all().strip() == "[baton] that message was already delivered"
+    echo.close()
+    assert len(gw.agents["claude_api"].prompts) == rounds
+
+
+def test_consume_echoes_walks_the_messages_newest_first():
+    h = hash_of("continue")
+    messages = [
+        {"role": "user", "content": "continue"},
+        {"role": "user", "content": "go"},
+        {"role": "user", "content": "continue"},
+    ]
+    taken = {h: {"n": 1, "at": 100.0}}
+    newest, marks = gateway._consume_echoes(messages, set(), taken, 100.0)
+    assert newest is True and marks == [(2, h)] and taken == {}
+
+
+# a person's stop ends the reply too: the echo of a note already read does not undo it
+
+
+def stopped_after_reading_a_note(gw, tmp_path, text="steer this way"):
+    """A job stopped by the person after an agent read a note taken from the inbox."""
+    (gw.work / "baton.toml").write_text('[verify]\ncommand = "test -f DONE"\n')
+    agent = gw.agents["claude_api"]
+    agent.announce = "vendor-session"
+    second = threading.Event()
+    agent.script = [until_killed("busy"), wait_event(second, "second round")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    job = gw.job()
+    add_inbox_row(tmp_path, "row1", text)
+    gw.manager.poll_inbox()
+    first.read_until("second round")
+    assert text in agent.prompts[-1]  # the agent has it
+    job.store.request_stop()
+    second.set()
+    first.read_all()
+    first.close()
+    assert wait_for(lambda: not job.is_running())
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    assert not _notes_left(job)
+    return job
+
+
+def _notes_left(job):
+    return job.store.read_inbox().strip() or job.store.load_state().get("notes", "").strip()
+
+
+def test_the_echo_of_a_note_a_stopped_job_read_does_not_restart_it(gw, tmp_path):
+    job = stopped_after_reading_a_note(gw, tmp_path)
+    rounds = len(gw.agents["claude_api"].prompts)
+    echo = gw.stream("go", "steer this way")
+    assert echo.read_all().strip() == "[baton] that message was already delivered"
+    echo.close()
+    assert gw.manager.get(SESSION) is job and not job.is_running()  # nothing started
+    assert len(gw.agents["claude_api"].prompts) == rounds  # no round ran
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+
+
+def test_the_echo_of_a_read_note_is_answered_from_job_json_alone_too(gw, tmp_path):
+    job = stopped_after_reading_a_note(gw, tmp_path)
+    rounds = len(gw.agents["claude_api"].prompts)
+    manager = restart(gw)
+    echo = gw.stream("go", "steer this way")
+    assert echo.read_all().strip() == "[baton] that message was already delivered"
+    echo.close()
+    assert manager.get(SESSION) is None  # no job
+    assert len(gw.agents["claude_api"].prompts) == rounds
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    assert job_json(job.store.root)["inbox_taken"] == {}  # and it is used up

@@ -196,7 +196,9 @@ The answer streams in the chat like any other model. A small request is answered
 plan finds nothing to build and the cycle ends there. A line tells you each time one agent hands
 over to another, and one each time the phase changes. While it works:
 
-- **To change direction,** just send another message. It interrupts the current round.
+- **To change direction,** just send another message. It reaches the agent after its current tool
+  call (never later than five minutes after), including a message you type while a reply is
+  streaming, which OpenCode would otherwise hold until the reply ends.
 - **Closing OpenCode does not stop the work.** It keeps running in the background.
 
 ### 8. Watch it, or stop it
@@ -634,7 +636,13 @@ and context on its side.
 
 Each OpenCode session becomes a job that runs in its own thread inside `baton serve`, independent of
 the HTTP connection. A dropped connection never stops it, and a new message in the session becomes
-a note that interrupts the running round. A message gets at least one round, even if the gate
+a note that ends the running round once its current tool call is done (after five minutes at the
+latest). A message typed while the reply streams, which OpenCode queues in its database and posts
+only when the reply ends, is read from there every 2 seconds (read-only, and any failure is
+silent), delivered as a note at once, and not delivered again when OpenCode later posts it. Every
+conversation of the job reads every note, not only the first one to take it, and a note over 8000
+characters goes to a file under `.baton/notes/` in the directory, with its first 1000 characters
+and the file's name in the prompt. A message gets at least one round, even if the gate
 already passes. A request that repeats what was already accepted, as a client's retry does, attaches
 to the stream and interrupts nothing, so it costs no round. `baton jobs` lists every job, and
 `baton status`, `baton say` and `baton stop` accept its name (`session-<id>`) in place of a goal
@@ -680,7 +688,7 @@ for writing it by hand.
 | `baton serve [--port 18777]` | Start the OpenCode gateway. |
 | `baton jobs` | List every job and goal that has state: whether its runner is alive, round, current agent, last event. |
 | `baton status <goal.toml or job>` | One-shot status: rounds, cooldowns, recent events. |
-| `baton say <goal.toml or job> [--now] "note"` | Leave a note for the next round. `--now` also interrupts the current one. |
+| `baton say <goal.toml or job> [--now] "note"` | Leave a note for the next round. `--now` also ends the current one, after its tool call. |
 | `baton stop <goal.toml or job> [--now]` | Stop after the current round, or kill the round with `--now`. |
 | `baton opencode-config [--port 18777]` | Print the provider JSON for `opencode.json`. |
 | `baton install-service [--port 18777]` | Write the launchd plist and load it (macOS). |

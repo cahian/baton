@@ -33,6 +33,7 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    ToolWatch,
     check_subagent,
     find_model,
     tier_config,
@@ -431,6 +432,77 @@ def _payload(event: dict) -> dict:
     return inner if isinstance(inner, dict) else {}
 
 
+# What agy says when the only thing keeping it alive is background tasks.
+_WAITING_RE = re.compile(r"waiting for (\d+) background task", re.IGNORECASE)
+_TASK_LINE_RE = re.compile(r"^Task: *(\S+)", re.MULTILINE)
+_STATUS_LINE_RE = re.compile(r"^Status: *(\S+)", re.MULTILINE)
+
+
+class _ToolWatch(ToolWatch):
+    """A tool step is open from its ACTIVE to any other state. A background task outlives its step:
+    `manage_task` reports it RUNNING until it is DONE, ends in another status or is killed. And
+    agy says when it only waits for tasks, which holds until a task goes or a tool starts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tasks: set[str] = set()
+        self.waiting = False
+
+    @property
+    def busy(self) -> bool:
+        return bool(self.open) or bool(self.tasks) or self.waiting
+
+    def feed(self, line: str) -> None:
+        event = _parse_event(line)
+        if event is None:
+            self._waiting_text(line)  # agy prints it as a plain line
+            return
+        if event.get("event") != "step_update":
+            return
+        step = _payload(event)
+        delta = step.get("text_delta")
+        if isinstance(delta, str):
+            self._waiting_text(delta)
+            return
+        name = step.get("tool_name")
+        index = step.get("step_index")
+        if not isinstance(name, str) or not name or index is None:
+            return
+        key = (step.get("conversation_id"), index)
+        state = step.get("state")
+        if state == "ACTIVE":
+            self.open.add(key)
+            self.waiting = False
+        elif isinstance(state, str):
+            self.open.discard(key)  # DONE, or ERROR and the like: real logs have both
+            if state == "DONE" and name == "manage_task":
+                self._task(step)
+
+    def _waiting_text(self, text: str) -> None:
+        found = _WAITING_RE.search(text)
+        if found and int(found.group(1)) > 0:
+            self.waiting = True
+
+    def _task(self, step: dict) -> None:
+        info = step.get("tool_info")
+        info = info if isinstance(info, dict) else {}
+        params = info.get("parameters")
+        params = params if isinstance(params, dict) else {}
+        output = info.get("output")
+        output = output if isinstance(output, str) else ""
+        named = _TASK_LINE_RE.search(output)
+        given = params.get("TaskId")
+        task = named.group(1) if named else given if isinstance(given, str) else ""
+        status = _STATUS_LINE_RE.search(output)
+        if not task:
+            return
+        if params.get("Action") == "kill" or (status and status.group(1) != "RUNNING"):
+            self.tasks.discard(task)
+            self.waiting = False
+        elif status:
+            self.tasks.add(task)
+
+
 class AntigravityAdapter:
     name = "antigravity"
     metered = False
@@ -586,6 +658,9 @@ class AntigravityAdapter:
         if ctx.session_id is not None and not worked:
             return RoundResult(TRANSIENT, reason=f"resume failed: {summary}", resume_failed=True)
         return RoundResult(TRANSIENT, reason=summary)
+
+    def tool_watch(self) -> ToolWatch:
+        return _ToolWatch()
 
     def is_work(self, line: str) -> bool:
         event = _parse_event(line)

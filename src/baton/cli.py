@@ -372,7 +372,7 @@ def cmd_say(args: argparse.Namespace) -> int:
     store.say(text)
     if args.now:
         store.request_interrupt()
-        print("note added; the current round is interrupted")
+        print("note added; it reaches the agent after the current tool call or in the next round")
     else:
         print("note added; it is delivered with the next round")
     return 0
@@ -466,7 +466,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("say", help="leave a note for the next round")
     p.add_argument("goal", help="goal file, or a job name such as session-<id>")
-    p.add_argument("--now", action="store_true", help="also interrupt the current round")
+    p.add_argument(
+        "--now", action="store_true", help="also end the current round after its tool call"
+    )
     p.add_argument("text", nargs="+", help="the note")
     p.set_defaults(func=cmd_say)
 

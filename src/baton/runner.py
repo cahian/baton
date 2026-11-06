@@ -13,6 +13,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from baton import superpowers
@@ -76,6 +77,13 @@ GATE_POLL_S = 0.5
 # watcher is given this long to finish when the round ends.
 PREEMPT_POLL_S = 30
 PREEMPT_JOIN_S = 2
+# A message that arrives during a tool call waits for it to end, but no longer than this.
+MESSAGE_WAIT_S = 300
+# A note over this many characters goes to a file in the workdir, and the prompt keeps its start.
+NOTE_INLINE_CHARS = 8000
+NOTE_HEAD_CHARS = 1000
+# How many notes state.json keeps for the conversations that have not read them yet.
+NOTE_LOG_MAX = 50
 # What a shell exits with when it cannot run the command: not executable, not found.
 UNRUNNABLE_EXITS = (126, 127)
 GATE_EXIT_RE = re.compile(r"\[exit code (\d+)\]\Z")
@@ -157,6 +165,30 @@ def build_prompt(
     if phase_block:
         parts.append(phase_block)
     return "\n\n".join(parts) + "\n"
+
+
+def file_large_note(workdir: Path, text: str, now: float) -> tuple[str, Path | None]:
+    """`text` as a prompt will carry it, and the file that holds all of it. A note over
+    NOTE_INLINE_CHARS goes to `.baton/notes/` in the workdir, and the prompt keeps its start and
+    a line naming the file. One that cannot be filed stays whole: the person's words come first."""
+    body = text.strip()
+    if len(body) <= NOTE_INLINE_CHARS:
+        return text, None
+    stamp = datetime.fromtimestamp(now, UTC).strftime("%Y%m%dT%H%M%SZ")
+    digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()[:8]
+    relative = Path(".baton") / "notes" / f"{stamp}-{digest}.md"
+    path = workdir / relative
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body + "\n", encoding="utf-8")
+    except OSError:
+        return text, None
+    return (
+        f"{body[:NOTE_HEAD_CHARS].rstrip()}\n"
+        f"[This note is {len(body)} characters long and is cut here. The whole of it is in "
+        f"`{relative}`: read that file in full before you act on it.]\n\n",
+        path,
+    )
 
 
 # gate
@@ -521,6 +553,10 @@ class _Run:
         self.prev_agent: str | None = None
         self.carried_notes = ""
         self.collected_inbox = ""
+        # Every note, newest last, each with a growing `seq`: a conversation reads the ones after
+        # its mark in `note_seen` (per session key), whoever read them first.
+        self.note_log: list[dict] = []
+        self.note_seen: dict[str, int] = {}
         self.owes_round = owes_round
         self.heads: dict[str, str] = {}
         self.pause_until = 0.0
@@ -609,6 +645,8 @@ class _Run:
             "group_start": self.group_start if self.group is not None else None,
             "notes": self.carried_notes,
             "collected_inbox": self.collected_inbox,
+            "note_log": list(self.note_log),
+            "note_seen": dict(self.note_seen),
             "owes_round": self.owes_round,
             "verify_warning": self.verify_warning,
             **(
@@ -815,6 +853,23 @@ class _Run:
         self.carried_notes = notes if isinstance(notes, str) else ""
         collected = state.get("collected_inbox")
         self.collected_inbox = collected if isinstance(collected, str) else ""
+        log = state.get("note_log")
+        self.note_log = [
+            {"seq": e["seq"], "text": e["text"]}
+            for e in (log if isinstance(log, list) else ())
+            if isinstance(e, dict)
+            and isinstance(e.get("seq"), int)
+            and not isinstance(e["seq"], bool)
+            and isinstance(e.get("text"), str)
+        ][-NOTE_LOG_MAX:]
+        seen = state.get("note_seen")
+        self.note_seen = {
+            k: v
+            for k, v in (seen.items() if isinstance(seen, dict) else ())
+            if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)
+        }
+        for saved in self.sessions:  # a conversation with no mark has read nothing it can rely on
+            self.note_seen.setdefault(saved, 0)
         self.owes_round = self.owes_round or state.get("owes_round") is True
         warning = state.get("verify_warning")
         self.verify_warning = warning if isinstance(warning, str) else ""
@@ -977,16 +1032,38 @@ class _Run:
                 self.collected_inbox = ""
                 self.persist_softly()
             return False
-        carried, collected = self.carried_notes, self.collected_inbox
-        self.carried_notes += text.removeprefix(collected)
+        carried, collected, log = self.carried_notes, self.collected_inbox, self.note_log
+        new, filed = self.shorten_note(text.removeprefix(collected))
+        self.carried_notes += new
+        if new.strip():
+            entry = {"seq": self.newest_note() + 1, "text": new}
+            self.note_log = [*log, entry][-NOTE_LOG_MAX:]
         self.collected_inbox = text
         if not self.persist_softly():
-            self.carried_notes, self.collected_inbox = carried, collected
+            self.carried_notes, self.collected_inbox, self.note_log = carried, collected, log
+            if filed is not None:
+                filed.unlink(missing_ok=True)  # the note is collected again, and filed again
             return True
         self.store.clear_inbox(text)
         self.collected_inbox = ""
         self.persist_softly()
         return False
+
+    def newest_note(self) -> int:
+        return self.note_log[-1]["seq"] if self.note_log else 0
+
+    def shorten_note(self, text: str) -> tuple[str, Path | None]:
+        return file_large_note(self.goal.workdir, text, self.clock())
+
+    def notes_since(self, mark: int | None) -> str:
+        """The notes a round reads: every one after the conversation's `mark`, or, for a
+        conversation with none (a fresh one, which holds the talk in its objective, and a review),
+        only the ones no agent has read."""
+        if mark is not None:
+            text = "".join(e["text"] for e in self.note_log if e["seq"] > mark)
+            if text.strip():
+                return text
+        return self.carried_notes
 
     def stop_now(self) -> bool:
         return self.stop_requested() == "now"
@@ -1017,12 +1094,13 @@ class _Run:
         except OSError:
             pass
         self.collect_notes()
-        notes = self.carried_notes
+        newest_note = self.newest_note()
         handoff = self.read_handoff()
         # The conversation of an agent is tied to its model: per role with phases, and a review
         # is always a fresh one.
         key = agent if not self.phases else (f"{agent}:{phase}" if phase != REVIEW else "")
         sid = self.sessions.get(key) if key else None
+        notes = self.notes_since(self.note_seen.get(key) if key and sid else None)
         # What changed since this agent's last round in this role: kept per session key, with the
         # review (which has no session) under its own.
         head_key = key or f"{agent}:{phase}"
@@ -1051,6 +1129,8 @@ class _Run:
         killed = False
         interrupted = False
         preempted = False
+        interrupt_at: float | None = None  # a note is waiting for the tool in flight to end
+        tools = None  # this round's tool watch, None when the adapter has none or it failed
         watch = (
             PreemptionWatch(self.sched, self.adapters, PREEMPT_POLL_S)
             if getattr(adapter, "metered", False)
@@ -1065,7 +1145,12 @@ class _Run:
                 mid_line = False
 
         def on_output(line: str) -> None:
-            nonlocal buf, worked, mid_line
+            nonlocal buf, worked, mid_line, tools
+            if tools is not None:
+                try:
+                    tools.feed(line)
+                except Exception:
+                    tools = None
             fragment = False
             try:
                 text = adapter.render(line)
@@ -1088,17 +1173,34 @@ class _Run:
             buf = (buf + text + "\n")[-ROUND_TAIL_CHARS:]
             self.emit("output", agent=agent, round=n, text=text)
 
+        def tool_running() -> bool:
+            nonlocal tools
+            if tools is None:
+                return False
+            try:
+                return tools.busy
+            except Exception:
+                tools = None
+                return False
+
         def should_kill() -> bool:
-            nonlocal killed, interrupted, preempted
+            nonlocal killed, interrupted, preempted, interrupt_at
             if killed:
                 return True
             try:
                 if store.stop_request() == "now":
                     killed = True
-                elif store.take_interrupt():
-                    killed = interrupted = True
+                elif interrupt_at is None and store.take_interrupt():
+                    interrupt_at = self.clock()
             except OSError:
                 pass
+            # A note ends the round between two tool calls, or after MESSAGE_WAIT_S at the latest.
+            if (
+                not killed
+                and interrupt_at is not None
+                and (not tool_running() or self.clock() - interrupt_at >= MESSAGE_WAIT_S)
+            ):
+                killed = interrupted = True
             if not killed and watch is not None and watch.found.is_set():
                 killed = preempted = True  # a stop or a note, seen above, takes precedence
             return killed
@@ -1119,9 +1221,17 @@ class _Run:
             if not key:
                 return  # a review keeps no conversation
             self.sessions[key] = session
+            # A conversation that begins here has the notes up to now in its objective or prompt.
+            self.note_seen.setdefault(key, newest_note)
             self.persist_softly()
 
         def attempt(session: str | None) -> RoundResult:
+            nonlocal tools
+            make_watch = getattr(adapter, "tool_watch", None)
+            try:
+                tools = make_watch() if make_watch is not None else None
+            except Exception:
+                tools = None
             prompt = build_prompt(
                 goal if self.objective is None else replace(goal, objective=self.objective()),
                 self.gate_tail,
@@ -1212,6 +1322,8 @@ class _Run:
         finished_its_turn = result.outcome in (COMPLETED, TIMEOUT) and not killed
         if spawned and (worked or finished_its_turn):
             self.carried_notes = ""
+            if key:
+                self.note_seen[key] = max(self.note_seen.get(key, 0), newest_note)
             self.owes_round = False
             self.round_tail = buf
         if spawned:

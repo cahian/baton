@@ -151,6 +151,24 @@ def find_model(obj: object, depth: int = 2) -> str | None:
     return None
 
 
+class ToolWatch:
+    """The tool calls of one round that have started and not yet ended, read from its stream.
+
+    The runner feeds it every output line and asks `busy` before it ends a round for a note: an
+    interrupt then waits for the tool, so a command is not cut off halfway. A line it does not
+    understand changes nothing. Adapters subclass it and say what a start and an end look like."""
+
+    def __init__(self) -> None:
+        self.open: set[object] = set()
+
+    @property
+    def busy(self) -> bool:
+        return bool(self.open)
+
+    def feed(self, line: str) -> None:
+        raise NotImplementedError
+
+
 class Adapter(Protocol):
     name: str
     # True for an agent paid by use, with no reset that would ever stop it: it runs only while
@@ -166,4 +184,9 @@ class Adapter(Protocol):
     def is_work(self, line: str) -> bool:
         """True when `line` shows the agent acting on its prompt. An error message or noise that
         `render` also shows does not count: a round that only said that never read the notes."""
+        ...
+
+    def tool_watch(self) -> ToolWatch | None:
+        """A new watch for one round, or None when the stream does not show tool calls. The
+        runner reads it with getattr: an adapter without it is interrupted at once."""
         ...

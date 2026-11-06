@@ -1400,3 +1400,58 @@ def test_a_round_cut_off_by_its_budget_is_bounded_but_still_completed_for_the_sc
 
 def test_a_normal_round_is_not_bounded(env):
     assert run(env).bounded is False
+
+
+# --- the tool watch --------------------------------------------------------------------------
+
+
+def assistant_blocks(*blocks):
+    return json.dumps({"type": "assistant", "message": {"role": "assistant", "content": blocks}})
+
+
+def user_blocks(*blocks):
+    return json.dumps({"type": "user", "message": {"role": "user", "content": blocks}})
+
+
+def use(ident, name="Bash"):
+    return {"type": "tool_use", "id": ident, "name": name, "input": {"command": "ls"}}
+
+
+def returned(ident):
+    return {"type": "tool_result", "tool_use_id": ident, "content": "ok"}
+
+
+def new_watch(env):
+    return make_adapter(env).tool_watch()
+
+
+def test_a_tool_use_is_busy_until_its_result_comes_back(env):
+    watch = new_watch(env)
+    assert watch.busy is False
+    watch.feed(assistant_blocks({"type": "text", "text": "running it"}, use("toolu_1")))
+    assert watch.busy is True
+    watch.feed(user_blocks(returned("toolu_1")))
+    assert watch.busy is False
+
+
+def test_a_parallel_pair_of_tool_uses_stays_busy_until_both_return(env):
+    watch = new_watch(env)
+    watch.feed(assistant_blocks(use("toolu_1"), use("toolu_2", "Read")))
+    watch.feed(user_blocks(returned("toolu_2")))
+    assert watch.busy is True
+    watch.feed(user_blocks(returned("toolu_1")))
+    assert watch.busy is False
+
+
+def test_text_only_events_and_noise_are_not_busy(env):
+    watch = new_watch(env)
+    for line in (
+        assistant_blocks({"type": "text", "text": "hello"}),
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "assistant", "message": "not a dict"}),
+        json.dumps({"type": "user", "message": {"content": "just a string"}}),
+        assistant_blocks("junk", {"type": "tool_use", "name": "Bash"}),  # no id to close it by
+        "plain stderr text",
+    ):
+        watch.feed(line)
+    assert watch.busy is False

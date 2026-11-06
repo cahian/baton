@@ -28,6 +28,7 @@ from baton.adapters.base import (
     Availability,
     RoundContext,
     RoundResult,
+    ToolWatch,
     check_subagent,
     find_model,
     subagent_guard_command,
@@ -348,6 +349,24 @@ def codex_allowed_models(cfg: AgentConfig) -> list[str]:
     return list(dict.fromkeys([cfg.model, cfg.build_model]))
 
 
+class _ToolWatch(ToolWatch):
+    """A command is open from its `item.started` to its `item.completed`, by item id."""
+
+    def feed(self, line: str) -> None:
+        event = _parse_event(line)
+        item = event.get("item") if event is not None else None
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            return
+        ident = item.get("id")
+        if not isinstance(ident, str):
+            return
+        kind = event.get("type")
+        if kind == "item.started":
+            self.open.add(ident)
+        elif kind == "item.completed":
+            self.open.discard(ident)
+
+
 class CodexAdapter:
     name = "codex"
     metered = False
@@ -483,6 +502,9 @@ class CodexAdapter:
         if ctx.session_id is not None:
             return RoundResult(TRANSIENT, reason=f"resume failed: {summary}", resume_failed=True)
         return RoundResult(TRANSIENT, reason=summary)
+
+    def tool_watch(self) -> ToolWatch:
+        return _ToolWatch()
 
     def is_work(self, line: str) -> bool:
         event = _parse_event(line)
