@@ -558,15 +558,15 @@ class AntigravityAdapter:
         prompt = prompt.replace("\x00", "")
         if prompt.lstrip().startswith("/") and not native_goal:
             prompt = "Task:\n" + prompt
-        argv = [
-            cfg.bin,
-            "-p",
-        ]
+        argv = [cfg.bin]
         if native_goal and session_id is None:
             # Antigravity expands /goal and skills in print mode. It does not expand commands from
             # stream-json input, so start the native goal as an argv prompt on a fresh session.
-            argv.append(prompt)
+            argv += ["-p", prompt]
         else:
+            # The prompt comes on stdin. agy's `-p` takes a value, so a bare `-p` would swallow the
+            # next flag as its prompt ("-p took "--input-format" as its prompt"); stream-json input
+            # already runs in print mode, so no `-p` is passed at all.
             argv += ["--input-format", "stream-json"]
         argv += ["--output-format", "stream-json", "--model", cfg.model]
         if read_only:

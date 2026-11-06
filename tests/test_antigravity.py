@@ -577,18 +577,39 @@ def test_only_a_text_delta_is_a_fragment():
 
 def test_argv_fresh_and_resume():
     a = AntigravityAdapter(make_cfg("/opt/agy"), read=Reads())
+    # The prompt goes on stdin; `-p` takes a value, so a bare `-p` before `--input-format` would
+    # make agy read the flag as its prompt.
     assert a.argv("do it", None) == [
         "/opt/agy",
-        "-p",
-        "do it",
+        "--input-format",
+        "stream-json",
         "--output-format",
         "stream-json",
         "--model",
         "gemini-4-argon-medium",
         "--dangerously-skip-permissions",
     ]
-    assert a.argv("do it", "conv-9")[-2:] == ["--conversation", "conv-9"]
-    assert "--dangerously-skip-permissions" in a.argv("do it", "conv-9")
+    resumed = a.argv("do it", "conv-9")
+    assert resumed[-2:] == ["--conversation", "conv-9"]
+    assert "--dangerously-skip-permissions" in resumed
+    assert "-p" not in resumed and "do it" not in resumed
+
+
+def test_a_native_goal_start_passes_the_prompt_attached_to_p():
+    a = AntigravityAdapter(make_cfg("/opt/agy"), read=Reads())
+    argv = a.argv("/goal finish it", None, native_goal=True)
+    assert argv[1:3] == ["-p", "/goal finish it"]
+    assert "--input-format" not in argv
+
+
+def test_no_argv_ever_puts_a_flag_right_after_p():
+    a = AntigravityAdapter(make_cfg("/opt/agy"), read=Reads())
+    for session in (None, "conv-9"):
+        for native in (False, True):
+            for read_only in (False, True):
+                argv = a.argv("x", session, native_goal=native, read_only=read_only)
+                if "-p" in argv:
+                    assert not argv[argv.index("-p") + 1].startswith("-")
 
 
 def test_argv_build_tier_uses_the_build_model_and_keeps_the_rest():
@@ -604,9 +625,9 @@ def test_a_round_context_with_the_build_tier_reaches_argv(tmp_path):
     seen = []
 
     class Spy(AntigravityAdapter):
-        def argv(self, prompt, session_id, tier="strong"):
+        def argv(self, prompt, session_id, tier="strong", **kw):
             seen.append(tier)
-            return super().argv(prompt, session_id, tier)
+            return super().argv(prompt, session_id, tier, **kw)
 
     a = Spy(make_cfg("/nonexistent/agy"), read=Reads())
     a.run_round("x", make_ctx(tmp_path, tier="build"))
@@ -619,10 +640,10 @@ def test_argv_without_full_access_drops_the_bypass_flag():
 
 
 def test_a_prompt_cannot_turn_into_a_slash_command_or_break_exec():
+    # A native goal start is the only argv prompt; outside it a slash prompt is plain task text.
     a = AntigravityAdapter(make_cfg(), read=Reads())
-    assert a.argv("/credits", None)[2] != "/credits"
-    assert a.argv("  /usage please", None)[2] != "  /usage please"
-    assert a.argv("a\x00b", None)[2] == "ab"
+    assert "/credits" not in a.argv("/credits", None)
+    assert a.argv("a\x00b", None, native_goal=True)[2] == "ab"
 
 
 # --- rounds ----------------------------------------------------------------------------------
@@ -678,7 +699,7 @@ def test_a_whole_real_shaped_round_goes_through_the_adapter_and_the_chat(fake, t
 
 
 def test_stdin_closed(fake, tmp_path):
-    # The fake exits 3 if stdin yields data and 4 if it stays open: either would not be COMPLETED.
+    # The fake exits 3 unless stdin holds exactly one user event then EOF, 4 if it stays open.
     res = adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path))
     assert res.outcome == COMPLETED and res.reason == ""
 
@@ -690,13 +711,15 @@ def test_the_round_carries_baton_round_in_its_environment(fake, tmp_path, monkey
     assert call["baton_env"]["BATON_ROUND"] == "1"
 
 
-def test_round_runs_in_the_workdir_with_the_prompt_in_argv(fake, tmp_path):
+def test_round_runs_in_the_workdir_with_the_prompt_on_stdin(fake, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     adapter(fake.bin, Reads()).run_round("fix the bug", make_ctx(tmp_path, workdir=work))
     (call,) = fake.calls()
     assert call["cwd"] == str(work.resolve()) or call["cwd"] == str(work)
-    assert call["argv"][:2] == ["-p", "fix the bug"]
+    assert call["prompt"] == "fix the bug"
+    assert "-p" not in call["argv"]
+    assert call["argv"][:2] == ["--input-format", "stream-json"]
     assert "--output-format" in call["argv"] and "stream-json" in call["argv"]
 
 
@@ -1113,7 +1136,7 @@ def test_oserror_after_spawn_is_reported_and_still_gets_a_closing_read(tmp_path,
     assert "after the agent started" in res.reason and "log disk full" in res.reason
 
 
-def test_stdin_is_not_given_to_the_runner(tmp_path, monkeypatch):
+def test_the_prompt_is_given_to_the_runner_as_one_user_event(tmp_path, monkeypatch):
     from baton.adapters import antigravity
 
     seen = {}
@@ -1124,7 +1147,7 @@ def test_stdin_is_not_given_to_the_runner(tmp_path, monkeypatch):
 
     monkeypatch.setattr(antigravity, "run_streaming", spy)
     frozen_adapter("agy", Reads()).run_round("go", make_ctx(tmp_path))
-    assert seen["stdin"] is None
+    assert json.loads(seen["stdin"]) == {"event": "user", "message": {"content": "go"}}
 
 
 def test_default_read_wiring_uses_cfg_bin_for_baseline_and_closing_read(fake, tmp_path):

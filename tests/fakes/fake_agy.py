@@ -2,13 +2,17 @@
 
 Stdin must be closed: the fake waits up to two seconds for it to report EOF and exits 3 if it
 yields data, 4 if it stays open and silent. That is how the tests prove the adapter closes it.
+With `--input-format stream-json` stdin must instead hold exactly one NDJSON user event and then
+EOF (exit 3 otherwise); its text is the prompt. Like the real agy, `-p` takes a value: a bare `-p`
+followed by a flag is refused with exit 2.
 
 Limit reads (`-p /usage` and `-p /credits`, text output) print the file named by
 `FAKE_AGY_USAGE` / `FAKE_AGY_CREDITS`. `FAKE_AGY_READ_MODE` (when set) is "hang", "flood" or
 "fail" and replaces the answer. `FAKE_AGY_READ_LOG` collects one line per read.
 
-A prompt (`-p <text> --output-format stream-json ...`) prints JSON lines. Every call is appended to
-`FAKE_AGY_CALLS` (argv and cwd, one JSON object per line). Knobs:
+A prompt (`-p <text> --output-format stream-json ...`, or `--input-format stream-json ...` with
+the prompt on stdin) prints JSON lines. Every call is appended to `FAKE_AGY_CALLS` (argv, prompt
+and cwd, one JSON object per line). Knobs:
   FAKE_AGY_CONVERSATION_ID  id announced in the init event (default conv-1; the id passed with
                             --conversation wins when present)
   FAKE_AGY_INIT_SHAPE       "nested" puts the id inside the init payload, as an older fake did;
@@ -69,12 +73,26 @@ def read_cmd(command: str) -> None:
     sys.stdout.flush()
 
 
-def prompt_cmd(argv: list[str]) -> None:
+def read_stream_prompt() -> str:
+    ready, _, _ = select.select([sys.stdin], [], [], 2)
+    if not ready:
+        sys.exit(4)
+    lines = [x for x in sys.stdin.read().splitlines() if x.strip()]
+    if len(lines) != 1:
+        sys.exit(3)
+    event = json.loads(lines[0])
+    if event.get("event") != "user":
+        sys.exit(3)
+    return event["message"]["content"]
+
+
+def prompt_cmd(argv: list[str], prompt: str) -> None:
     calls = os.environ.get("FAKE_AGY_CALLS")
     if calls:
         with open(calls, "a") as fh:
             record = {
                 "argv": argv,
+                "prompt": prompt,
                 "cwd": os.getcwd(),
                 "baton_env": {k: v for k, v in os.environ.items() if k.startswith("BATON")},
             }
@@ -128,13 +146,23 @@ def main() -> None:
     if pidfile:
         Path(pidfile).write_text(str(os.getpid()))
     argv = sys.argv[1:]
+    if "-p" in argv:
+        value = argv[argv.index("-p") + 1] if argv.index("-p") + 1 < len(argv) else None
+        if value is None or value.startswith("--"):
+            sys.stderr.write(f'Error: -p took "{value}" as its prompt\n')
+            sys.exit(2)
+    if "--input-format" in argv:
+        if "-p" in argv or argv[argv.index("--input-format") + 1] != "stream-json":
+            sys.exit(2)
+        prompt_cmd(argv, read_stream_prompt())
+        return
     if len(argv) < 2 or argv[0] != "-p":
         sys.exit(2)
     check_stdin()
     if argv[1] in ("/usage", "/credits"):
         read_cmd(argv[1])
     else:
-        prompt_cmd(argv)
+        prompt_cmd(argv, argv[1])
 
 
 main()

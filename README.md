@@ -20,24 +20,21 @@ The default is native one-shot task execution. Baton-managed plan, build, review
 available when `phases = true` (see [Phases](#phases-plan-build-review)).
 
 ```mermaid
-flowchart TB
-    request["User's objective"] --> skill["Native baton-oneshot skill"]
-    skill --> choose{"Next vendor"}
-    subgraph vendors["Each vendor runs its own CLI and native workflow"]
-        codex["Codex CLI<br/>native Goal"]
-        agy["Antigravity CLI<br/>native /goal"]
-        claude["Claude Code CLI<br/>native skill, tasks, and session"]
-    end
-    choose --> codex
-    choose --> agy
-    choose --> claude
-    codex --> task["One vendor owns the whole task"]
-    agy --> task
-    claude --> task
-    task --> complete{"Complete or configured limit reached?"}
-    complete -- complete --> done(["done"])
-    complete -- limit or user switch --> transfer["Full sanitized conversation<br/>+ every vendor session ID"]
-    transfer --> choose
+flowchart LR
+    goal(["Your objective"]) --> baton{{"baton<br/><small>picks a vendor<br/>with usage left</small>"}}
+    baton --> vendor["<b>One vendor owns the whole task</b><br/><small>Codex · native Goal<br/>Antigravity · native /goal<br/>Claude Code · one-shot skill</small>"]
+    vendor -- "complete" --> done(["Done"])
+    vendor -. "limit reached<br/>or you switch" .-> handoff["Handoff<br/><small>sanitized transcript<br/>+ every session ID</small>"]
+    handoff -. "next vendor" .-> baton
+
+    classDef io fill:#0f172a,stroke:#38bdf8,color:#e2e8f0,stroke-width:2px
+    classDef core fill:#1e1b4b,stroke:#a78bfa,color:#ede9fe,stroke-width:2px
+    classDef agent fill:#052e16,stroke:#4ade80,color:#dcfce7,stroke-width:2px
+    classDef relay fill:#431407,stroke:#fb923c,color:#ffedd5,stroke-width:2px
+    class goal,done io
+    class baton core
+    class vendor agent
+    class handoff relay
 ```
 
 One vendor works until the task is complete or its configured limit is reached. On a limit, Baton
