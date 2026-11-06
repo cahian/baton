@@ -457,7 +457,11 @@ never runs `ai-memory setup`, `install-hooks`, `install-mcp` or `run`.
 - Before every round, baton searches the project's memory with words from the last verify output
   (at most 16 of them) and the objective (the rest, up to 24 in all), and puts the best 5 hits (6000 characters at most) in the prompt, labelled as
   context that may be out of date, not as instructions. Words are taken from the end of the
-  verify output and of the objective, where the errors and the newest message are. The hits sit
+  verify output and of the objective, where the errors and the newest message are. Each hit is
+  the page itself, not search's short snippet: baton reads it and puts in the prompt the part
+  around where the search matched (the head when it cannot tell), sharing the 6000 characters
+  among the hits, 1200 at most for each. Pages that hold lessons come first, and the pages of
+  this goal's own rounds are left out, since the handoff already carries them. The hits sit
   between `--- BEGIN BATON MEMORY ---` and `--- END BATON MEMORY ---`, one line each, starting
   with the page's date and goal.
 - After a round that started a process, baton stores one page: the date, the agent, how it ended,
@@ -466,8 +470,11 @@ never runs `ai-memory setup`, `install-hooks`, `install-mcp` or `run`.
   verify has run, so a baton killed during the verify still leaves its page. A round that fails,
   times out or has a failing verify is kept as a "gotcha"; a stop, an interrupt, a takeover by
   another agent or a limit is normal rotation.
-- Agents are told to keep durable findings under a `## Lessons` heading in the handoff. When that
-  section changes, baton stores it as a pinned page that outlives the goal.
+- Agents are told to keep durable findings under a `## Lessons` heading in the handoff. baton also
+  takes `## Lessons ...` and `### Lessons ...` headings and list items that start with
+  `**Lessons`, with their indented lines (code fences are skipped). When that changes, baton
+  stores it as a pinned page that outlives the goal. Each round's page is announced in
+  `baton status` as a `memory` event `recorded`.
 - ai-memory redacts secrets before it stores anything. Memory is per directory: a project is the
   directory's name plus a short hash of its full path, and a search never leaves it.
 - The data is in `~/.local/state/baton/.ai-memory` (mode 700), with its own config and its own
@@ -504,7 +511,8 @@ and a warning in `baton doctor`.
 
 - One memory call, starting the server included, is given 8 seconds in all. After any failure
   (server dead, garbage output) baton skips memory for 300 seconds, so a broken memory costs a
-  round one short wait at most. A missing binary costs nothing and says nothing; `baton doctor`
+  round one short wait at most. A page that cannot be read does not stop memory: for 300 seconds
+  the hits are search's snippets instead of pages. A missing binary costs nothing and says nothing; `baton doctor`
   warns. Failures show in `baton status` as `memory` events, never in the chat.
 - If you change `port` while the old server is still running, baton starts no second one: it says
   so, in `baton status` and `baton doctor`, and you stop the old server (or set the old port

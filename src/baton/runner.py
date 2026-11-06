@@ -927,7 +927,7 @@ class _Run:
         the gate (or never reaching it) still leaves its page. The real result replaces it."""
         if self.pending is None:
             return
-        self.memory_call("remember_round", self.pending)
+        self.store_round(self.pending)
         self.memory_call("remember_lessons", self.pending.handoff)
         self.pending_saved = True
 
@@ -943,8 +943,14 @@ class _Run:
             entry = replace(entry, gate=gate, gate_tail=gate_tail)
         elif saved:
             return
-        self.memory_call("remember_round", entry)
+        self.store_round(entry)
         self.memory_call("remember_lessons", entry.handoff)
+
+    def store_round(self, entry: RoundEntry) -> None:
+        """Write a round's page, and say so when it was written."""
+        if self.memory_call("remember_round", entry) is True:
+            path = self.memory_call("round_path", entry.n, default="")
+            self.emit("memory", event="recorded", round=entry.n, path=path)
 
     # the loop
 

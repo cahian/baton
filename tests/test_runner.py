@@ -2575,6 +2575,7 @@ class FakeMemory:
         raises: Exception | None = None
         error_on_recall = ""
         on_recall = None
+        writes = True  # whether a round's page was written
 
     built: list["FakeMemory"] = []
 
@@ -2607,6 +2608,7 @@ class FakeMemory:
         if self.plan.raises:
             raise self.plan.raises
         self.rounds.append(entry)
+        return self.plan.writes
 
     def remember_lessons(self, handoff):
         if self.plan.raises:
@@ -2689,7 +2691,7 @@ def test_no_hits_means_no_block_and_no_event(go, agents, work, store, memory):
     agents["codex"].script = [done(work)]
     go()
     assert "Memory from earlier" not in agents["codex"].prompts[0]
-    assert memory_events(store) == []
+    assert [e for e in memory_events(store) if e["event"] == "recalled"] == []
 
 
 def test_memory_is_recalled_before_every_round_excluding_the_page_before(go, agents, work, memory):
@@ -2771,6 +2773,21 @@ def test_a_round_is_recorded_after_its_gate_with_the_gate_result(
     assert rounds[1].outcome == COMPLETED
     assert rounds[1].round_tail.strip() == "round one talking"
     assert isinstance(rounds[1].seconds, float)
+
+
+def test_a_written_page_is_announced_with_its_round(tmp_path, go, agents, work, store, memory):
+    agents["codex"].script = [result(COMPLETED)]
+    go(make_goal(tmp_path, work, verify=None))
+    recorded = [e for e in memory_events(store) if e["event"] == "recorded"]
+    assert [e["round"] for e in recorded] == [1]
+    assert recorded[0]["path"] == f"rounds/{memory.mem().job}/r1.md"
+
+
+def test_a_page_that_was_not_written_is_not_announced(tmp_path, go, agents, work, store, memory):
+    memory.writes = False
+    agents["codex"].script = [result(COMPLETED)]
+    go(make_goal(tmp_path, work, verify=None))
+    assert [e for e in memory_events(store) if e["event"] == "recorded"] == []
 
 
 def test_without_a_verify_command_a_round_is_recorded_at_once(
