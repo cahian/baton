@@ -1800,6 +1800,14 @@ class _Run:
             return None  # the goal changed while it ran: this result is not for the new one
         if tail.rstrip().endswith("[verify stopped]"):
             return None  # a stop was asked for: the loop honours it, and this runs again
+        drift = self.consensus_drift()
+        if drift:
+            self.reject_consensus(
+                f"The work changed after the check passed, so the approvals are void: {drift}.",
+                "the work changed since the check passed: back to build",
+                CHANGED_TASK,
+            )
+            return None
         if not passed:
             self.reject_consensus(
                 f"Every agent approved, but the check no longer passes:\n{tail.strip()}",

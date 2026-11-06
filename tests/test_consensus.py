@@ -424,6 +424,27 @@ def test_a_message_while_the_agent_is_picked_ends_consensus_and_no_approval_coun
     assert "goal achieved" not in " ".join(notices(store))
 
 
+def test_a_tracked_change_during_the_final_check_rejects_consensus(
+    go, agents, work, store, monkeypatch
+):
+    codex, agy = agents["codex"], agents["antigravity"]
+    original = runner._Run.run_check
+
+    def run_check(self, with_goal):
+        if self.consensus is not None:
+            (work / "a.txt").write_text("changed during check")
+        return original(self, with_goal)
+
+    monkeypatch.setattr(runner._Run, "run_check", run_check)
+    codex.script = [step(touch(work)), approve(work), step(stop(store))]
+    agy.script = [approve(work)]
+    assert go() == 0
+    assert store.goal() == GOAL
+    assert "goal achieved" not in " ".join(notices(store))
+    assert store.load_state()["phase"]["phase"] == "build"
+    assert "Review the changes made during consensus" in (work / ".baton" / "PLAN.md").read_text()
+
+
 def test_a_message_during_the_final_check_ends_consensus_instead_of_the_goal(
     go, agents, work, store, monkeypatch
 ):
