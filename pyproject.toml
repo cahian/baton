@@ -26,6 +26,7 @@ testpaths = ["tests"]
 timeout = 120
 markers = [
     "phases: run with the real default of the phases setting (on), not the test default (off)",
+    "refusals: a goal is refused with phases off or outside a git repository, as in real use",
 ]
 
 [tool.ruff]

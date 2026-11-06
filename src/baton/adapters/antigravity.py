@@ -535,7 +535,9 @@ class AntigravityAdapter:
 
     def availability(self) -> Availability:
         if not self.cfg.enabled:
-            return Availability(False, reason="antigravity is disabled in the goal file")
+            return Availability(
+                False, reason="antigravity is disabled in the goal file", permanent=True
+            )
         now = self._wall_clock()
         try:
             return _evaluate(self._read(), self.cfg.threshold_pct, now).avail

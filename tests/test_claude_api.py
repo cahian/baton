@@ -529,14 +529,19 @@ def test_availability_is_ok_and_describes_the_spend(env):
 
 def test_disabled_is_unavailable(env):
     avail = make_adapter(env, enabled=False).availability()
-    assert not avail.ok and "disabled" in avail.reason
+    assert not avail.ok and "disabled" in avail.reason and avail.permanent
     assert env.calls() == []
+
+
+def test_a_round_budget_below_the_minimum_is_permanently_unavailable(env):
+    avail = make_adapter(env, round_budget_usd=Decimal("0.01")).availability()
+    assert not avail.ok and "minimum" in avail.reason and avail.permanent
 
 
 def test_wrong_mode_key_is_unavailable(env):
     env.key.chmod(0o644)
     avail = make_adapter(env).availability()
-    assert not avail.ok and "600" in avail.reason
+    assert not avail.ok and "600" in avail.reason and avail.permanent
     assert avail.until == NOW + 3600
     assert KEY not in avail.reason
 
@@ -546,6 +551,7 @@ def test_missing_key_is_unavailable_and_nonblocking(env, tmp_path):
     adapter = make_adapter(env)
     avail = adapter.availability()
     assert not avail.ok and "not found" in avail.reason and avail.until == NOW + 3600
+    assert avail.permanent  # no key: it will not run until the person adds one
 
     from baton.adapters.base import Availability
     from baton.scheduler import Scheduler

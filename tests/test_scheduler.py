@@ -1187,3 +1187,74 @@ def test_a_reserve_agent_keeps_the_fallback_behaviour(tmp_path):
     agents["codex"].avail = Availability(True)
     clock.now += 10_001
     assert s.plan_ready_to_check() == ["codex", "antigravity"]
+
+
+# consensus: asking one agent, and who can run at all
+
+
+def test_pick_for_reads_that_agent_and_moves_nothing(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 600, 0)
+    s.drop("claude_api")
+    before = s.snapshot()
+    assert s.pick_for("antigravity") is agents["antigravity"]
+    after = s.snapshot()
+    for key in ("current", "turn", "dropped"):
+        assert after[key] == before[key]
+    assert after["current"] == "codex" and after["turn"]["agent"] == "codex"
+
+
+def test_pick_for_gives_nothing_for_an_agent_out_of_quota_and_remembers_its_reset(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    out(agents["antigravity"], clock, seconds=3000)
+    assert s.pick_for("antigravity") is None
+    assert s.next_wake() == clock.now + 3000
+    clock.now += 3001
+    agents["antigravity"].avail = Availability(True)
+    assert s.pick_for("antigravity") is agents["antigravity"]
+    assert s.pick_for("nobody") is None
+
+
+def test_can_run_leaves_out_an_agent_that_can_never_run(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    agents["claude_api"].avail = Availability(False, reason="no key file", permanent=True)
+    assert [n for n in s.order if s.can_run(n)] == ["codex", "antigravity"]
+
+
+def test_can_run_waits_for_an_agent_out_of_quota_with_a_known_or_unknown_reset(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    out(agents["codex"], clock)
+    agents["antigravity"].avail = Availability(False, reason="limit")
+    assert s.can_run("codex") and s.can_run("antigravity")
+
+
+def test_a_refusal_with_no_reset_is_not_permanent_unless_the_adapter_says_so(tmp_path):
+    _, agents, _, s = queue(tmp_path)
+    agents["codex"].avail = Availability(False, reason="disabled", permanent=True)
+    agents["antigravity"].avail = Availability(False, reason="who knows")
+    assert not s.can_run("codex") and s.can_run("antigravity")
+    agents["codex"].avail = Availability(False, until=1e12, reason="no key", permanent=True)
+    assert not s.can_run("codex")  # permanent wins over a retry time
+
+
+def test_can_run_leaves_out_a_dropped_agent_and_an_unknown_one(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.drop("claude_api")
+    assert not s.can_run("claude_api") and not s.can_run("nobody")
+    assert s.can_run("codex")
+
+
+def test_can_run_waits_for_an_agent_whose_availability_cannot_be_read(tmp_path):
+    _, agents, _, s = queue(tmp_path)
+    agents["codex"].avail = RuntimeError("boom")
+    assert s.can_run("codex")  # an unreadable agent is an unavailable one, not a missing one
+
+
+def test_a_round_that_is_not_the_turns_can_leave_the_turn_alone(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 600, 2.0, goal=True, turn=False)
+    snap = s.snapshot()
+    assert snap["turn"]["worked_s"] == 0 and snap["turn"]["spent"] == 0
+    assert snap["agents"]["codex"]["goal_spent"] == 2.0

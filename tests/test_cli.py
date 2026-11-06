@@ -68,6 +68,42 @@ def test_goal_sets_the_pinned_goal_of_a_goal_file_or_a_job(fakes, capsys):
     assert store_for(fakes, "session-ses_1").goal() == "new one"
 
 
+@pytest.mark.refusals
+def test_goal_is_refused_with_phases_off_and_pins_nothing(fakes, capsys):
+    assert (
+        main(["goal", str(fakes.goal()), "ship", "it"]) == 2
+    )  # the fake goal file says phases = false
+    assert "a goal needs phases, and phases = false here" in capsys.readouterr().err
+    assert store_for(fakes).goal() == ""
+
+
+@pytest.mark.refusals
+def test_goal_is_refused_in_a_directory_that_is_not_a_repository(fakes, capsys):
+    path = fakes.goal()
+    path.write_text(path.read_text().replace("phases = false", "phases = true"))
+    fakes.work.mkdir(exist_ok=True)
+    assert main(["goal", str(path), "ship", "it"]) == 2
+    assert "a goal needs a git repository" in capsys.readouterr().err
+    assert store_for(fakes).goal() == ""
+
+
+@pytest.mark.refusals
+def test_goal_is_accepted_with_phases_in_a_repository(fakes, capsys):
+    path = fakes.goal()
+    path.write_text(path.read_text().replace("phases = false", "phases = true"))
+    fakes.work.mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(fakes.work)], check=True)
+    assert main(["goal", str(path), "ship", "it"]) == 0
+    assert store_for(fakes).goal() == "ship it"
+
+
+@pytest.mark.refusals
+def test_goal_off_is_never_refused(fakes, capsys):
+    store_for(fakes).set_goal("something")
+    assert main(["goal", str(fakes.goal()), "--off"]) == 0
+    assert store_for(fakes).goal() == ""
+
+
 def test_a_big_goal_is_filed_and_only_its_start_is_pinned(fakes):
     big = "word " * 3000
     assert main(["goal", str(fakes.goal()), big]) == 0

@@ -327,6 +327,27 @@ class Scheduler:
             agent["blocked"], agent["after_preempt"] = True, False
             self._save_quietly()
 
+    def pick_for(self, name: str) -> Adapter | None:
+        """`name`'s adapter when it is available now, else None. Reads that one agent like `pick`
+        does (and keeps the reset it reports), but moves nothing: not `current`, not the turn,
+        not `dropped`. For a round that asks one agent a question, a consensus round."""
+        with self._lock:
+            return self._try(name) if name in self._agents else None
+
+    def can_run(self, name: str) -> bool:
+        """Whether `name` can ever take a round: it is in `order`, not `dropped`, and its
+        availability is not permanent (disabled, no key, settings that cannot run a round). An
+        agent out of quota, whether or not it says when it is back, is waited for, and so is one
+        that cannot be read."""
+        with self._lock:
+            if name not in self._agents or name in self._dropped:
+                return False
+            try:
+                avail = self._adapters[name].availability()
+            except Exception:
+                return True
+            return avail.ok or not avail.permanent
+
     def plan_ready_to_check(self) -> list[str]:
         """The queue agents whose cooldown has passed and that are not blocked, in `order`: the
         ones worth reading while a reserve agent runs. Moves nothing. Nothing at all once the day's
@@ -356,10 +377,13 @@ class Scheduler:
 
     # turns
 
-    def note_round(self, agent: str, seconds: float, usd: float, goal: bool = False) -> None:
+    def note_round(
+        self, agent: str, seconds: float, usd: float, goal: bool = False, turn: bool = True
+    ) -> None:
         """Count a round of `agent`: its time and cost go to the turn when `agent` holds it, and
         its cost to the goal's spend when a goal is set (`goal`). A round of an agent that does
-        not hold the turn (a review it was lent for) counts for the goal alone."""
+        not hold the turn (a review it was lent for) counts for the goal alone, and so does one
+        that says it is not the turn's (`turn=False`: a consensus round)."""
         if agent not in self._agents:
             return
         worked, amount = _num(seconds), _num(usd)
@@ -368,7 +392,7 @@ class Scheduler:
         with self._lock:
             if goal:
                 self._agents[agent]["goal_spent"] += amount
-            if self._turn["agent"] == agent:
+            if turn and self._turn["agent"] == agent:
                 self._turn["worked_s"] += worked
                 self._turn["spent"] += amount
             self._save_quietly()

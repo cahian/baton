@@ -169,6 +169,8 @@ class Store:
         self._job = self.root / "job.json"
         self._goal = self.root / "goal.md"
         self._goal_done = self.root / "goal.done.md"
+        self._terms_reset = self.root / "terms.reset"
+        self._first_check = self.root / "verify.first.sh"
         self._next = self.root / "next"
         self._seq = max(self._last_seq(self._events), self._last_seq(self._rotated))
 
@@ -371,8 +373,18 @@ class Store:
     # goal
 
     def set_goal(self, text: str) -> None:
-        """Pin the goal the person fixed: every prompt opens with it until they change it."""
+        """Pin the goal the person fixed: every prompt opens with it until they change it. Saying
+        it again also accepts the goal's terms as they are now: the runner takes the mark."""
         _atomic_write(self._goal, text.strip() + "\n")
+        _atomic_write(self._terms_reset, "1\n")
+
+    def take_terms_reset(self) -> bool:
+        """True, once, after the goal was set (again): its terms are to be saved as they are."""
+        try:
+            self._terms_reset.unlink()
+        except FileNotFoundError:
+            return False
+        return True
 
     def read_goal(self) -> str | None:
         """The pinned goal, "" when none is set, and None when it exists but cannot be read."""
@@ -396,6 +408,27 @@ class Store:
             os.replace(self._goal, self._goal_done)
         except FileNotFoundError:
             pass
+
+    def first_check_path(self) -> Path:
+        """Where the first version of the check is kept."""
+        return self._first_check
+
+    def first_check(self) -> str | None:
+        """The first version of the goal's check (`.baton/VERIFY.sh`), None when none was kept or
+        it cannot be read."""
+        try:
+            return self._first_check.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def keep_first_check(self, text: str) -> None:
+        """Keep `text` as the first version of the check, unless one is kept already."""
+        if not self._first_check.exists():
+            _atomic_write(self._first_check, text)
+
+    def drop_first_check(self) -> None:
+        """Forget the first version: a new goal begins with a check of its own."""
+        self._first_check.unlink(missing_ok=True)
 
     # next
 

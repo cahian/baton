@@ -424,7 +424,7 @@ def test_classify_other_text_is_left_to_the_caller(text):
 def test_disabled_is_unavailable():
     a = AntigravityAdapter(make_cfg(enabled=False), read=Reads())
     res = a.availability()
-    assert not res.ok and "disabled" in res.reason
+    assert not res.ok and "disabled" in res.reason and res.permanent
 
 
 def test_availability_reads_both_commands_and_checks():

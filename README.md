@@ -320,8 +320,9 @@ what that agent does and which of its two models runs. State lives in `.baton/PL
    Changes go back to build at most 2 times; a third `CHANGES` ends the cycle.
 4. **End of cycle.** The verify command runs here, and a failed run goes back to plan. It also
    runs after every 3 rounds without a phase change, whatever their outcome (a timeout resumes
-   rather than advances), and a pass finishes the goal as usual. With no verify command, the end
-   of a cycle finishes the goal.
+   rather than advances), and a pass finishes the goal as usual (with a goal set, it starts
+   [consensus](#a-goal-ends-only-when-its-check-passes-and-every-agent-approves) instead). With no
+   verify command, the end of a cycle finishes the goal.
 
 A note from a person in the middle of a cycle is delivered as before, outranks the current task,
 and changes no phase; a new message starts a new cycle at plan, and `.baton/PLAN.md` and
@@ -338,6 +339,72 @@ just before a review round and reads the verdict only after a round that complet
 tracked or new file outside `.baton/` changes), the review is void: it counts as `CHANGES`, a
 `phase` event says `reviewer changed the code`, and a task to review those changes is added to the
 plan. A reviewer editing a gitignored file is not detected.
+
+### A goal ends only when its check passes and every agent approves
+
+While a goal is set (`baton: goal <text>`, `baton goal`, or `oneshot`), a passed verify does not
+finish the job, whatever the goal file says. A goal needs phases and a git repository, because
+consensus is a phase and an approval is bound to the state of the tree. With `phases = false`, or
+outside a repository, `baton: goal` answers `[baton] a goal needs phases, and phases = false here`
+(or `a goal needs a git repository`), `baton goal` exits with that error, and `oneshot = true` with
+`phases = false` is an error in the goal file. A run that finds a goal set where it cannot do it (a
+`baton.toml` edited to `phases = false` and a restart, a `.git` that disappeared) alerts once and
+holds, as it does for a missing Superpowers: no round, nothing ends, a stop is honoured, until the
+goal is cleared (`baton: goal off`) or the setup is fixed and the job restarted.
+
+The check is `verify.command` when the goal file has one. Otherwise it is `.baton/VERIFY.sh`, which
+the plan writes: it must exit 0 only when the goal is met as the person would experience it, in the
+real setup, with no rounding, a check that measures a stand-in fails the check, and it writes only
+under `.baton/` or outside the working directory (anything else it leaves in the tree counts as a
+change to the work). With no check the gate fails with `no check`, and the plan stays in plan, with
+tasks or without, until `.baton/VERIFY.sh` exists. The gate before round 1 and the periodic one run
+only with a check that exists.
+
+- **The check is locked.** At the end of each completed plan round baton saves the script's hash,
+  and keeps its first version in the state directory (`verify.first.sh`). A gate that finds another
+  hash fails with `the check changed outside plan` and alerts, so a build round cannot weaken it
+  silently. A plan round may change it; consensus then shows every approver the diff against the
+  first version, and tells them to reject a weaker check. When a goal ends or changes, the script
+  moves to `.baton/archive/` with the lock and the first version: the next goal writes its own.
+- **Consensus.** A pass starts it: every agent in `order` that can run (not left out for its goal
+  budget, and not one that can never run: disabled, no usable key, or a `round_budget_usd` below
+  the minimum) takes a fresh, strong round, one at a time, without moving the queue or its turns,
+  and with no round tail and no preemption watch. Every approver is shown the check itself (the
+  command or the script) and told to reject one that cannot fail or measures a stand-in. It may not
+  change the tree or the check, reruns the check itself, inspects real evidence, and writes
+  `REVIEW.md` with `APPROVED` or `CHANGES` first (`APPROVED only if ...` is not an approval). An
+  agent out of quota is waited for (`waiting for <agent> to approve`, said once per reason); a round
+  that did not complete is retried, and three in a row count as one failed cycle; an agent that
+  crosses its goal budget in the meantime leaves the list, and the chat says so.
+- **An approval belongs to a state.** When the gate passes baton records the tree (HEAD and every
+  changed file outside `.baton/`) and the check's hash. After every consensus round, completed or
+  not, on a restart, and just before the goal ends, they are compared: a change rejects, consensus
+  ends and the work goes back to build, with a note naming the changed paths from `git status`. A
+  clean round's own snapshot commit moves the record along. Before it ends, baton also looks again
+  at the goal (changed or cleared ends the approval) and asks anyone who can run now and has not
+  approved. Everyone approving ends the goal: `[baton] goal achieved: check passed, approved by
+  codex, antigravity, claude_api`, and the goal is archived.
+- **The goal's terms are saved.** When a goal is first seen baton saves its terms in `state.json`
+  (`goal_terms`: the verify command, `order`, and which agents are enabled). A later difference, from
+  a `baton.toml` an agent edited or anything else, fails the gate with `the goal's terms changed:
+  <what>` and an alert, and voids a consensus under way, until the person sets the goal again with
+  `baton: goal` or `baton goal` (the same words will do), which saves the terms as they are.
+  Consensus shows the saved verify command.
+- **The check runs once more at the end.** Just before the goal ends baton runs the check again:
+  the tree comparison cannot see what git ignores (a `dist/`, a build). A failure rejects, back to
+  build, and a goal that changes while any check runs does not get that run's result: the check runs
+  again for the new goal.
+- **A no goes back to build.** `CHANGES`, a missing verdict or a changed tree ends consensus: the
+  review becomes a note, a task goes to the plan, and the chat says `[baton] <agent> rejected:
+  back to build`. A message from the person during consensus ends it the same way, and `next` is
+  taken and dropped with a `[baton]` line.
+- **No giving up.** Every 3 cycles that end with a failed gate or a rejection, baton alerts `no
+  progress in N cycles: still working`, and carries on.
+
+What this does not stop: agents run with full access to the machine, so one could in principle
+write to baton's own state directory (the goal file, `state.json`, `verify.first.sh`); consensus
+guards the work and the check, not baton from the agents it runs. Helper files a check calls
+beside it are not locked either.
 
 **Subagents are allowed on the provider's two models.** A subagent may use only the strong or the
 working model of its provider, exactly, and what enforces that differs by provider.

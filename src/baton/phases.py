@@ -8,6 +8,7 @@ review guard, appending to) those two files.
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import time
@@ -16,14 +17,22 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 PLAN, BUILD, REVIEW = "plan", "build", "review"
-PHASES = (PLAN, BUILD, REVIEW)
-TIER = {PLAN: "strong", BUILD: "build", REVIEW: "strong"}
+# A goal the person set ends in consensus: every agent that can run checks the work on its own.
+CONSENSUS = "consensus"
+PHASES = (PLAN, BUILD, REVIEW, CONSENSUS)
+TIER = {PLAN: "strong", BUILD: "build", REVIEW: "strong", CONSENSUS: "strong"}
 MAX_CYCLES = 3
 # A completed build round that closes no task this many times in a row ends the build phase.
 STUCK_LIMIT = 2
 
 PLAN_FILE = "PLAN.md"
 REVIEW_FILE = "REVIEW.md"
+# The check of a goal that has no verify command: a script the plan writes, exit 0 meaning met.
+CHECK_FILE = "VERIFY.sh"
+# How much of the change to the check a consensus prompt carries.
+CHECK_DIFF_CHARS = 12000
+# How much of the check's own text a consensus prompt carries.
+CHECK_TEXT_CHARS = 6000
 # What baton adds to the plan when the reviewer changed the code: that work needs a second look.
 REVIEW_TASK = "- [ ] Review the changes made during review"
 
@@ -35,12 +44,16 @@ def open_tasks(text: str) -> list[str]:
     return [line.strip() for line in (text or "").splitlines() if _OPEN_RE.match(line)]
 
 
+_APPROVED_RE = re.compile(r"APPROVED(?:\s*$|\s*[.:\u2014-])", re.IGNORECASE)
+
+
 def verdict(text: str) -> str:
-    """ "approved" when the first non-blank line starts with APPROVED (any case), else "changes":
-    a missing, empty or malformed review never approves."""
+    """ "approved" when the first non-blank line is APPROVED (any case) as a word, followed by
+    nothing or by `.`, `:`, `-` or an em dash, else "changes": a missing, empty or malformed
+    review never approves, and neither does `APPROVED only if ...`."""
     for line in (text or "").splitlines():
         if line.strip():
-            return "approved" if line.lstrip("﻿ \t").upper().startswith("APPROVED") else "changes"
+            return "approved" if _APPROVED_RE.match(line.lstrip("\ufeff \t")) else "changes"
     return "changes"
 
 
@@ -151,12 +164,54 @@ def reason_for(
     return f"review asked for changes (cycle {new.cycles} of {max_cycles})"
 
 
-def phase_prompt(phase: str, next_task: str, base: str) -> str:
-    """The instructions for this phase, appended to the round's prompt."""
+def check_diff(first: str, now: str) -> str:
+    """The unified diff from the first version of the check to what it is now: "" when they are
+    the same, or when there is no first version to compare with. Cut to CHECK_DIFF_CHARS."""
+    if not first or first == now:
+        return ""
+    lines = difflib.unified_diff(
+        first.splitlines(),
+        now.splitlines(),
+        "VERIFY.sh (first version)",
+        "VERIFY.sh (now)",
+        lineterm="",
+    )
+    text = "\n".join(lines)
+    if len(text) <= CHECK_DIFF_CHARS:
+        return text
+    return f"{text[:CHECK_DIFF_CHARS]}\n[{len(text) - CHECK_DIFF_CHARS} characters left out here]"
+
+
+def phase_prompt(
+    phase: str,
+    next_task: str,
+    base: str,
+    *,
+    write_check: bool = False,
+    check_diff: str = "",
+    check_text: str = "",
+    check_label: str = "",
+    first_path: str = "",
+) -> str:
+    """The instructions for this phase, appended to the round's prompt. `write_check` (a goal
+    with no verify command) has the plan write the check. For the consensus prompt: `check_text`,
+    the check's own text (`check_label` says which it is), always; `check_diff`, how it changed
+    since its first version, and `first_path`, where that version is kept."""
     if phase == PLAN:
+        check = (
+            "- Write `.baton/VERIFY.sh`, the check of the goal: it must exit 0 only when the "
+            "goal is met as the person would experience it, in the real setup, with no "
+            "rounding. A check that measures a stand-in (a mock, a smaller input, a different "
+            "setup) fails the check: do not write one. The check writes only under `.baton/` or "
+            "outside the working directory: anything else it leaves in the tree counts as a "
+            "change to the work. Only the plan may change it, and a weaker one is rejected.\n"
+            if write_check
+            else ""
+        )
         return (
             "Phase: PLAN (you are the strong model; think, do not build).\n"
             "- Study the objective, the verify output above and the code.\n"
+            f"{check}"
             "- Write `.baton/PLAN.md`: one line `- [ ] <task>` per task, each small enough for "
             "one round of a weaker model. If the file already exists, keep it: leave closed "
             "tasks as `- [x]` and add or reopen what is still missing.\n"
@@ -181,6 +236,43 @@ def phase_prompt(phase: str, next_task: str, base: str) -> str:
             "- Do not write `.baton/REVIEW.md`: only the reviewer does."
         )
     where = f"`git diff {base}..HEAD`" if base else "`git log -p` and `git status` (no base commit)"
+    if phase == CONSENSUS:
+        text = check_text.strip()
+        if len(text) > CHECK_TEXT_CHARS:
+            left = len(text) - CHECK_TEXT_CHARS
+            text = f"{text[:CHECK_TEXT_CHARS]}\n[{left} characters left out here]"
+        shown = (
+            f"- The check, {check_label or 'as it stands'}:\n```sh\n{text}\n```\n"
+            "  Reject it (CHANGES) when it cannot fail (it always exits 0, or tests nothing the "
+            "goal asks for) or when it measures a stand-in for what the person would "
+            "experience.\n"
+            if text
+            else ""
+        )
+        where_first = f" (kept at `{first_path}`)" if first_path else ""
+        changed = (
+            f"- The check was changed since its first version{where_first}. This is the change:\n"
+            f"```diff\n{check_diff}\n```\n"
+            "  Reject it (CHANGES) when the check is weaker than the first version, however it "
+            "is worded, unless the goal itself changed.\n"
+            if check_diff
+            else ""
+        )
+        return (
+            "Phase: CONSENSUS (you are a fresh approver; do not edit code).\n"
+            "- The goal ends only when its check passes and every agent approves. The check "
+            "already passed: whether the goal is really met is yours to say.\n"
+            "- Re-run the check yourself. Then inspect real evidence: run the thing as the person "
+            "would use it and read what it does. Do not take the plan, the handoff or the last "
+            "verify output for proof.\n"
+            f"- What was done is in {where} and `.baton/PLAN.md`.\n"
+            f"{shown}"
+            f"{changed}"
+            "- Do NOT edit, create or delete any file except `.baton/REVIEW.md` and "
+            "`.baton/PLAN.md`: a round that changes the code is void and counts as a rejection.\n"
+            "- Write `.baton/REVIEW.md`. Its first line must be `APPROVED` or `CHANGES`.\n"
+            "- For CHANGES, say what is wrong and what evidence shows it."
+        )
     return (
         "Phase: REVIEW (you are a fresh reviewer; do not edit code).\n"
         f"- Inspect what was done since the plan with {where} and read `.baton/PLAN.md`.\n"
@@ -222,15 +314,20 @@ def clear_review(workdir: Path) -> bool:
     return True
 
 
-def add_review_task(workdir: Path) -> None:
-    """Append the follow-up task to PLAN.md, once. Raises OSError when it cannot be written."""
+def add_task(workdir: Path, line: str) -> None:
+    """Append an open task to PLAN.md, once. Raises OSError when it cannot be written."""
     path = workdir / ".baton" / PLAN_FILE
     text = read_plan(workdir)
-    if REVIEW_TASK in open_tasks(text):
+    if line in open_tasks(text):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     sep = "" if not text or text.endswith("\n") else "\n"
-    path.write_text(f"{text}{sep}{REVIEW_TASK}\n", encoding="utf-8")
+    path.write_text(f"{text}{sep}{line}\n", encoding="utf-8")
+
+
+def add_review_task(workdir: Path) -> None:
+    """Append the follow-up task to PLAN.md, once. Raises OSError when it cannot be written."""
+    add_task(workdir, REVIEW_TASK)
 
 
 def archive_plan(workdir: Path, now: float) -> None:
@@ -250,3 +347,21 @@ def archive_plan(workdir: Path, now: float) -> None:
             n += 1
             target = target_dir / f"{stamp}-{n}-{name}"
         os.replace(source, target)
+
+
+def archive_check(workdir: Path, now: float) -> Path | None:
+    """Move `.baton/VERIFY.sh` to `.baton/archive/<timestamp>-VERIFY.sh`, when its goal ends or
+    changes: the next goal writes a check of its own. The new place, or None when there was no
+    check. Raises OSError when it cannot be moved."""
+    source = workdir / ".baton" / CHECK_FILE
+    if not source.is_file():
+        return None
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now))
+    target_dir = workdir / ".baton" / "archive"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target, n = target_dir / f"{stamp}-{CHECK_FILE}", 1
+    while target.exists():
+        n += 1
+        target = target_dir / f"{stamp}-{n}-{CHECK_FILE}"
+    os.replace(source, target)
+    return target

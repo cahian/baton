@@ -372,3 +372,16 @@ def test_a_later_plain_next_does_not_downgrade_a_pending_next_now(st):
 def test_an_unreadable_goal_file_counts_as_no_goal(st):
     (st.root / "goal.md").mkdir()  # reading it is an OSError, not a missing file
     assert st.goal() == ""
+
+
+def test_the_first_version_of_the_check_is_kept_once_and_can_be_dropped(st):
+    assert st.first_check() is None
+    st.keep_first_check("fps >= 30\n")
+    st.keep_first_check("fps >= 3\n")  # a later version never replaces it
+    assert st.first_check() == "fps >= 30\n"
+    assert (st.root / "verify.first.sh").read_text() == "fps >= 30\n"
+    st.drop_first_check()
+    assert st.first_check() is None
+    st.drop_first_check()  # nothing to drop is fine
+    st.keep_first_check("new goal\n")
+    assert st.first_check() == "new goal\n"

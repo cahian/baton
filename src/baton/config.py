@@ -539,6 +539,11 @@ def goal_from_table(
     if not any(agents[a].enabled for a in order_raw):
         raise GoalError("every agent in order is disabled; nothing could ever run")
 
+    phases = _bool(data, "phases", PHASES_DEFAULT, "")
+    oneshot = _bool(data, "oneshot", False, "")
+    if oneshot and "phases" in data and not phases:
+        raise GoalError("oneshot needs phases: a goal ends in consensus, and phases = false here")
+
     return Goal(
         name=name,
         workdir=workdir,
@@ -548,8 +553,8 @@ def goal_from_table(
         idle_s=_int(data, "idle_s", 1200, "", 1, 10**7),
         snapshot=_bool(data, "snapshot", True, ""),
         memory=_bool(data, "memory", True, ""),
-        phases=_bool(data, "phases", PHASES_DEFAULT, ""),
-        oneshot=_bool(data, "oneshot", False, ""),
+        phases=phases,
+        oneshot=oneshot,
         verify_command=verify_command,
         verify_timeout_s=_int(verify, "timeout_s", 3600, "verify.", 1, 10**7),
         agents=agents,

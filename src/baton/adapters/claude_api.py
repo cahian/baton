@@ -463,17 +463,20 @@ class ClaudeApiAdapter:
 
     def availability(self) -> Availability:
         if not self.cfg.enabled:
-            return Availability(False, reason="claude_api is disabled in the goal file")
+            return Availability(
+                False, reason="claude_api is disabled in the goal file", permanent=True
+            )
         now = self._wall_clock()
         try:
             read_key(Path(self.cfg.key_file))
         except KeyFileError as exc:
-            return Availability(False, until=now + NO_KEY_RETRY_S, reason=str(exc))
+            return Availability(False, until=now + NO_KEY_RETRY_S, reason=str(exc), permanent=True)
         if self.cfg.round_budget_usd < MIN_GRANT_USD:
             return Availability(
                 False,
                 until=now + NO_KEY_RETRY_S,
                 reason=f"round_budget_usd is below the minimum round of {MIN_GRANT_USD} USD",
+                permanent=True,
             )
         try:
             if self.ledger.exhausted():

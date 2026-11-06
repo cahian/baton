@@ -14,13 +14,14 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from baton import runner as runner_module
 from baton.adapters.antigravity import AntigravityAdapter
 from baton.adapters.base import Adapter
 from baton.adapters.claude_api import ClaudeApiAdapter, ledger_for, make_cost_report
 from baton.adapters.codex import CodexAdapter
 from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_goal_ref
 from baton.doctor import run_checks
-from baton.gateway import DEFAULT_PORT, opencode_config, serve
+from baton.gateway import DEFAULT_PORT, build_goal, opencode_config, serve
 from baton.runner import pin_goal, preempted_sentence, run_goal
 from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
@@ -402,6 +403,21 @@ def _job_workdir(store: Store) -> Path | None:
     return Path(directory) if isinstance(directory, str) and directory else None
 
 
+def _goal_refusal(name: str, ref: GoalRef | None, workdir: Path | None) -> str:
+    """Why this goal may not be set, "" when it may. Whatever cannot be read here is the run's to
+    report, not a reason to refuse."""
+    try:
+        if ref is not None:
+            goal = load_goal(ref.path)
+        elif workdir is not None:
+            goal = build_goal(name, workdir, "a goal")
+        else:
+            return ""
+    except GoalError:
+        return ""
+    return runner_module.goal_refusal(goal)
+
+
 def cmd_goal(args: argparse.Namespace) -> int:
     name, ref = _resolve(args.goal_target)
     text = " ".join(args.text).strip()
@@ -414,6 +430,10 @@ def cmd_goal(args: argparse.Namespace) -> int:
         print("goal cleared; the next round's prompt no longer carries it")
     else:
         workdir = ref.workdir if ref else _job_workdir(store)
+        refusal = _goal_refusal(name, ref, workdir)
+        if refusal:
+            _err(refusal)
+            return 2
         if workdir is None:
             store.set_goal(text)  # nowhere to file a big one: pinned whole
         else:

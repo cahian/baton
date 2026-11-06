@@ -2334,6 +2334,40 @@ def test_goal_starts_a_job_with_its_text_as_the_objective(gw):
     assert "baton: goal" not in prompt
 
 
+@pytest.mark.refusals
+def test_goal_is_refused_with_phases_off_and_starts_nothing(gw):
+    (gw.work / "baton.toml").write_text("phases = false\n")
+    s = gw.stream("baton: goal make the build green")
+    text = s.read_all()
+    s.close()
+    assert "[baton] a goal needs phases, and phases = false here" in text
+    assert session_store().goal() == "" and gw.job() is None
+
+
+@pytest.mark.refusals
+def test_goal_is_refused_in_a_directory_that_is_not_a_repository(gw):
+    (gw.work / "baton.toml").write_text("phases = true\n")
+    s = gw.stream("baton: goal make the build green")
+    text = s.read_all()
+    s.close()
+    assert "[baton] a goal needs a git repository" in text
+    assert session_store().goal() == "" and gw.job() is None
+
+
+@pytest.mark.refusals
+def test_goal_with_a_running_job_is_refused_too_and_adds_no_note(gw):
+    (gw.work / "baton.toml").write_text("phases = false\n")
+    first, release = running_job(gw)
+    second = gw.stream("first request", "baton: goal ship it")
+    second.read_until("a goal needs phases")
+    assert session_store().goal() == "" and gw.job().store.read_inbox() == ""
+    release.set()
+    second.read_all()
+    second.close()
+    first.read_all()
+    first.close()
+
+
 def test_goal_keeps_the_conversation_before_it_in_the_objective(gw):
     s = Stream(gw.port, request("earlier talk", "baton: goal ship it"), session=SESSION)
     s.read_all()

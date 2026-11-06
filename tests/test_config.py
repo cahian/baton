@@ -595,6 +595,16 @@ def test_oneshot_is_off_by_default_and_can_be_turned_on(tmp_path):
     assert load_goal(write(tmp_path, on)).oneshot is True
 
 
+def test_oneshot_with_phases_off_is_refused(tmp_path):
+    bad = minimal().replace(
+        'objective = "Ship it."', 'objective = "x"\noneshot = true\nphases = false'
+    )
+    with pytest.raises(GoalError, match="oneshot needs phases"):
+        load_goal(write(tmp_path, bad))
+    ok = bad.replace("phases = false", "phases = true")
+    assert load_goal(write(tmp_path, ok)).oneshot is True
+
+
 def test_oneshot_must_be_a_boolean(tmp_path):
     bad = minimal().replace('objective = "Ship it."', 'objective = "x"\noneshot = "yes"')
     with pytest.raises(GoalError, match="oneshot"):

@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
+from baton import runner as runner_module
 from baton.adapters.base import Adapter
 from baton.commands import GOAL, GOAL_OFF, NEXT, Command, parse_command
 from baton.config import Goal, GoalError, check_repo_table, goal_from_table
@@ -344,9 +345,11 @@ def render_event(kind: str, f: Mapping) -> str:
     if kind == "round_start":
         agent, previous, n = f.get("agent"), f.get("previous"), f.get("round")
         # A `rotation` event just said it, with its reason: the line is not shown twice.
-        if previous and previous != agent and not f.get("announced"):
+        if previous and previous != agent and not f.get("announced") and not f.get("consensus"):
             return f"\n[baton] rotation: {previous} -> {agent} (round {n})\n\n"
         resumed = " (resumed)" if f.get("resumed") else ""
+        if f.get("consensus"):  # not a turn in the relay: it only checks the goal
+            return f"\n[baton] round {n}: {agent} (consensus)\n\n"
         return f"\n[baton] round {n}: {agent}{resumed}\n\n"
     if kind == "rotation":
         return (
@@ -377,6 +380,8 @@ def render_event(kind: str, f: Mapping) -> str:
         return f"\n[baton] phase: {f.get('phase')}{cycle}: {f.get('reason')}\n\n"
     if kind == "verify_unrunnable":
         return f"\n[baton] warning: {f.get('message')}\n\n"
+    if kind == "notice":
+        return f"\n[baton] {f.get('message')}\n\n"
     if kind == "alert":
         return f"\n[baton] alert: {f.get('message') or f.get('reason') or f.get('outcome')}\n\n"
     if kind == "error":
@@ -730,6 +735,12 @@ class Job:
             if self._done or self._closing:
                 return False
             if command.kind == GOAL:
+                refusal = runner_module.goal_refusal(self.goal)
+                if refusal:
+                    self._push(f"\n[baton] {refusal}\n\n")
+                    self._took_row(original, row)
+                    self._accept_or_save(mark)
+                    return True
                 # A big goal is filed once, and the note says no more than what is pinned.
                 short = pin_goal(self.store, self.workdir, command.text, time.time())
                 self._push("\n[baton] goal set\n\n")
@@ -1082,6 +1093,14 @@ class JobManager:
                     objective = text
                     if command is not None:
                         objective, _ = file_large_note(workdir, command.text, time.time())
+                    if command is not None and not said:
+                        # A goal ends in consensus: refused where that cannot be, before a job.
+                        refusal = runner_module.goal_refusal(
+                            build_goal(job_name(session), workdir, objective)
+                        )
+                        if refusal:
+                            self._save_mark(session, mark, old)
+                            raise GatewayError(refusal)
                     job = self._create(
                         session, workdir, messages[:index], objective, accepted, inbox, say=not said
                     )

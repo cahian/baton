@@ -91,6 +91,18 @@ def done(workdir):
     return step
 
 
+def done_and_stop(work, store):
+    """Step that satisfies the gate and asks for a stop: a goal that is set does not end on the
+    pass (consensus does), and these tests are about what comes before that."""
+
+    def step(agent, prompt, ctx):
+        (work / "DONE").write_text("x")
+        store.request_stop()
+        return RoundResult(COMPLETED)
+
+    return step
+
+
 def result(outcome, **kw):
     return lambda agent, prompt, ctx: RoundResult(outcome, **kw)
 
@@ -3401,13 +3413,15 @@ def test_no_pinned_goal_changes_nothing_in_the_prompt(tmp_path, work):
         assert "fixed by the person" not in plain
 
 
+@pytest.mark.phases
 def test_a_goal_in_the_store_reaches_the_first_prompt(go, agents, work, store):
     store.set_goal("the fixed goal")
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go() == 0
     assert agents["codex"].prompts[0].startswith(PINNED + "the fixed goal\n")
 
 
+@pytest.mark.phases
 def test_goal_off_takes_effect_from_the_next_rounds_prompt(go, agents, work, store):
     store.set_goal("the fixed goal")
 
@@ -3415,50 +3429,56 @@ def test_goal_off_takes_effect_from_the_next_rounds_prompt(go, agents, work, sto
         store.clear_goal()  # while the round runs: this round's prompt is already built
         return RoundResult(COMPLETED)
 
-    agents["codex"].script = [person_turns_it_off, done(work)]
+    agents["codex"].script = [person_turns_it_off, done_and_stop(work, store)]
     assert go() == 0
     first, second = agents["codex"].prompts
     assert "the fixed goal" in first and "fixed by the person" not in second
 
 
+@pytest.mark.phases
 def test_a_goal_set_mid_run_reaches_the_next_round_resumed_or_not(go, agents, work, store):
     def person_sets_it(agent, prompt, ctx):
         store.set_goal("set while running")
         return RoundResult(COMPLETED)
 
-    agents["codex"].script = [person_sets_it, done(work)]
+    agents["codex"].script = [person_sets_it, done_and_stop(work, store)]
     assert go() == 0
     first, second = agents["codex"].prompts
     assert "fixed by the person" not in first
     assert second.startswith(PINNED + "set while running\n")
 
 
+@pytest.mark.phases
 def test_oneshot_pins_the_objective_as_the_goal_at_start(tmp_path, work, go, agents, store):
     goal = make_goal(tmp_path, work, top="oneshot = true")
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go(goal) == 0
     assert store.goal() == OBJECTIVE
     assert agents["codex"].prompts[0].startswith(PINNED + OBJECTIVE + "\n")
 
 
+@pytest.mark.phases
 def test_oneshot_keeps_a_goal_that_is_already_set(tmp_path, work, go, agents, store):
     store.set_goal("the person's own")
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
     assert store.goal() == "the person's own"
 
 
+@pytest.mark.phases
 def test_oneshot_does_not_bring_back_a_goal_the_person_cleared(tmp_path, work, go, agents, store):
     # A restart that comes before round 1 has no rounds to go by: the state says it was pinned.
     store.save_state({"oneshot_pinned": True})
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
     assert store.goal() == ""
     assert "fixed by the person" not in agents["codex"].prompts[0]
 
 
+@pytest.mark.phases
 def test_oneshot_pins_once_and_says_so_in_state_json(tmp_path, work, go, agents, store):
     goal = make_goal(tmp_path, work, top="oneshot = true", verify="")
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go(goal) == 0
     assert store.load_state()["oneshot_pinned"] is True
     store.clear_goal()  # the person turns it off, and the job starts again at once
@@ -3466,28 +3486,31 @@ def test_oneshot_pins_once_and_says_so_in_state_json(tmp_path, work, go, agents,
     assert store.goal() == ""
 
 
+@pytest.mark.phases
 def test_a_state_without_the_flag_pins_at_the_first_start(tmp_path, work, go, agents, store):
     store.save_state({"round": 0, "workdir": str(work)})  # as an older baton wrote it
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
     assert store.goal() == OBJECTIVE
 
 
+@pytest.mark.phases
 def test_a_goal_that_was_already_set_counts_as_the_pin(tmp_path, work, go, agents, store):
     store.set_goal("the person's own")
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
     store.clear_goal()
     assert go(make_goal(tmp_path, work, top="oneshot = true")) == 0
     assert store.goal() == ""
 
 
+@pytest.mark.phases
 def test_a_big_oneshot_objective_is_filed_and_only_its_start_is_pinned(
     tmp_path, work, go, agents, store
 ):
     big = "word " * 3000
     goal = replace(make_goal(tmp_path, work), objective=big, oneshot=True)
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert go(goal) == 0
     pinned = store.goal()
     assert len(pinned) < 1500 and "`.baton/notes/" in pinned
@@ -3737,11 +3760,12 @@ def goal_world(tmp_path, work, agents):
     return make_goal(tmp_path, work, order=CLAUDE_FIRST, top=GOAL_CAPS)
 
 
+@pytest.mark.phases
 def test_crossing_the_goal_budget_drops_the_agent_and_alerts(tmp_path, work, store, agents, world):
     goal = goal_world(tmp_path, work, agents)
     store.set_goal("make it fast")
     agents["claude_api"].script = [costing(100.0), costing(60.0)]
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
     assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
         "claude_api",
@@ -3765,12 +3789,13 @@ def test_the_goal_budget_only_applies_while_a_goal_is_set(tmp_path, work, store,
     assert len(agents["codex"].prompts) == 0
 
 
+@pytest.mark.phases
 def test_a_new_goal_brings_the_dropped_agent_back_and_clears_its_spend(
     tmp_path, work, store, agents, world
 ):
     goal = goal_world(tmp_path, work, agents)
     store.set_goal("make it fast")
-    agents["claude_api"].script = [costing(160.0), done(work)]
+    agents["claude_api"].script = [costing(160.0), done_and_stop(work, store)]
 
     def changes_goal(agent, prompt, ctx):
         store.set_goal("make it small")
@@ -3787,10 +3812,11 @@ def test_a_new_goal_brings_the_dropped_agent_back_and_clears_its_spend(
     assert state["dropped"] == [] and state["agents"]["claude_api"]["goal_spent"] == 0
 
 
+@pytest.mark.phases
 def test_clearing_the_goal_also_brings_the_agent_back(tmp_path, work, store, agents, world):
     goal = goal_world(tmp_path, work, agents)
     store.set_goal("make it fast")
-    agents["claude_api"].script = [costing(160.0), done(work)]
+    agents["claude_api"].script = [costing(160.0), done_and_stop(work, store)]
 
     def clears_goal(agent, prompt, ctx):
         store.clear_goal()
@@ -3802,6 +3828,7 @@ def test_clearing_the_goal_also_brings_the_agent_back(tmp_path, work, store, age
     assert agents["claude_api"].script == []  # it ran its second round
 
 
+@pytest.mark.phases
 def test_a_dropped_agent_stays_dropped_across_a_restart_with_the_same_goal(
     tmp_path, work, store, agents, world
 ):
@@ -3813,7 +3840,7 @@ def test_a_dropped_agent_stays_dropped_across_a_restart_with_the_same_goal(
         return RoundResult(COMPLETED, cost_usd=160.0)
 
     agents["claude_api"].script = [spends_and_stops]
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
     assert store.load_state()["dropped"] == ["claude_api"]
     assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
@@ -3917,6 +3944,7 @@ def test_a_rotation_waits_for_the_agent_that_takes_over_when_none_can_run(
     assert kinds_seen.index("wait") < kinds_seen.index("rotation")  # said once somebody took over
 
 
+@pytest.mark.phases
 def test_the_cost_of_a_round_that_kept_its_reservation_counts_in_the_goal(
     tmp_path, work, store, agents, world
 ):
@@ -3926,7 +3954,7 @@ def test_the_cost_of_a_round_that_kept_its_reservation_counts_in_the_goal(
         costing(100.0),
         costing(60.0),
     ]  # a kill or a timeout would carry 5
-    agents["codex"].script = [done(work)]
+    agents["codex"].script = [done_and_stop(work, store)]
     assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
     assert store.load_state()["agents"]["claude_api"]["goal_spent"] == 160.0
 
@@ -3938,6 +3966,7 @@ def test_spend_is_not_counted_for_the_goal_while_none_is_set(tmp_path, work, sto
     assert store.load_state()["agents"]["claude_api"]["goal_spent"] == 0
 
 
+@pytest.mark.phases
 def test_a_goal_set_during_a_round_does_not_charge_the_money_spent_before_it(
     tmp_path, work, store, agents, world
 ):
@@ -3947,12 +3976,13 @@ def test_a_goal_set_during_a_round_does_not_charge_the_money_spent_before_it(
         store.set_goal("first goal")
         return RoundResult(COMPLETED, cost_usd=3.0)
 
-    agents["claude_api"].script = [costing(160.0), sets_goal, done(work)]
+    agents["claude_api"].script = [costing(160.0), sets_goal, done_and_stop(work, store)]
     assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
     assert [e for e in store.events() if e["kind"] == "alert"] == []
     assert store.load_state()["dropped"] == []
 
 
+@pytest.mark.phases
 def test_a_goal_that_cannot_be_read_changes_nothing(tmp_path, work, store, agents, world):
     goal = goal_world(tmp_path, work, agents)
     store.set_goal("make it fast")
@@ -3968,7 +3998,7 @@ def test_a_goal_that_cannot_be_read_changes_nothing(tmp_path, work, store, agent
         return RoundResult(LIMIT, until=world.now + 60)
 
     agents["claude_api"].script = [costing(160.0)]
-    agents["codex"].script = [unreadable_then_back, readable_again, done(work)]
+    agents["codex"].script = [unreadable_then_back, readable_again, done_and_stop(work, store)]
     assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
     assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
         "claude_api",

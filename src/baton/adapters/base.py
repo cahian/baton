@@ -45,12 +45,15 @@ class RoundResult:
 
 @dataclass(frozen=True)
 class Availability:
-    """Whether an agent may run now. Unknown means not ok."""
+    """Whether an agent may run now. Unknown means not ok. `permanent` says a no that waiting does
+    not end: the agent is disabled, has no usable key, or its settings cannot run a round. It
+    differs from being out of quota, which ends by itself."""
 
     ok: bool
     until: float | None = None
     reason: str = ""
     usage: dict = field(default_factory=dict)
+    permanent: bool = False
 
 
 @dataclass
