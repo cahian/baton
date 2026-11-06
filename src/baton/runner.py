@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,8 @@ COMMITS_MAX_CHARS = 2000
 # A round that completes sooner than this, without the goal being met, is followed by a pause of
 # this length, so an agent that exits at once cannot burn quota in a tight loop.
 MIN_ROUND_S = 30
+# The settings of an agent that a goal's terms hold, besides its verify command and its place.
+BUDGET_KEYS = ("round_budget_usd", "turn_budget_usd", "goal_budget_usd")
 # Phases: a phase that never completes still reaches the gate, and a builder that closes no task
 # cannot stay in build for ever.
 GATE_EVERY_ROUNDS = 3
@@ -245,6 +248,17 @@ def file_large_note(workdir: Path, text: str, now: float) -> tuple[str, Path | N
     )
 
 
+def saved_total(value: object) -> Decimal | None:
+    """A session's saved total as an amount, or None when there is none or it is unreadable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        number = Decimal(value)
+    except InvalidOperation:
+        return None
+    return number if number.is_finite() and number >= 0 else None
+
+
 def pin_goal(store: Store, workdir: Path, text: str, now: float) -> str:
     """Fix `text` as the goal. One over NOTE_INLINE_CHARS goes to a file the way a large note does,
     once, and what is pinned is its start and the line naming the file: every prompt carries the
@@ -351,9 +365,14 @@ def _signal_group(pgid: int, sig: int) -> None:
 # workdir and snapshots
 
 
+# What every git call baton makes runs with: a repository's own config must not run a program
+# (a file-system monitor, a hook) or open a pager inside baton, whose reads it could forge.
+GIT_SAFE = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat")
+
+
 def _git(workdir: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "-c", "commit.gpgsign=false", *args],
+        ["git", *GIT_SAFE, "-c", "commit.gpgsign=false", *args],
         cwd=workdir,
         capture_output=True,
         text=True,
@@ -524,9 +543,10 @@ def tree_fingerprint(workdir: Path) -> str | None:
         inside = _git(workdir, "rev-parse", "--is-inside-work-tree")
         top = _git(workdir, "rev-parse", "--show-toplevel")
         status = _git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", "--", ".")
+        listed = _git(workdir, "ls-files", "-v", "-z", "--", ".")
         if inside.returncode != 0 or inside.stdout.strip() != "true":
             return None
-        if top.returncode != 0 or status.returncode != 0:
+        if top.returncode != 0 or status.returncode != 0 or listed.returncode != 0:
             return None
         root = Path(top.stdout.strip())
         entries = status.stdout.split("\0")
@@ -546,6 +566,16 @@ def tree_fingerprint(workdir: Path) -> str | None:
         digest = hashlib.sha256(_head(workdir).encode())
         for code, path in sorted(found):
             digest.update(f"\0{code}\0{path}\0{_file_digest(root / path)}".encode())
+        # A tracked file marked skip-worktree or assume-unchanged is invisible to `status`: its
+        # mark and its content count too.
+        hidden = []
+        for entry in listed.stdout.split("\0"):
+            if len(entry) > 2 and entry[0] != "H" and entry[1] == " ":
+                path = entry[2:]
+                if path != ".baton" and not path.startswith(".baton/"):
+                    hidden.append((entry[0], path))
+        for flag, path in sorted(hidden):
+            digest.update(f"\0hidden\0{flag}\0{path}\0{_file_digest(workdir / path)}".encode())
         return digest.hexdigest()
     except Exception:
         return None
@@ -667,6 +697,10 @@ class _Run:
         self.ready = False
         self.sched: Scheduler | None = None
         self.sessions: dict[str, str] = {}
+        # What a session had reported as its cost by the end of its last round, by session id, as
+        # the text of the amount: Claude reports a session's total, so a round counts the part
+        # past it. Only the ids in `sessions` are kept.
+        self.session_totals: dict[str, str] = {}
         self.round_no = 0
         self.round_tail = ""
         self.gate_tail = ""
@@ -687,6 +721,8 @@ class _Run:
         self.verify_warning = ""
         # The goal text the scheduler last heard of: a different one is a new goal.
         self.goal_seen = ""
+        # A goal has been set at least once: a check there before that is the person's own.
+        self.goal_ever = False
         # What the goal was set with: {"verify", "order", "enabled"}, saved when it is first seen.
         # A different goal file later is not the goal the person set (None while no goal is set).
         self.goal_terms: dict[str, Any] | None = None
@@ -833,6 +869,9 @@ class _Run:
             "round": self.round_no,
             "workdir": str(self.goal.workdir),
             "sessions": dict(self.sessions),
+            "session_totals": {
+                s: t for s, t in self.session_totals.items() if s in self.sessions.values()
+            },
             "round_tail": self.round_tail,
             "heads": dict(self.heads),
             "group": self.group,
@@ -845,6 +884,7 @@ class _Run:
             "oneshot_pinned": self.oneshot_pinned,
             "verify_warning": self.verify_warning,
             "goal_seen": self.goal_seen,
+            "goal_ever": self.goal_ever,
             "goal_terms": deepcopy(self.goal_terms),
             **(
                 {
@@ -1037,6 +1077,7 @@ class _Run:
         same_dir = state.get("workdir") == str(goal.workdir)
         saved = state.get("sessions")
         heads = state.get("heads")
+        totals = state.get("session_totals")
         # Sessions are kept per agent, or per agent and role with phases: a key this run does not
         # use (an old one, or one from the other mode) is ignored and its agent starts fresh.
         keys = (
@@ -1052,6 +1093,11 @@ class _Run:
             self.sessions = {}
             if saved:
                 self.emit("alert", message="working directory changed: session ids cleared")
+        self.session_totals = {
+            s: t
+            for s, t in (totals.items() if same_dir and isinstance(totals, dict) else ())
+            if s in self.sessions.values() and isinstance(t, str) and saved_total(t) is not None
+        }
         self.heads = (
             {
                 k: h
@@ -1088,6 +1134,10 @@ class _Run:
             and not isinstance(e["seq"], bool)
             and isinstance(e.get("text"), str)
         ][-NOTE_LOG_MAX:]
+        if not self.note_log and self.carried_notes.strip():
+            # A state from before the log: its unread note enters it, so that a conversation
+            # reading the log (and not the carried text) still gets it.
+            self.note_log = [{"seq": 1, "text": self.carried_notes}]
         seen = state.get("note_seen")
         self.note_seen = {
             k: v
@@ -1101,7 +1151,10 @@ class _Run:
         self.verify_warning = warning if isinstance(warning, str) else ""
         seen = state.get("goal_seen")
         self.goal_seen = seen if isinstance(seen, str) else ""
+        self.goal_ever = state.get("goal_ever") is True or bool(self.goal_seen)
         self.goal_terms = self.read_terms(state.get("goal_terms"))
+        if self.goal_terms is not None and "budgets" not in self.goal_terms:
+            self.goal_terms["budgets"] = self.terms_now()["budgets"]  # a state from before them
         if self.store.take_terms_reset():  # the goal was said again: its terms are as they are now
             self.goal_terms = self.terms_now()
         prepare_workdir(goal)
@@ -1295,11 +1348,17 @@ class _Run:
                 self.goal_terms = self.terms_now()
                 self.persist_softly()
             return False
+        first = not self.goal_ever
         self.goal_seen = current
+        self.goal_ever = self.goal_ever or bool(current)
         self.goal_terms = self.terms_now() if current else None
         self.sched.new_goal()
-        # The check, the lock on it and the count of failed cycles belong to one goal.
-        self.set_check_aside()
+        # The check, the lock on it and the count of failed cycles belong to one goal. A check
+        # there before the first goal was ever set is the person's own: it is the goal's.
+        if first and current and self.keeps_check():
+            self.keep_check()
+        else:
+            self.set_check_aside()
         self.failed_cycles = 0
         if self.consensus is not None:
             self.notice("the goal changed: the approval under way is dropped")
@@ -1334,6 +1393,12 @@ class _Run:
             "verify": goal.verify_command or "",
             "order": list(goal.order),
             "enabled": [n for n, cfg in goal.agents.items() if cfg.enabled],
+            # What a repository's baton.toml may lower, and so remove an approver with: a round
+            # budget under the minimum, a turn or a goal budget that is soon spent.
+            "budgets": {
+                n: {key: format(getattr(cfg, key), "f") for key in BUDGET_KEYS}
+                for n, cfg in goal.agents.items()
+            },
         }
 
     @staticmethod
@@ -1347,6 +1412,16 @@ class _Run:
             if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
                 return None
             found[key] = list(names)
+        budgets = raw.get("budgets")
+        if budgets is not None:  # absent in a state from before them: taken as they are on load
+            if not isinstance(budgets, dict) or not all(
+                isinstance(n, str)
+                and isinstance(b, dict)
+                and all(isinstance(b.get(k), str) for k in BUDGET_KEYS)
+                for n, b in budgets.items()
+            ):
+                return None
+            found["budgets"] = {n: {k: b[k] for k in BUDGET_KEYS} for n, b in budgets.items()}
         return found
 
     def terms_changed(self) -> str:
@@ -1365,6 +1440,11 @@ class _Run:
             if saved[key] != now[key]:
                 was, is_now = ", ".join(saved[key]) or "none", ", ".join(now[key]) or "none"
                 found.append(f"{key} was {was}, now {is_now}")
+        for name, budgets in now["budgets"].items():
+            before = saved["budgets"].get(name, {})
+            for key in BUDGET_KEYS:
+                if before.get(key) != budgets[key]:
+                    found.append(f"{name} {key} was {before.get(key, 'unset')}, now {budgets[key]}")
         return "; ".join(found)
 
     def take_next(self) -> bool:
@@ -1533,6 +1613,21 @@ class _Run:
         text, _ = self.check_text()
         return check_diff(self.store.first_check() or "", text)
 
+    def keeps_check(self) -> bool:
+        """True when the goal's check is `.baton/VERIFY.sh` and one exists."""
+        return not self.goal.verify_command and self.check_file().is_file()
+
+    def keep_check(self) -> None:
+        """The first goal takes the check that was already there, as it is: it is locked, and its
+        first version kept, as if a plan round had written it."""
+        self.check_lock = ""
+        try:
+            self.store.drop_first_check()
+        except OSError as exc:
+            self.emit("error", error=f"could not forget the first check: {exc}")
+        self.lock_check()
+        self.notice("using the existing .baton/VERIFY.sh as the goal's check")
+
     def set_check_aside(self) -> None:
         """A goal ended or changed: its check goes to `.baton/archive/`, and the lock and the first
         version go with it. The next goal writes a check of its own."""
@@ -1629,9 +1724,7 @@ class _Run:
                 "next is ignored during consensus: the agents approving the goal do not take turns"
             )
         if self.owes_round or self.unread_notes():
-            self.reject_consensus(
-                "", "your message ends the approval: back to build", MESSAGE_TASK, count=False
-            )
+            self.message_ends_consensus()
             return None
         pending = [n for n in state["pending"] if n not in sched.dropped]
         for name in state["pending"]:
@@ -1714,17 +1807,20 @@ class _Run:
                 CHECK_TASK,
             )
             return None
+        if self.unread_notes():
+            # A message came while the check ran: nobody approved with it in mind.
+            self.message_ends_consensus()
+            return None
         return self.achieve()
 
     def after_consensus(
-        self, agent: str, completed: bool, spawned: bool, drift: str, trusted: bool
+        self, agent: str, completed: bool, spawned: bool, drift: str, text: str
     ) -> None:
         """A consensus round ended. A round that changed the work (`drift`, completed or not),
         a missing verdict and CHANGES reject the goal; APPROVED takes `agent` out of the pending.
         A round that did not complete is retried, and three in a row count as one failed cycle."""
         if self.consensus is None:
             return
-        text = read_review(self.goal.workdir) if trusted else ""
         wrote = f"\nWhat it wrote:\n{text.strip()}" if text.strip() else ""
         if drift:
             try:
@@ -1742,7 +1838,7 @@ class _Run:
                 if self.incomplete_rounds >= INCOMPLETE_LIMIT:
                     self.incomplete_rounds = 0
                     self.count_failed_cycle()
-        elif verdict(text) == "approved":
+        elif verdict(text, strict=True) == "approved":
             self.incomplete_rounds = 0
             state = self.consensus
             state["pending"] = [n for n in state["pending"] if n != agent]
@@ -1752,6 +1848,13 @@ class _Run:
             self.reject_consensus(
                 f"{agent} rejected the goal.{wrote}", f"{agent} rejected: back to build"
             )
+
+    def message_ends_consensus(self) -> None:
+        """The person's words end consensus: back to build, with no approval counted and no
+        failed cycle."""
+        self.reject_consensus(
+            "", "your message ends the approval: back to build", MESSAGE_TASK, count=False
+        )
 
     def reject_consensus(
         self, note: str, line: str, task: str = REJECTION_TASK, count: bool = True
@@ -1891,7 +1994,14 @@ class _Run:
             store.take_interrupt()  # one that arrived between rounds has nothing left to end
         except OSError:
             pass
-        self.collect_notes()
+        left_in_inbox = self.collect_notes()
+        if phase == CONSENSUS and (left_in_inbox or self.carried_notes.strip()):
+            # A message came after the step looked: it ends the approval before any agent is
+            # asked, and its text is for the build that follows. This round never started.
+            self.round_no = n - 1
+            self.need_gate = gate_was_due
+            self.message_ends_consensus()
+            return False
         newest_note = self.newest_note()
         handoff = self.read_handoff()
         # The conversation of an agent is tied to its model: per role with phases, and a review
@@ -2026,10 +2136,19 @@ class _Run:
         def on_session(session: str) -> None:
             if not key:
                 return  # a review keeps no conversation
+            before = self.sessions.get(key)
             self.sessions[key] = session
+            if before and before != session and before in self.session_totals:
+                # The session went on under a new id: its total goes on with it.
+                self.session_totals[session] = self.session_totals.pop(before)
             # A conversation that begins here has the notes up to now in its objective or prompt.
             self.note_seen.setdefault(key, newest_note)
             self.persist_softly()
+
+        def on_session_total(session: str, total: Decimal) -> None:
+            if key and total > 0:  # a zero is no total: the saved one stands
+                self.session_totals[session] = format(total, "f")
+                self.persist_softly()
 
         def attempt(session: str | None) -> RoundResult:
             nonlocal tools, spent
@@ -2064,6 +2183,8 @@ class _Run:
                 on_spawn=on_spawn,
                 session_id=session,
                 on_session=on_session,
+                session_total=saved_total(self.session_totals.get(session)) if session else None,
+                on_session_total=on_session_total,
                 tier=TIER[phase] if phase else "strong",
                 on_subagent=on_subagent,
             )
@@ -2110,6 +2231,9 @@ class _Run:
 
         # A round cut off by its own cap (bounded) is complete for the scheduler, not for the work.
         completed = result.outcome == COMPLETED and not killed and not result.bounded
+        # What an approver wrote is read before baton's next git call: nothing a repository's
+        # own config could run in between is to leave a verdict behind.
+        said = read_review(goal.workdir) if phase == CONSENSUS and review_trusted else ""
         # A reviewer is not to change the code: compared before baton's own snapshot commit.
         void = False
         drift = ""
@@ -2121,6 +2245,8 @@ class _Run:
 
         self.group = None
         ended = self.clock()
+        # Fragments were masked one by one: a secret they split rejoins in the tail.
+        tail = mask_secrets(buf)
         # Record first: nothing after this can lose a credit_guard or limit outcome.
         self.sched.record(agent, result, seconds=ended - started)
         # A consensus round is a lent one: its cost counts for the goal, not for the agent's turn.
@@ -2148,7 +2274,7 @@ class _Run:
                 self.note_seen[key] = max(self.note_seen.get(key, 0), newest_note)
             self.owes_round = False
             if phase != CONSENSUS:
-                self.round_tail = buf
+                self.round_tail = tail
         if spawned:
             if phase != CONSENSUS:
                 self.prev_agent = agent  # an approver takes nobody's place in the relay
@@ -2175,7 +2301,7 @@ class _Run:
         )
         if phase == CONSENSUS:
             # After the notes were marked read: a rejection leaves one for the build that follows.
-            self.after_consensus(agent, completed, spawned, drift, review_trusted)
+            self.after_consensus(agent, completed, spawned, drift, said)
         self.end_turn(agent, spent, rotate=phase != CONSENSUS)
         self.persist_softly()
         if spawned and self.memory() is not None:
@@ -2193,13 +2319,15 @@ class _Run:
                 gate_tail="",
                 commits=commits_since(goal.workdir, head_before) if head_before else "",
                 handoff=self.read_handoff(limit=False),  # whole, for the lessons at its top
-                round_tail=buf,
+                round_tail=tail,
                 phase=phase,
             )
             if self.gated():
                 self.save_pending()  # the gate may never finish: see `step`
             else:
                 self.record_pending()
+        if self.goal_on():
+            return False  # a goal set during the round ends in consensus, never on a round
         if self.phases:
             return cycle_ended and not self.gated()
         return not goal.verify_command and completed

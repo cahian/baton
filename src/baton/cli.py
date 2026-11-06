@@ -22,6 +22,7 @@ from baton.adapters.codex import CodexAdapter
 from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_goal_ref
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, build_goal, opencode_config, serve
+from baton.proc import ROUND_VARIABLE
 from baton.runner import pin_goal, preempted_sentence, run_goal
 from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
@@ -601,8 +602,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# The commands that steer a goal: an agent's own shell has no business running them.
+STEERING = ("cmd_goal", "cmd_next", "cmd_restart", "cmd_stop")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if os.environ.get(ROUND_VARIABLE) and args.func.__name__ in STEERING:
+        _err("refused: this runs inside an agent's round, and only the person steers a goal")
+        return 2
     try:
         return args.func(args)
     except GoalError as exc:

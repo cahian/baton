@@ -59,6 +59,8 @@ PUT_TIMEOUT_S = 0.05
 STOP_LOG_BYTES = 16 * 1024 * 1024
 # How long reading continues once the group is dead, to reach EOF.
 JOIN_S = 0.5
+# Set in every agent's environment: the commands that steer a goal refuse to run under it.
+ROUND_VARIABLE = "BATON_ROUND"
 # What replaces a credential that a child printed, and the shortest value worth hiding.
 REDACTED = b"[redacted]"
 MIN_SECRET_CHARS = 8
@@ -92,13 +94,14 @@ _PLACEHOLDER_RE = re.compile(
     r"\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[\w .-]+>|[xX*.]+"
 )
 # An unquoted value is taken for a credential only when it holds a digit or one of these: letters
-# with . _ - are names of things (`self.password`, `settings.DB_PASSWORD`, `AuthToken`).
+# with . _ - are names of things (`self.password`, `settings.DB_PASSWORD`, `AuthToken`). Digits
+# alone are a number (`token_budget=10000000`).
 _SECRET_SYMBOLS = frozenset("!@$%^*+=~|?")
 _TRAILING = ",);]"
 
 
 def _secret_like(value: str) -> bool:
-    return any(c.isdigit() or c in _SECRET_SYMBOLS for c in value)
+    return not value.isdigit() and any(c.isdigit() or c in _SECRET_SYMBOLS for c in value)
 
 
 def _mask_named(text: str) -> str:
@@ -153,7 +156,7 @@ def mask_secrets(text: str) -> str:
     token, `token`/`api_key`/`secret`/`password` given a value of at least MIN_SECRET_CHARS
     characters, and the well-known token shapes (`sk-`, `ghp_`, `AKIA`, `xoxb-`). A placeholder
     (`$TOKEN`, `${TOKEN}`, `<token>`, `xxxxxxxx`) is not a value. Known limit: an unquoted value of
-    letters only (with . _ -) is read as a name in code and kept."""
+    letters only (with . _ -), or of digits only, is read as a name or a number in code and kept."""
     if not text:
         return text
     for pattern in _TOKEN_RES:
@@ -392,6 +395,7 @@ def run_streaming(
         env.update(extra_env)
     if plain_env:
         env.update(plain_env)
+    env[ROUND_VARIABLE] = "1"  # last: nothing an adapter passes can unset it
     # Open the log before spawning: a failure here must not leave a running, unwatched child.
     log = ctx.log_path.open("ab")
     try:

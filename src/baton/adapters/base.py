@@ -7,6 +7,7 @@ import shlex
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -67,6 +68,11 @@ class RoundContext:
     on_spawn: Callable[[int], None]
     session_id: str | None = None
     on_session: Callable[[str], None] = lambda _: None
+    # Claude reports its cost as the session's total so far. What the session had reported by the
+    # end of its last round (None for a session with no saved total), so a round is charged only
+    # for what it added; and told, as (session, total), the total a round reports.
+    session_total: Decimal | None = None
+    on_session_total: Callable[[str, Decimal], None] = lambda session, total: None
     # "strong" (plan, review and the plain relay) or "build": which of the two models runs.
     tier: str = "strong"
     # Told, with the tool and the model when the stream shows it, of every subagent a round starts.

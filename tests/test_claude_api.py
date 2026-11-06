@@ -455,6 +455,12 @@ def test_key_reaches_only_its_process(env, monkeypatch):
     assert KEY not in os.environ.values()  # not in baton's own environment either
 
 
+def test_the_round_carries_baton_round_in_its_environment(env, monkeypatch):
+    monkeypatch.setenv("BATON_ROUND", "")
+    run(env)
+    assert env.calls()[0]["env"]["BATON_ROUND"] == "1"
+
+
 def test_key_is_never_on_the_command_line(env):
     run(env, session_id="abc")
     assert KEY not in json.dumps(env.calls()[0]["argv"])
@@ -752,6 +758,97 @@ def test_cost_over_the_cap_is_charged_in_full(env, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_COST", "12.5")
     run(env)
     assert env.ledger.spent() == Decimal("12.5")
+
+
+def resumed_round(env, monkeypatch, total, last, saved):
+    """A resumed round of session s1 that reports `total`, after one that reported `last`."""
+    monkeypatch.setenv("FAKE_CLAUDE_COST", total)
+    return run(
+        env,
+        session_id="s1",
+        session_total=None if last is None else Decimal(last),
+        on_session_total=lambda session, amount: saved.append((session, amount)),
+    )
+
+
+def test_a_resumed_round_is_charged_what_it_added_to_the_sessions_total(env, monkeypatch):
+    saved = []
+    first = resumed_round(env, monkeypatch, "5", None, saved)  # no saved total: the whole figure
+    second = resumed_round(env, monkeypatch, "10", "5", saved)
+    third = resumed_round(env, monkeypatch, "15", "10", saved)
+    assert [first.cost_usd, second.cost_usd, third.cost_usd] == [5.0, 5.0, 5.0]
+    assert env.ledger.spent() == Decimal("15")  # real spend, not 5 + 10 + 15
+    assert saved == [("s1", Decimal("5")), ("s1", Decimal("10")), ("s1", Decimal("15"))]
+
+
+def charged_sequence(env, monkeypatch, totals):
+    """The charge of each resumed round that reports the next total, each one handed the total
+    the runner would have saved: the last non-zero one."""
+    saved, last, charges = [], None, []
+    for total in totals:
+        before = len(saved)
+        charges.append(resumed_round(env, monkeypatch, total, last, saved).cost_usd)
+        if len(saved) > before:
+            last = str(saved[-1][1])
+    return charges, saved
+
+
+@pytest.mark.parametrize(
+    "totals,charges",
+    [
+        (["40", "45", "0", "50"], [40.0, 5.0, 0.0, 5.0]),  # a zero (a crash) is ignored
+        (["40", "45", "3", "8"], [40.0, 5.0, 3.0, 5.0]),  # a lower one is a restarted counter
+    ],
+)
+def test_a_zero_total_is_ignored_and_a_restarted_counter_is_charged_whole(
+    env, monkeypatch, totals, charges
+):
+    got, saved = charged_sequence(env, monkeypatch, totals)
+    assert got == charges
+    assert env.ledger.spent() == Decimal(str(sum(charges)))
+    assert all(total > 0 for _, total in saved)  # a zero is never saved
+
+
+def test_a_killed_round_saves_no_total_and_counts_its_grant(env, monkeypatch):
+    saved = []
+    monkeypatch.setenv("FAKE_CLAUDE_NO_RESULT", "1")
+    result = run(
+        env,
+        session_id="s1",
+        session_total=Decimal("5"),
+        on_session_total=lambda session, amount: saved.append((session, amount)),
+    )
+    assert saved == [] and result.cost_usd == 10.0
+    assert env.ledger.spent() == Decimal("10.00")
+
+
+def test_the_turn_limit_trips_at_the_real_fifty_dollars_of_a_resumed_session(
+    tmp_path, monkeypatch, env
+):
+    from test_runner import CLAUDE_FIRST, Fake, World, done, make_goal
+
+    from baton.runner import run_goal
+    from baton.store import Store
+
+    work = tmp_path / "work"
+    work.mkdir()
+    world, store = World(), Store(tmp_path / "state")
+    monkeypatch.setenv("FAKE_CLAUDE_STEP", "5")
+    monkeypatch.setenv("FAKE_CLAUDE_TOTALS", str(tmp_path / "totals.json"))
+    codex = Fake("codex")
+    codex.script = [done(work)]
+    claude = make_adapter(env)
+    goal = make_goal(tmp_path, work, order=CLAUDE_FIRST)
+    # Claude's rounds report 5, 10, 15 ... for one session: each one really spent 5.
+    assert (
+        run_goal(goal, {"codex": codex, "claude_api": claude}, store, world.clock, world.sleep) == 0
+    )
+    rounds = [e for e in store.events() if e["kind"] == "round_end" and e["agent"] == "claude_api"]
+    assert len(rounds) == 10 and {e["cost_usd"] for e in rounds} == {5.0}
+    assert env.ledger.spent() == Decimal("50")
+    (rotation,) = [e for e in store.events() if e["kind"] == "rotation"]
+    assert rotation["reason"] == "USD 50"
+    assert store.load_state()["session_totals"] == {"sess-1": "50"}
 
 
 def test_budget_cap_reached_settles_and_counts_as_completed(env, monkeypatch):

@@ -65,7 +65,24 @@ def test_open_tasks_only_unchecked_lines():
         ("NOT APPROVED", "changes"),
     ],
 )
-def test_verdict(text, expected):
+def test_the_strict_verdict_of_consensus(text, expected):
+    assert verdict(text, strict=True) == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("APPROVED", "approved"),
+        ("approved, looks good", "approved"),
+        ("APPROVED only if the fps is 30", "approved"),  # a plain review reads the first word
+        ("\ufeff  Approved\n", "approved"),
+        ("CHANGES\n- [ ] x", "changes"),
+        ("", "changes"),
+        ("# Review\nAPPROVED", "changes"),
+        ("NOT APPROVED", "changes"),
+    ],
+)
+def test_the_plain_verdict_of_a_review(text, expected):
     assert verdict(text) == expected
 
 

@@ -13,6 +13,9 @@ does: "ANTHROPIC_API_KEY" when that variable is set, "none" otherwise, unless ov
   FAKE_CLAUDE_ECHO_KEY        also prints the API key inside the assistant text
   FAKE_CLAUDE_SLEEP           seconds to stay alive before the result event
   FAKE_CLAUDE_COST            total_cost_usd, written into the JSON verbatim (default 0.0123)
+  FAKE_CLAUDE_STEP            instead of COST: the session's total grows by this much each round,
+                              kept per session in the JSON file FAKE_CLAUDE_TOTALS (as the real
+                              CLI reports a resumed session's cost: cumulative)
   FAKE_CLAUDE_NO_RESULT       no result event
   FAKE_CLAUDE_LINGER          seconds to stay alive after the result event, before exiting
   FAKE_CLAUDE_IS_ERROR        the result is an error; its text is FAKE_CLAUDE_ERROR_TEXT
@@ -36,6 +39,7 @@ import json
 import os
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -154,7 +158,15 @@ def main() -> None:
             "total_cost_usd": "__COST__",
             "result": env.get("FAKE_CLAUDE_ERROR_TEXT", "boom") if is_error else "done",
         }
-        line = json.dumps(result).replace('"__COST__"', env.get("FAKE_CLAUDE_COST", "0.0123"))
+        cost = env.get("FAKE_CLAUDE_COST", "0.0123")
+        if env.get("FAKE_CLAUDE_STEP"):
+            # As the real CLI reports it: the session's total so far, this round's spend included.
+            totals_file = Path(env["FAKE_CLAUDE_TOTALS"])
+            totals = json.loads(totals_file.read_text()) if totals_file.exists() else {}
+            cost = str(Decimal(totals.get(session, "0")) + Decimal(env["FAKE_CLAUDE_STEP"]))
+            totals[session] = cost
+            totals_file.write_text(json.dumps(totals))
+        line = json.dumps(result).replace('"__COST__"', cost)
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
     time.sleep(float(env.get("FAKE_CLAUDE_LINGER", "0")))

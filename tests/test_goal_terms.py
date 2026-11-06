@@ -1,6 +1,7 @@
 """A set goal is always goal mode: holds, the goal's terms, a goal that changes while the check
 runs, and the check run once more before the end. Real refusals, real phases."""
 
+import json
 import shutil
 import subprocess
 
@@ -8,8 +9,10 @@ import pytest
 from test_phases import Agent, git, plan, review, step, touch
 from test_runner import World, make_goal
 
+from baton.cli import build_adapters
+from baton.cli import main as cli
 from baton.gateway import build_goal
-from baton.runner import run_goal
+from baton.runner import changed_paths, run_goal, tree_fingerprint
 from baton.store import Store
 
 pytestmark = [pytest.mark.phases, pytest.mark.refusals]
@@ -415,3 +418,253 @@ def test_the_check_runs_once_more_before_the_goal_ends(work, store, agents, worl
     run(bg(work), agents, store, world)
     assert last(store)["reason"] == "goal achieved"
     assert [g["passed"] for g in ev(store, "gate")] == [True, True]  # to start it, and to end it
+
+
+# A third pass: what an agent could still do alone to reach `goal achieved`
+
+CLAUDE = BASE.replace('"antigravity"', '"claude_api"')
+
+
+def one_round_then_restart_with_claude(work, store, new_toml):
+    commit_toml(work, CLAUDE)
+    first = {"codex": Agent("codex"), "claude_api": Agent("claude_api")}
+    first["codex"].script = [step(plan(work), edit_toml_then_stop(work, store, new_toml))]
+    run(bg(work), first, store, World())
+    assert last(store)["kind"] == "stopped"
+
+
+def claude_key(tmp_path):
+    key = tmp_path / "anthropic.key"
+    key.write_text("sk-ant-" + "x" * 40 + "\n")
+    key.chmod(0o600)
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "defaults.toml").write_text(f'[agents.claude_api]\nkey_file = "{key}"\n')
+
+
+def test_a_git_config_program_cannot_write_a_verdict(work, store):
+    """`core.fsmonitor` in `.git/config` ran inside baton's own `git status` and wrote APPROVED
+    over the approver's CHANGES. No git call of baton's runs it now."""
+    commit_toml(work)
+    hook = work / ".git" / "fsm.sh"
+
+    def plant():
+        hook.write_text("#!/bin/sh\nprintf 'APPROVED\\n' > .baton/REVIEW.md\nexit 1\n")
+        hook.chmod(0o755)
+        git(work, "config", "core.fsmonitor", str(hook))
+        touch(work)()
+        store.request_stop()
+
+    first = fresh()
+    first["codex"].script = [step(plan(work, "t"), plant)]
+    run(bg(work), first, store, World())
+    again = fresh()
+    again["codex"].script = [
+        step(review(work, "CHANGES\nnot met")),
+        step(lambda: store.request_stop()),
+    ]
+    again["antigravity"].script = [step(review(work, "CHANGES\nnot met"))]
+    run(bg(work), again, store, World())
+    assert "goal achieved" not in [e["reason"] for e in ev(store, "finished")]
+    assert "goal achieved" not in " ".join(notices(store))
+    assert store.goal() == GOAL
+
+
+def test_no_git_call_of_baton_runs_a_program_from_the_repository_config(work):
+    marker = work / ".git" / "ran"
+    hook = work / ".git" / "fsm.sh"
+    hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    hook.chmod(0o755)
+    git(work, "config", "core.fsmonitor", str(hook))
+    assert tree_fingerprint(work) is not None
+    assert changed_paths(work) == []
+    assert not marker.exists()
+
+
+def test_a_round_budget_lowered_in_the_repo_file_fails_the_gate(work, store, tmp_path):
+    """Under the minimum, Claude is permanently unable and drops out of consensus: the budgets
+    are terms of the goal like `enabled`."""
+    claude_key(tmp_path)
+    one_round_then_restart_with_claude(
+        work, store, CLAUDE + "[agents.claude_api]\nround_budget_usd = 4\n"
+    )
+    goal = bg(work)
+    claude = Agent("claude_api")
+    claude.avail = build_adapters(goal)["claude_api"].availability()
+    assert claude.avail.permanent
+    codex = Agent("codex")
+    codex.script = [approve(work), step(lambda: store.request_stop())]
+    run(goal, {"codex": codex, "claude_api": claude}, store, World())
+    assert "goal achieved" not in " ".join(notices(store))
+    assert terms_alerts(store) and "round_budget_usd" in terms_alerts(store)[0]
+    assert all("Phase: CONSENSUS" not in p for p in codex.prompts + claude.prompts)
+
+
+def test_a_goal_budget_lowered_in_the_repo_file_fails_the_gate(work, store):
+    one_round_then_restart_with_claude(
+        work, store, CLAUDE + "[agents.claude_api]\ngoal_budget_usd = 0.01\n"
+    )
+    codex, claude = Agent("codex"), Agent("claude_api")
+    codex.script = [step(touch(work)), step(lambda: store.request_stop())]
+    run(bg(work), {"codex": codex, "claude_api": claude}, store, World())
+    assert "goal achieved" not in " ".join(notices(store))
+    assert terms_alerts(store) and "goal_budget_usd" in terms_alerts(store)[0]
+    assert claude.prompts == []
+
+
+def test_a_turn_budget_lowered_in_the_repo_file_fails_the_gate(work, store):
+    one_round_then_restart_with_claude(
+        work, store, CLAUDE + "[agents.claude_api]\nturn_budget_usd = 1\n"
+    )
+    codex = Agent("codex")
+    codex.script = [step(lambda: store.request_stop())]
+    run(bg(work), {"codex": codex, "claude_api": Agent("claude_api")}, store, World())
+    assert terms_alerts(store) and "turn_budget_usd" in terms_alerts(store)[0]
+
+
+def test_the_budgets_are_saved_with_the_terms_and_an_old_state_takes_them_as_they_are(
+    work, store, agents, world
+):
+    commit_toml(work)
+    agents["codex"].script = [step(edit_toml_then_stop(work, store, BASE))]
+    run(bg(work), agents, store, world)
+    budgets = store.load_state()["goal_terms"]["budgets"]
+    assert budgets["claude_api"] == {
+        "round_budget_usd": "5",
+        "turn_budget_usd": "50",
+        "goal_budget_usd": "150",
+    }
+    state = store.load_state()
+    del state["goal_terms"]["budgets"]  # a state from before them
+    store.save_state(state)
+    c2 = Agent("codex")
+    c2.script = [step(lambda: store.request_stop())]
+    run(bg(work), {"codex": c2, "antigravity": Agent("antigravity")}, store, world)
+    assert terms_alerts(store) == []
+
+
+def test_a_tracked_file_hidden_with_skip_worktree_is_seen_by_the_fingerprint(work):
+    before = tree_fingerprint(work)
+    git(work, "update-index", "--skip-worktree", "a.txt")
+    (work / "a.txt").write_text("edited behind the mark")
+    hidden = tree_fingerprint(work)
+    (work / "a.txt").write_text("edited again")
+    assert hidden != before and tree_fingerprint(work) != hidden
+    git(work, "update-index", "--no-skip-worktree", "a.txt")
+    git(work, "update-index", "--assume-unchanged", "a.txt")
+    assumed = tree_fingerprint(work)
+    (work / "a.txt").write_text("and again")
+    assert tree_fingerprint(work) != assumed
+
+
+def test_an_edit_hidden_with_skip_worktree_after_an_approval_voids_it(work, store):
+    commit_toml(work)
+    a = fresh()
+
+    def hide():
+        git(work, "update-index", "--skip-worktree", "a.txt")
+        (work / "a.txt").write_text("edited after the other approval")
+
+    a["codex"].script = [approve(work), step(lambda: store.request_stop())]
+    a["antigravity"].script = [step(hide, review(work, "APPROVED"))]
+    (work / "DONE").write_text("x")
+    run(bg(work), a, store, World())
+    assert "goal achieved" not in " ".join(notices(store))
+    assert "goal achieved" not in [e["reason"] for e in ev(store, "finished")]
+
+
+def under_a_round(monkeypatch):
+    monkeypatch.setenv("BATON_ROUND", "1")  # what an agent's shell has
+
+
+@pytest.fixture
+def job(work, store, monkeypatch):
+    """A job named `job` with a goal set, where the CLI looks for it."""
+    monkeypatch.setenv("BATON_STATE_DIR", str(store.root.parent))
+    found = Store(store.root.parent / "job")
+    found.set_goal(GOAL)
+    (found.root / "job.json").write_text(json.dumps({"workdir": str(work)}))
+    return found
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["goal", "job", "another goal"],
+        ["goal", "job", "--off"],
+        ["next", "job"],
+        ["stop", "job"],
+        ["restart"],
+    ],
+)
+def test_the_steering_commands_refuse_inside_a_round(job, monkeypatch, capsys, argv):
+    under_a_round(monkeypatch)
+    assert cli(argv) == 2
+    assert "refused" in capsys.readouterr().err
+    assert job.goal() == GOAL and job.stop_request() == "" and not job.next_pending()
+
+
+def test_the_steering_commands_work_outside_a_round(job, monkeypatch, capsys):
+    monkeypatch.delenv("BATON_ROUND", raising=False)
+    assert cli(["stop", "job"]) == 0
+    assert "stop requested" in capsys.readouterr().out
+    assert job.stop_request() == "soon"
+
+
+def test_an_agent_cannot_accept_its_own_weakened_terms_with_baton_goal(work, job, monkeypatch):
+    commit_toml(work)
+    a = fresh()
+    a["codex"].script = [
+        step(plan(work, "t"), edit_toml_then_stop(work, job, BASE.replace("test -f DONE", "true")))
+    ]
+    run(bg(work), a, job, World())
+    b = fresh()
+
+    def say():
+        under_a_round(monkeypatch)
+        assert cli(["goal", "job", GOAL]) == 2  # the same words, from the agent's own shell
+        job.request_stop()
+
+    b["codex"].script = [step(say)]
+    run(bg(work), b, job, World())
+    c = fresh()
+    c["codex"].script = [approve(work), step(lambda: job.request_stop())]
+    c["antigravity"].script = [approve(work)]
+    run(bg(work), c, job, World())
+    assert "goal achieved" not in [e["reason"] for e in ev(job, "finished")]
+    assert terms_alerts(job)
+
+
+def test_an_agent_cannot_erase_the_goal_with_baton_goal_off(work, job, monkeypatch):
+    commit_toml(work)
+
+    def off():
+        under_a_round(monkeypatch)
+        touch(work)()
+        assert cli(["goal", "job", "--off"]) == 2
+        job.request_stop()
+
+    a = fresh()
+    a["codex"].script = [step(plan(work, "t"), off)]
+    run(bg(work), a, job, World())
+    assert job.goal() == GOAL
+
+
+def test_a_goal_set_during_a_round_of_a_run_without_phases_never_ends_on_that_round(
+    work, store, monkeypatch
+):
+    monkeypatch.setenv("BATON_STATE_DIR", str(store.root.parent))
+    job = Store(store.root.parent / "job")  # no goal when the run starts
+    (job.root / "job.json").write_text(json.dumps({"workdir": str(work)}))
+    plain = 'order = ["codex", "antigravity"]\nsnapshot = true\n'
+    toml(work, "phases = false\n" + plain)
+    a = fresh()
+
+    def edit_and_set():
+        toml(work, plain)  # the file now says phases on, so `baton goal` is not refused
+        assert cli(["goal", "job", GOAL]) == 0
+
+    a["codex"].script = [step(edit_and_set)]
+    world = World()
+    run(bg(work), a, job, world, stop_when_held(job, world))
+    assert [e["reason"] for e in ev(job, "finished")] == []
+    assert job.goal() == GOAL and last(job)["kind"] == "stopped"

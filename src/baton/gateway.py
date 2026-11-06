@@ -72,7 +72,7 @@ RESTART_POLL_S = 1.0
 INBOX_DB_TIMEOUT_S = 1.0
 # What a note taken from the inbox waits for its echo, the later POST of the same words, before
 # it is forgotten (the person may have cancelled that message in OpenCode, which sends nothing).
-INBOX_TAKEN_TTL_S = 24 * 3600.0
+INBOX_TAKEN_TTL_S = 7 * 24 * 3600.0
 INBOX_SEEN_MAX = 500
 DELIVERED = "that message was already delivered"
 # What an agent is told when the person clears the goal: a resumed one still remembers it.

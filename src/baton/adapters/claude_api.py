@@ -237,6 +237,16 @@ def _cost(value: object) -> Decimal | None:
     return number if number.is_finite() and number >= 0 else None
 
 
+def _added(total: Decimal, last: Decimal | None) -> Decimal:
+    """What a round added to its session: the total is cumulative, so only the part past the
+    total the session had reported before counts. A session with no saved total is charged the
+    whole figure, and so is a total below the saved one (not zero): a restarted counter. A zero
+    (a crash may report one) adds nothing."""
+    if total == 0:
+        return Decimal(0)
+    return total if last is None or total < last else total - last
+
+
 def _summary(text: str) -> str:
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     return (lines[-1] if lines else "")[:300]
@@ -256,7 +266,9 @@ class _Stream:
         self.has_result = False
         self.is_error = False
         self.subtype = ""
-        self.cost: Decimal | None = None
+        self.session = ""  # the id the init event gave
+        self.total: Decimal | None = None  # the session's total so far, as reported
+        self.cost: Decimal | None = None  # what this round added to it: what the ledger charges
         self.kept: Decimal | None = None  # the reservation the ledger went on counting
         self.result_text = ""
         self.kinds: set[str] = set()
@@ -672,6 +684,7 @@ class ClaudeApiAdapter:
             session = event.get("session_id")
             if not stream.session_reported and isinstance(session, str) and session:
                 stream.session_reported = True
+                stream.session = session
                 ctx.on_session(session)
         elif kind in ("assistant", "user", "stream_event") and not stream.verified:
             return RoundResult(
@@ -688,9 +701,13 @@ class ClaudeApiAdapter:
             stream.is_error = event.get("is_error") is True
             subtype = event.get("subtype")
             stream.subtype = subtype if isinstance(subtype, str) else ""
-            cost = _cost(event.get("total_cost_usd"))
-            if cost is not None:
-                stream.cost = cost if stream.cost is None else max(stream.cost, cost)
+            total = _cost(event.get("total_cost_usd"))
+            if total is not None:
+                stream.total = total if stream.total is None else max(stream.total, total)
+                stream.cost = _added(stream.total, ctx.session_total)
+                session = stream.session or ctx.session_id
+                if session and stream.total > 0:  # a zero says nothing about the session
+                    ctx.on_session_total(session, stream.total)
             texts = []
             if isinstance(event.get("result"), str):
                 texts.append(event["result"])

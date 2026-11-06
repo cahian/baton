@@ -47,13 +47,17 @@ def open_tasks(text: str) -> list[str]:
 _APPROVED_RE = re.compile(r"APPROVED(?:\s*$|\s*[.:\u2014-])", re.IGNORECASE)
 
 
-def verdict(text: str) -> str:
-    """ "approved" when the first non-blank line is APPROVED (any case) as a word, followed by
-    nothing or by `.`, `:`, `-` or an em dash, else "changes": a missing, empty or malformed
-    review never approves, and neither does `APPROVED only if ...`."""
+def verdict(text: str, strict: bool = False) -> str:
+    """ "approved" when the first non-blank line starts with APPROVED (any case), else "changes":
+    a missing, empty or malformed review never approves. With `strict` (consensus, where the
+    goal ends) it must be APPROVED as a word, followed by nothing or by `.`, `:`, `-` or an em
+    dash: `APPROVED only if ...` does not approve."""
     for line in (text or "").splitlines():
         if line.strip():
-            return "approved" if _APPROVED_RE.match(line.lstrip("\ufeff \t")) else "changes"
+            line = line.lstrip("\ufeff \t")
+            if strict:
+                return "approved" if _APPROVED_RE.match(line) else "changes"
+            return "approved" if line.upper().startswith("APPROVED") else "changes"
     return "changes"
 
 

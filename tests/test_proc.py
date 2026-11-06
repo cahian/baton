@@ -880,6 +880,23 @@ def test_plain_env_reaches_the_child_and_is_not_redacted(tmp_path):
     assert "model=claude-sonnet-5-5" in shown
 
 
+def test_baton_round_is_set_last_so_nothing_an_adapter_passes_unsets_it(tmp_path):
+    ctx = make_ctx(tmp_path)
+    shown = []
+    ctx.on_output = shown.append
+    run_streaming(
+        py("import os; print('round=' + os.environ['BATON_ROUND'])"),
+        tmp_path,
+        None,
+        ctx,
+        never,
+        lambda: None,
+        plain_env={"BATON_ROUND": "0"},
+        scrub=("BATON_*",),
+    )
+    assert "round=1" in shown
+
+
 def test_a_secret_split_across_two_chunks_is_still_redacted(tmp_path):
     secret = "fake-ant-api03-SPLITSPLITSPLIT"
     # one line, longer than the 64 KB chunk, with the secret straddling the cut
@@ -1214,6 +1231,8 @@ def test_scrub_drops_every_variable_that_matches_before_the_adapter_adds_its_own
         ("token=abc12345#comment", "token=[masked]#comment"),
         ("password=$ecretPass1!", "password=[masked]"),
         ("secret: Zz9+/abcdefgh=", "secret: [masked]"),
+        ('token_budget="10000000"', 'token_budget="[masked]"'),  # quoted: still a value
+        ("token_budget=10000000a", "token_budget=[masked]"),
     ],
 )
 def test_mask_secrets_keeps_the_name_and_hides_the_value(text, shown):
@@ -1251,6 +1270,7 @@ def test_mask_secrets_keeps_the_name_and_hides_the_value(text, shown):
         "token = AuthToken",
         "const token = readToken(req);",
         "max_tokens=4096",
+        "token_budget=10000000",
         "token_url=https://example.com/oauth/token",
         "password_file=/etc/app/password",
         "",

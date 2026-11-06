@@ -2,7 +2,7 @@
 
 ## Intent
 
-A single long coding goal should keep moving for days across up to three agents, in this order: Codex (GPT-6.1 Sol), Antigravity (Gemini 4 Argon) and Claude Opus 5.5 through an organization API key, all at medium effort, without a person restarting anything and without ever spending pay-as-you-go credits. Claude is optional: baton works with Codex and Antigravity alone, and Claude only joins, as a backup, once a key file exists.
+A single long coding goal should keep moving for days across up to three agents, in this order: Codex (GPT-6.1 Sol), Antigravity (Gemini 4 Argon) and Claude Opus 5.5 through an organization API key, all at medium effort, without a person restarting anything and without ever spending pay-as-you-go credits. Claude is optional: baton works with Codex and Antigravity alone, and Claude only joins the queue, last in the default order, once a key file exists.
 
 The real failure this exists to prevent: at 100% of its included usage, the Codex CLI keeps working and silently debits account credits. No error is raised and no 429 reaches the client. Any design that waits for a limit error loses money first. Limits must be read and acted on before they are reached.
 
@@ -52,11 +52,11 @@ snapshot uncommitted work
 run gate
 ```
 
-Agents come in two kinds. Plan agents (`codex`, `antigravity`) have included usage that comes back at a reset; a metered agent (`claude_api`) is paid by use and has no reset that would ever stop it, so it would run until the credit is gone. The rotation therefore treats a metered agent as a fallback, wherever it appears in `order`:
+Agents come in two kinds. Plan agents (`codex`, `antigravity`) have included usage that comes back at a reset; a metered agent (`claude_api`) is paid by use and has no reset that would ever stop it, so its turn is bounded by money as well as time. The default queue is `codex`, `antigravity`, `claude_api`, and the rotation treats every agent alike, except that Claude has more limits:
 
-- The current plan agent keeps working until it becomes unavailable, then the rotation moves to the next plan agent in `order`, wrapping around. A plan agent that comes back does not preempt another plan agent that is working.
-- A metered agent runs only while no plan agent is available. It is optional: with no key file for `claude_api` (or `enabled = false`) it is simply never available, and the rotation is the two plan agents alone.
-- While a metered agent runs, the plan agents are read (without a model call) from their reset time onward. As soon as one reads available, the metered round is killed and that agent takes over. If both are available, the first in `order` goes first. This preemption is not a failure and gives the metered agent no cooldown.
+- The current agent keeps working until it becomes unavailable or its turn ends, then the rotation moves to the next agent in `order`, wrapping around. An agent that comes back does not preempt another that is working. A turn ends after `turn_max_s` (5 hours) for every agent, and for Claude also after `turn_budget_usd` (USD 50), whichever comes first. A goal leaves Claude out of the queue after `goal_budget_usd` (USD 150) spent in that goal.
+- Claude is optional: with no key file for `claude_api` (or `enabled = false`) it is simply never available, and the queue is the two plan agents alone. Claude's cost is cumulative per session, so a resumed round is charged only what it added to the session's last reported total, and a round that reports none counts its whole reservation.
+- With `reserve = true` under `[agents.claude_api]`, Claude instead leaves the queue and runs only while no other agent is available (the older fallback). While it runs, the plan agents are read (without a model call) from their reset time onward, and as soon as one reads available the Claude round is killed and that agent takes over. This preemption is not a failure and gives Claude no cooldown. The rest of this list applies to that mode.
 - A plan agent that reads available but whose round, right after such a preemption, fails (anything but `completed` or `timeout`) within 300 s is blocked from preempting: it is no longer read while a metered agent runs, so one bad agent cannot cost a metered round per attempt. The block is kept in `state.json`. It ends when a round of that agent completes, times out or lasts at least 300 s. At a round boundary the agent is still picked as usual. An agent that carries the mark from its preemption and then reads not available in that pick (the watcher read it available, the pick says no) is blocked at once, as if its round had failed immediately.
 - At most 6 preemptions (`MAX_PREEMPTS_PER_DAY`) are made in any 24 hours, whatever the cause: the times are kept in `state.json`, and once 6 are in the window the plan agents are no longer read while a metered agent runs, bounding the ledger overcount at 6 rounds' budgets a day. Selection at a round boundary is unaffected, and `baton status` says when the cap is active.
 - With no agent available, the wait ends at the earliest known reset.
@@ -168,7 +168,7 @@ Prompt on stdin. The key is read from `key_file` at spawn and passed only in tha
 
 Spend tracking is a ledger shared across all goals at `~/.local/state/baton/claude-spend.json`, updated under a lock:
 
-- Spend comes from `total_cost_usd` in the `result` event. It is a local estimate, so `reserve_pct` also absorbs its error.
+- Spend comes from `total_cost_usd` in the `result` event. It is a local estimate, so `reserve_pct` also absorbs its error. It is the session's total so far, so a resumed round is charged only the difference from the total last saved for that session (`session_totals` in `state.json`), and the ledger settles that same difference.
 - A period starts on `budget_reset_day` (default 1) at 00:00 UTC.
 - Before a round, atomically reserve `round_budget_usd` (default 5). If spent plus all live reservations plus the round would pass the ceiling, shrink the round to what is left; below 5 USD the agent is unavailable until the next period.
 - After a round, replace the reservation with the actual cost. If a round ends with no `result` event, the full reservation stays counted. Crashes therefore overcount and never undercount.
@@ -222,7 +222,7 @@ Each provider has a strong model for thinking and a working model for building. 
 | Codex | `gpt-6.1-sol`, medium | `gpt-6.1-terra`, high |
 | Antigravity | `gemini-4-argon-medium` | `gemini-3.8-flash-high` |
 
-This is orthogonal to rotation. Who works is still decided by the scheduler: Codex and Antigravity alternate, and Claude runs only while both are out. Phases decide what that agent does and which of its two models runs. A handover in the middle of a phase continues the same phase on the next agent, at the same tier.
+This is orthogonal to rotation. Who works is still decided by the scheduler: the agents take turns in `order` (Codex, Antigravity, Claude), and Claude's turn also ends at USD 50. Phases decide what that agent does and which of its two models runs. A handover in the middle of a phase continues the same phase on the next agent, at the same tier.
 
 **The cycle.** State lives in `.baton/PLAN.md` and `.baton/REVIEW.md`, so any provider can continue it.
 

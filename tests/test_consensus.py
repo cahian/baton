@@ -6,6 +6,7 @@ import pytest
 from test_phases import Agent, close, git, plan, review, step, touch
 from test_runner import World, costing, make_goal, result
 
+from baton import runner
 from baton.adapters.base import TIMEOUT, TRANSIENT, Availability
 from baton.gateway import render_event
 from baton.runner import run_goal
@@ -398,6 +399,54 @@ def test_a_message_during_consensus_ends_it_and_goes_to_build(go, agents, work, 
     assert store.load_state().get("failed_cycles", 0) == 0  # not a rejection
     assert any("back to build" in m for m in notices(store))
     assert "goal achieved" not in " ".join(notices(store))
+
+
+def test_a_message_while_the_agent_is_picked_ends_consensus_and_no_approval_counts(
+    go, agents, work, store
+):
+    codex = agents["codex"]
+    said = []
+
+    def availability():
+        if not said and (store.load_state().get("consensus") or {}).get("pending"):
+            said.append(True)
+            store.say("use the real device")  # after the check for notes, before the round
+        return Availability(True)
+
+    codex.availability = availability
+    codex.script = [step(touch(work)), step(stop(store))]
+    assert go() == 0
+    assert said and consensus_rounds(store) == []  # no approver was asked
+    assert "Phase: BUILD" in codex.prompts[1] and "use the real device" in codex.prompts[1]
+    assert store.load_state()["consensus"] is None
+    assert store.load_state().get("failed_cycles", 0) == 0
+    assert any("back to build" in m for m in notices(store))
+    assert "goal achieved" not in " ".join(notices(store))
+
+
+def test_a_message_during_the_final_check_ends_consensus_instead_of_the_goal(
+    go, agents, work, store, monkeypatch
+):
+    codex, agy = agents["codex"], agents["antigravity"]
+    said = []
+    original = runner._Run.run_check
+
+    def run_check(self, with_goal):
+        found = original(self, with_goal)
+        if self.consensus is not None and not said:
+            said.append(True)
+            store.say("one more thing")
+        return found
+
+    monkeypatch.setattr(runner._Run, "run_check", run_check)
+    codex.script = [step(touch(work)), approve(work), step(stop(store))]
+    agy.script = [approve(work)]
+    assert go() == 0
+    assert said and "goal achieved" not in " ".join(notices(store))
+    assert any("back to build" in m for m in notices(store))
+    assert "Phase: BUILD" in codex.prompts[2] and "one more thing" in codex.prompts[2]
+    assert store.goal() == GOAL and store.load_state()["consensus"] is None
+    assert store.load_state().get("failed_cycles", 0) == 0
 
 
 def test_next_during_consensus_rotates_nothing_and_is_dropped_with_a_line(
@@ -926,6 +975,7 @@ def test_a_stale_check_from_an_earlier_goal_is_set_aside_and_the_plan_runs_first
 ):
     (work / ".baton").mkdir()
     (work / ".baton" / "VERIFY.sh").write_text("exit 0\n# the old goal's check\n")
+    store.save_state({"workdir": str(work), "goal_seen": "the earlier goal"})  # not the first goal
     goal = make_goal(tmp_path, work, verify=None, snapshot=True)
     agents["codex"].script = [step(stop(store))]
     run_goal(goal, agents, store, world.clock, world.sleep)
@@ -934,6 +984,24 @@ def test_a_stale_check_from_an_earlier_goal_is_set_aside_and_the_plan_runs_first
     (moved,) = (work / ".baton" / "archive").glob("*-VERIFY.sh")
     assert "the old goal's check" in moved.read_text()
     assert events(store, "gate")[0]["tail"] == "no check"
+
+
+def test_a_check_there_before_the_first_goal_is_kept_and_shown_to_the_approvers(
+    tmp_path, work, store, agents, world
+):
+    (work / ".baton").mkdir()
+    (work / ".baton" / "VERIFY.sh").write_text("exit 0\n# the person's own check\n")
+    goal = make_goal(tmp_path, work, verify=None, snapshot=True)
+    agents["codex"].script = [approve(work)]
+    agents["antigravity"].script = [approve(work)]
+    assert run_goal(goal, agents, store, world.clock, world.sleep) == 0
+    assert "using the existing .baton/VERIFY.sh as the goal's check" in notices(store)
+    assert events(store, "gate")[0]["passed"] is True  # it was the check from the start
+    assert "# the person's own check" in agents["codex"].prompts[0]
+    assert "Phase: PLAN" not in agents["codex"].prompts[0]
+    (moved,) = (work / ".baton" / "archive").glob("*-VERIFY.sh")  # set aside when the goal ended
+    assert "the person's own check" in moved.read_text()
+    assert last_event(store)["reason"] == "goal achieved"
 
 
 def test_a_plan_with_tasks_but_no_check_stays_in_plan(tmp_path, work, store, agents, world):

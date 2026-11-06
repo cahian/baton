@@ -49,7 +49,14 @@ class Fake:
             ctx.on_spawn(1)  # the process started; a refused start never gets here
         if self.announce:
             ctx.on_session(self.announce)
-        return step(self, prompt, ctx) if step else RoundResult(COMPLETED)
+        if step:
+            return step(self, prompt, ctx)
+        # A goal ends only in consensus, never on a round: a round with nothing scripted, under
+        # a goal, asks for the stop that ends the job instead.
+        job = Store(state_dir(gateway.job_name(SESSION)))
+        if job.goal():
+            job.request_stop()
+        return RoundResult(COMPLETED)
 
     def render(self, line):
         return line
@@ -1966,7 +1973,19 @@ def test_the_same_words_twice_are_counted_and_consumed_twice(gw, tmp_path):
     batch.close()
 
 
-def test_an_entry_older_than_a_day_is_ignored_and_dropped(gw, tmp_path):
+def test_an_echo_entry_lasts_seven_days():
+    digest = hash_of("typed long ago")
+    messages = [{"role": "user", "content": "typed long ago"}]
+    week = 7 * 24 * 3600.0
+    taken = {digest: {"n": 1, "at": 100.0}}
+    echoed, marks = gateway._consume_echoes(messages, set(), taken, 100.0 + week - 1)
+    assert echoed is True and marks and taken == {}  # six days and more: still its echo
+    taken = {digest: {"n": 1, "at": 100.0}}
+    echoed, marks = gateway._consume_echoes(messages, set(), taken, 100.0 + week + 1)
+    assert echoed is False and marks == [] and taken == {}  # forgotten, not matched
+
+
+def test_an_entry_older_than_a_week_is_ignored_and_dropped(gw, tmp_path):
     release = threading.Event()
     gw.agents["claude_api"].script = [wait_event(release, "busy")]
     first = gw.stream("go")
@@ -1974,7 +1993,7 @@ def test_an_entry_older_than_a_day_is_ignored_and_dropped(gw, tmp_path):
     add_inbox_row(tmp_path, "row1", "typed long ago")
     gw.manager.poll_inbox()
     job = gw.job()
-    job._inbox_taken[hash_of("typed long ago")]["at"] -= 25 * 3600
+    job._inbox_taken[hash_of("typed long ago")]["at"] -= 8 * 24 * 3600
     again = gw.stream("go", "typed long ago")  # a new message now, with the same words
     release.set()
     again.read_all()
@@ -2334,6 +2353,25 @@ def test_goal_starts_a_job_with_its_text_as_the_objective(gw):
     assert "baton: goal" not in prompt
 
 
+def test_the_first_goal_keeps_a_check_that_was_there_before_it(gw):
+    (gw.work / ".baton").mkdir()
+    (gw.work / ".baton" / "VERIFY.sh").write_text("exit 1\n# the person's own check\n")
+    seen = []
+
+    def round_one(agent, prompt, ctx):
+        seen.append((gw.work / ".baton" / "VERIFY.sh").exists())
+        session_store().request_stop()
+        return RoundResult(COMPLETED)
+
+    gw.agents["claude_api"].script = [round_one]
+    s = gw.stream("baton: goal make the build green")
+    text = s.read_all()
+    s.close()
+    assert "[baton] using the existing .baton/VERIFY.sh as the goal's check" in text
+    assert seen == [True]
+    assert not list((gw.work / ".baton" / "archive").glob("*-VERIFY.sh"))
+
+
 @pytest.mark.refusals
 def test_goal_is_refused_with_phases_off_and_starts_nothing(gw):
     (gw.work / "baton.toml").write_text("phases = false\n")
@@ -2585,7 +2623,7 @@ def test_the_post_of_a_command_row_follows_the_job_and_does_nothing_more(gw, tmp
     session_store().set_goal("set again by hand")
     again = gw.stream("first request", "baton: goal off")  # OpenCode posts what it queued
     release.set()
-    assert "[baton] done" in again.read_all()
+    assert "[baton] stopped after round" in again.read_all()  # a goal is set: never `done`
     again.close()
     first.read_all()
     first.close()
@@ -2709,7 +2747,7 @@ def test_the_echo_of_a_goal_row_on_a_stopped_job_starts_it_without_setting_the_g
     echo = gw.stream("go", "baton: goal first goal")
     reply = echo.read_all()
     echo.close()
-    assert "already delivered" not in reply and "[baton] done" in reply
+    assert "already delivered" not in reply and "[baton] stopped after round" in reply
     assert "goal set" not in reply
     assert session_store().goal() == "set later"
     prompts = gw.agents["claude_api"].prompts[rounds:]

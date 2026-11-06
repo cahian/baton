@@ -576,6 +576,12 @@ def test_the_allowed_models_reach_every_round_as_the_pair(fake, tmp_path, tier, 
     assert any(a.startswith("hooks.PreToolUse=") for a in call["argv"])
 
 
+def test_the_round_carries_baton_round_in_its_environment(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("BATON_ROUND", "")
+    adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path))
+    assert fake.exec_calls()[0]["baton_env"]["BATON_ROUND"] == "1"
+
+
 def test_the_hook_is_given_per_run_with_no_file_written(fake, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     adapter(fake.bin, Reads(limits())).run_round("go", make_ctx(tmp_path))

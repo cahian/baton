@@ -68,6 +68,18 @@ def goals_allowed_by_default(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def outside_a_round():
+    """Baton's own tests run in no agent's round: the steering commands refuse under
+    `BATON_ROUND`, so a stray one is dropped (and put back afterwards)."""
+    saved = os.environ.pop("BATON_ROUND", None)
+    yield
+    if saved is not None:
+        os.environ["BATON_ROUND"] = saved
+    else:
+        os.environ.pop("BATON_ROUND", None)
+
+
+@pytest.fixture(autouse=True)
 def isolated_baton_files(tmp_path, monkeypatch):
     """No test reads the real defaults file or touches the real spend ledger."""
     monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "config" / "defaults.toml"))

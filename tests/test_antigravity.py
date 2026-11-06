@@ -683,6 +683,13 @@ def test_stdin_closed(fake, tmp_path):
     assert res.outcome == COMPLETED and res.reason == ""
 
 
+def test_the_round_carries_baton_round_in_its_environment(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("BATON_ROUND", "")
+    adapter(fake.bin, Reads()).run_round("go", make_ctx(tmp_path))
+    (call,) = fake.calls()
+    assert call["baton_env"]["BATON_ROUND"] == "1"
+
+
 def test_round_runs_in_the_workdir_with_the_prompt_in_argv(fake, tmp_path):
     work = tmp_path / "work"
     work.mkdir()

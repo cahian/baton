@@ -20,7 +20,27 @@ is resumed when its turn comes again.
 Inside a goal the work follows a cycle of plan, build and review, with a strong and a working
 model per provider (see [Phases](#phases-plan-build-review)).
 
-![How baton works: Codex and Antigravity rotate, Claude takes its turn after them, and every goal runs plan, build, review and verify.](docs/assets/baton-diagram.png)
+```mermaid
+flowchart LR
+    subgraph queue["The queue: one agent runs at a time"]
+        direction LR
+        codex["codex"] --> antigravity["antigravity"] --> claude["claude"]
+        claude -. "turn ends: back to the first" .-> codex
+    end
+    queue --> cycle
+    subgraph cycle["Every cycle of a goal"]
+        direction LR
+        plan["plan"] --> build["build"] --> review["review"]
+    end
+    review --> check{"the check passes?"}
+    check -- "no: back to plan" --> plan
+    check -- yes --> consensus["consensus: every agent approves"]
+    consensus -- "an agent asks for changes" --> build
+    consensus -- "all approve" --> done(["done"])
+```
+
+How baton works: Codex, Antigravity and then Claude take turns; every goal runs plan, build and
+review, then the check, then consensus of every agent, and only then is it done.
 
 ## What you need
 
@@ -291,7 +311,7 @@ The turn of a reserve Claude never ends. The limits are settings (`turn_max_s` f
 seconds, default 18000; `turn_budget_usd`, default 50, and `goal_budget_usd`, default 150, for
 Claude). They go in `defaults.toml` or in a goal file. A repository's `baton.toml` may only lower
 them (and `round_budget_usd`), may not turn a `reserve` off, and may not enable an agent that
-`defaults.toml` disables. A round that ends without a cost report (killed, timed out) counts its
+`defaults.toml` disables. Claude reports a session's cost as a running total, so a resumed round counts only what it added to the last total baton saved for that session. A round that ends without a cost report (killed, timed out) counts its
 whole reservation against the turn and the goal, as the ledger does. Change the
 order, or disable an agent, in the goal file.
 
@@ -386,7 +406,9 @@ only with a check that exists.
   approved. Everyone approving ends the goal: `[baton] goal achieved: check passed, approved by
   codex, antigravity, claude_api`, and the goal is archived.
 - **The goal's terms are saved.** When a goal is first seen baton saves its terms in `state.json`
-  (`goal_terms`: the verify command, `order`, and which agents are enabled). A later difference, from
+  (`goal_terms`: the verify command, `order`, which agents are enabled, and every agent's
+  `round_budget_usd`, `turn_budget_usd` and `goal_budget_usd`, which a repository's `baton.toml` may
+  lower and so take Claude out of consensus). A later difference, from
   a `baton.toml` an agent edited or anything else, fails the gate with `the goal's terms changed:
   <what>` and an alert, and voids a consensus under way, until the person sets the goal again with
   `baton: goal` or `baton goal` (the same words will do), which saves the terms as they are.
@@ -402,10 +424,19 @@ only with a check that exists.
 - **No giving up.** Every 3 cycles that end with a failed gate or a rejection, baton alerts `no
   progress in N cycles: still working`, and carries on.
 
-What this does not stop: agents run with full access to the machine, so one could in principle
-write to baton's own state directory (the goal file, `state.json`, `verify.first.sh`); consensus
-guards the work and the check, not baton from the agents it runs. Helper files a check calls
-beside it are not locked either.
+**Hardening, and the trust boundary.** Every git call baton makes runs with `core.fsmonitor`,
+`core.hooksPath` and `core.pager` neutralised, so those cannot run a program inside baton. Other
+config still can: a repository's `filter.*` (clean and smudge) programs run inside git, and baton
+does not disable filters. What stops them forging an approval is the order: an approver's
+`REVIEW.md` is read before baton's next git call. The tree record
+also covers tracked files hidden with `skip-worktree` or `assume-unchanged`. Baton sets
+`BATON_ROUND=1` in every agent's environment, and the commands that steer a goal (`baton goal`,
+`next`, `restart` and `stop`) refuse to run under it, so an agent's shell cannot accept its own
+changed terms or clear the goal. This only raises the bar: agents run as the same user with full
+access to the machine, so a determined agent can still write to baton's own state directory (the
+goal file, `state.json`, `verify.first.sh`) or unset the variable. The protection is the check and
+the consensus, which guard the work and the check, not baton from the agents it runs. Helper files
+a check calls beside it are not locked either.
 
 **Subagents are allowed on the provider's two models.** A subagent may use only the strong or the
 working model of its provider, exactly, and what enforces that differs by provider.

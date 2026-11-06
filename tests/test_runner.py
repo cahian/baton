@@ -6,6 +6,7 @@ import threading
 import time
 import types
 from dataclasses import replace
+from decimal import Decimal
 
 import pytest
 
@@ -575,6 +576,47 @@ def test_resume_failure_reruns_fresh_and_clears_id(tmp_path, work, go, agents, s
     assert store.load_state()["round"] == 5
 
 
+def test_a_sessions_total_is_saved_handed_back_and_forgotten_with_the_session(
+    go, agents, work, store
+):
+    seen = []
+
+    def report(session, total):
+        def step(agent, prompt, ctx):
+            seen.append(ctx.session_total)
+            ctx.on_session(session)
+            ctx.on_session_total(session, Decimal(total))
+            return RoundResult(COMPLETED)
+
+        return step
+
+    def lost(agent, prompt, ctx):
+        seen.append(ctx.session_total)
+        ctx.on_session_total(ctx.session_id, Decimal("99"))
+        return RoundResult(TRANSIENT, reason="resume failed: gone", resume_failed=True)
+
+    agents["codex"].script = [report("s1", "5"), report("s1", "10"), lost, done(work)]
+    assert go() == 0
+    # none for a fresh session, then what it last reported; a failed resume keeps nothing
+    assert seen == [None, Decimal("5"), Decimal("10")]
+    assert store.load_state()["session_totals"] == {}
+
+
+def test_a_state_without_session_totals_loads_and_charges_the_whole_figure(go, agents, work, store):
+    store.save_state({"workdir": str(work), "sessions": {"codex": "c1"}, "round": 3})
+    seen = []
+
+    def step(agent, prompt, ctx):
+        seen.append((ctx.session_id, ctx.session_total))
+        ctx.on_session_total("c1", Decimal("2.5"))
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [step, done(work)]
+    assert go() == 0
+    assert seen == [("c1", None)]
+    assert store.load_state()["session_totals"] == {"c1": "2.5"}
+
+
 # interrupts
 
 
@@ -1042,6 +1084,21 @@ def test_round_tail_holds_the_joined_text(go, work, store):
     prompt = agents["antigravity"].prompts[0]
     assert "half a sentence\n" in prompt
     assert "half a sent\n" not in prompt
+
+
+def test_a_secret_split_across_fragments_is_masked_in_the_tail_and_in_memory(
+    tmp_path, go, work, store, memory
+):
+    def last(agent, prompt, ctx):
+        ctx.on_output("~the password=hun")  # each piece is too short to be a secret
+        ctx.on_output("~ter2hunter now\n")
+        return RoundResult(LIMIT, until=1_000_000.0 + 3600)
+
+    agents = streaming_run(go, store, work, [last])
+    prompt = agents["antigravity"].prompts[0]
+    assert "password=[masked] now" in prompt and "hunter2hunter" not in prompt
+    (entry,) = [r for r in memory.mem().rounds if r.agent == "codex" and r.gate == "none"]
+    assert "password=[masked] now" in entry.round_tail and "hunter2hunter" not in entry.round_tail
 
 
 def test_a_failed_resume_starts_the_fresh_attempt_on_a_clean_line(go, work, store):
@@ -3481,6 +3538,28 @@ def test_the_old_notes_of_a_resumed_session_come_before_a_new_one(go, agents, wo
     prompt = agents["codex"].prompts[0]
     assert prompt.index("ONE") < prompt.index("TWO") < prompt.index("THREE")
     assert prompt.count("TWO") == 1
+
+
+def test_an_old_carried_note_is_not_lost_to_a_new_message_after_the_upgrade(
+    go, agents, work, store
+):
+    store.save_state(
+        {
+            "workdir": str(work),
+            "sessions": {"codex": "c1"},
+            "notes": "OLD UNREAD NOTE",  # a state from before the log: no note_log, no note_seen
+        }
+    )
+    store.say("NEW MESSAGE")
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    prompt = agents["codex"].prompts[0]
+    assert agents["codex"].sessions == ["c1"]
+    assert prompt.index("OLD UNREAD NOTE") < prompt.index("NEW MESSAGE")
+    assert [e["text"].strip() for e in store.load_state()["note_log"]] == [
+        "OLD UNREAD NOTE",
+        "NEW MESSAGE",
+    ]
 
 
 # large notes

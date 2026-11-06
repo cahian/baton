@@ -73,7 +73,12 @@ def prompt_cmd(argv: list[str]) -> None:
     calls = os.environ.get("FAKE_AGY_CALLS")
     if calls:
         with open(calls, "a") as fh:
-            fh.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
+            record = {
+                "argv": argv,
+                "cwd": os.getcwd(),
+                "baton_env": {k: v for k, v in os.environ.items() if k.startswith("BATON")},
+            }
+            fh.write(json.dumps(record) + "\n")
     conversation = os.environ.get("FAKE_AGY_CONVERSATION_ID", "conv-1")
     if "--conversation" in argv:
         conversation = argv[argv.index("--conversation") + 1]
