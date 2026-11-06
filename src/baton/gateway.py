@@ -343,10 +343,15 @@ def render_event(kind: str, f: Mapping) -> str:
         return text if f.get("fragment") else f"{text}\n"
     if kind == "round_start":
         agent, previous, n = f.get("agent"), f.get("previous"), f.get("round")
-        if previous and previous != agent:
+        # A `rotation` event just said it, with its reason: the line is not shown twice.
+        if previous and previous != agent and not f.get("announced"):
             return f"\n[baton] rotation: {previous} -> {agent} (round {n})\n\n"
         resumed = " (resumed)" if f.get("resumed") else ""
         return f"\n[baton] round {n}: {agent}{resumed}\n\n"
+    if kind == "rotation":
+        return (
+            f"\n[baton] rotation: {f.get('previous')} -> {f.get('agent')} ({f.get('reason')})\n\n"
+        )
     if kind == "round_end":
         outcome = f.get("outcome")
         if outcome == "preempted":

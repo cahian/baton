@@ -705,3 +705,34 @@ def test_status_says_nothing_when_verify_runs(fakes, capsys):
     store_for(fakes).save_state({"verify_warning": ""})
     assert main(["status", str(goal)]) == 0
     assert "warning" not in capsys.readouterr().out
+
+
+def test_status_shows_the_turn_and_the_dropped_agents(fakes, capsys):
+    store = store_for(fakes)
+    store.save_state(
+        {
+            "round": 9,
+            "current": "claude_api",
+            "agents": {},
+            "turn": {"agent": "claude_api", "worked_s": 9000, "spent": 12.5},
+            "dropped": ["claude_api", "codex"],
+        }
+    )
+    assert main(["status", str(fakes.goal())]) == 0
+    out = capsys.readouterr().out
+    assert "turn: claude_api, 2.5 hours worked, USD 12.50 spent" in out
+    assert "left out of the queue for this goal: claude_api, codex" in out
+
+
+def test_status_is_silent_about_a_turn_that_has_not_begun_or_is_damaged(fakes, capsys):
+    store = store_for(fakes)
+    for state in (
+        {"round": 1, "agents": {}},
+        {"round": 1, "agents": {}, "turn": {"agent": "", "worked_s": 0, "spent": 0}, "dropped": []},
+        {"round": 1, "agents": {}, "turn": "oops", "dropped": "oops"},
+        {"round": 1, "agents": {}, "turn": {"agent": "codex", "worked_s": "x", "spent": None}},
+    ):
+        store.save_state(state)
+        assert main(["status", str(fakes.goal())]) == 0
+        out = capsys.readouterr().out
+        assert "turn:" not in out and "left out" not in out

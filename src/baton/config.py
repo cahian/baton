@@ -12,6 +12,8 @@ from typing import Any
 
 AGENT_NAMES = ("claude_api", "antigravity", "codex")
 DEFAULT_ORDER = ("codex", "antigravity", "claude_api")
+# How long an agent's turn lasts: 5 hours.
+TURN_MAX_S = 5 * 3600
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -28,6 +30,7 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "poll_s": 15,
         "bin": "codex",
         "full_access": True,
+        "turn_max_s": TURN_MAX_S,
     },
     "antigravity": {
         "enabled": True,
@@ -39,6 +42,7 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "poll_s": 30,
         "bin": "agy",
         "full_access": True,
+        "turn_max_s": TURN_MAX_S,
     },
     # Claude through a Console API key. Its limits are baton's own spend ledger, so it has no
     # threshold or poll interval, and it always runs with permissions skipped (the spec's command).
@@ -53,6 +57,10 @@ _AGENT_DEFAULTS: dict[str, dict[str, Any]] = {
         "reserve_pct": 10,
         "round_budget_usd": Decimal("5"),
         "budget_reset_day": 1,
+        "reserve": False,  # True: Claude waits for the others, as a last resort
+        "turn_max_s": TURN_MAX_S,
+        "turn_budget_usd": Decimal("50"),
+        "goal_budget_usd": Decimal("150"),
         "key_file": "~/.config/baton/anthropic.key",
         "admin_key_file": "",
     },
@@ -90,6 +98,9 @@ GLOBAL_ONLY = ("monthly_budget_usd", "reserve_pct", "budget_reset_day")
 # executables run, which credentials are read, whether the sandbox is on or how rarely the guard
 # reads the limits.
 REPO_FORBIDDEN = ("bin", "key_file", "admin_key_file", "full_access", "poll_s")
+# What a `baton.toml` may set only at or below the default: more time or money per turn, round or
+# goal is the person's to give, and so is giving up the reserve or enabling an agent.
+REPO_LOWER_ONLY = ("turn_max_s", "turn_budget_usd", "goal_budget_usd", "round_budget_usd")
 MAX_THRESHOLD_PCT = 90
 ANTIGRAVITY_MODEL_PREFIX = "gemini-"
 # Whether a goal runs plan, build and review phases when it does not say. Tests turn it off, so
@@ -113,11 +124,15 @@ class AgentConfig:
     poll_s: int
     bin: str
     full_access: bool
+    turn_max_s: int = TURN_MAX_S
     # Only claude_api reads these; the goal file accepts them for no other agent.
     monthly_budget_usd: Decimal = Decimal("200")
     reserve_pct: int = 10
     round_budget_usd: Decimal = Decimal("5")
     budget_reset_day: int = 1
+    reserve: bool = False
+    turn_budget_usd: Decimal = Decimal("50")
+    goal_budget_usd: Decimal = Decimal("150")
     key_file: str = "~/.config/baton/anthropic.key"
     admin_key_file: str = ""
 
@@ -249,6 +264,10 @@ def _load_claude_api(table: dict[str, Any]) -> AgentConfig:
         reserve_pct=_int(table, "reserve_pct", d["reserve_pct"], where, 1, 99),
         round_budget_usd=_usd(table, "round_budget_usd", d["round_budget_usd"], where),
         budget_reset_day=_int(table, "budget_reset_day", d["budget_reset_day"], where, 1, 31),
+        reserve=_bool(table, "reserve", d["reserve"], where),
+        turn_max_s=_int(table, "turn_max_s", d["turn_max_s"], where, 1, 10**7),
+        turn_budget_usd=_usd(table, "turn_budget_usd", d["turn_budget_usd"], where),
+        goal_budget_usd=_usd(table, "goal_budget_usd", d["goal_budget_usd"], where),
         key_file=_str(table, "key_file", d["key_file"], where),
         admin_key_file=_optional_str(table, "admin_key_file", d["admin_key_file"], where),
         **_CLAUDE_FIXED,
@@ -278,6 +297,7 @@ def _load_agent(name: str, table: dict[str, Any]) -> AgentConfig:
         poll_s=_int(table, "poll_s", d["poll_s"], where, 1, 3600),
         bin=os.path.expanduser(_str(table, "bin", d["bin"], where)),
         full_access=_bool(table, "full_access", d["full_access"], where),
+        turn_max_s=_int(table, "turn_max_s", d["turn_max_s"], where, 1, 10**7),
     )
 
 
@@ -425,6 +445,32 @@ def load_goal(path: Path) -> Goal:
     return goal_from_table(rest, name=ref.name, workdir=ref.workdir, objective=objective, path=path)
 
 
+def _check_repo_limits(agent: str, table: dict[str, Any]) -> None:
+    """A `baton.toml` may lower the turn, round and goal limits, and keep or turn on the reserve;
+    it may not raise a limit above the default, turn off a reserve the default has, or enable an
+    agent the defaults disable. A value of another type is left for the builder to reject."""
+    if not any(key in table for key in (*REPO_LOWER_ONLY, "reserve", "enabled")):
+        return
+    ceiling = {**_AGENT_DEFAULTS.get(agent, {}), **load_defaults().get(agent, {})}
+    for key in REPO_LOWER_ONLY:
+        value = table.get(key)
+        if isinstance(value, Decimal) and value.is_nan():  # it cannot be compared
+            raise GoalError(f"agents.{agent}.{key} must be a number")
+        if isinstance(value, int | Decimal) and not isinstance(value, bool) and key in ceiling:
+            if value > ceiling[key]:
+                raise GoalError(
+                    f"agents.{agent}.{key} may not be set above {ceiling[key]} here: a file that "
+                    f"comes with a repository can only lower it (raise it in {defaults_path()})"
+                )
+    for key, kept in (("reserve", True), ("enabled", False)):
+        if table.get(key) is not kept and key in table and ceiling.get(key) is kept:
+            what = "turned off" if key == "reserve" else "turned on"
+            raise GoalError(
+                f"agents.{agent}.{key} may not be {what} here (it is {kept} in "
+                f"{defaults_path()}): a file that comes with a repository can only restrict it"
+            )
+
+
 def check_repo_table(data: dict[str, Any]) -> None:
     """Refuse what a `baton.toml` may not set. A malformed `agents` is left for the builder."""
     if "oneshot" in data:
@@ -434,6 +480,8 @@ def check_repo_table(data: dict[str, Any]) -> None:
         )
     agents = data.get("agents")
     for agent, table in agents.items() if isinstance(agents, dict) else ():
+        if isinstance(table, dict):
+            _check_repo_limits(agent, table)
         for key in REPO_FORBIDDEN:
             if isinstance(table, dict) and key in table:
                 raise GoalError(

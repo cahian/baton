@@ -374,12 +374,18 @@ class Store:
         """Pin the goal the person fixed: every prompt opens with it until they change it."""
         _atomic_write(self._goal, text.strip() + "\n")
 
-    def goal(self) -> str:
-        """The pinned goal, "" when none is set (the goal is on while this is not empty)."""
+    def read_goal(self) -> str | None:
+        """The pinned goal, "" when none is set, and None when it exists but cannot be read."""
         try:
             return self._goal.read_text(encoding="utf-8", errors="replace").strip()
+        except FileNotFoundError:
+            return ""
         except OSError:
-            return ""  # unreadable is no goal, as an unreadable handoff is none
+            return None
+
+    def goal(self) -> str:
+        """The pinned goal, "" when none is set (the goal is on while this is not empty)."""
+        return self.read_goal() or ""  # unreadable is no goal, as an unreadable handoff is none
 
     def clear_goal(self) -> None:
         self._goal.unlink(missing_ok=True)
@@ -398,6 +404,10 @@ class Store:
         if not now and self._next.exists():
             return  # a request already waits, and never downgrade a `now`
         _atomic_write(self._next, "now\n" if now else "soon\n")
+
+    def next_pending(self) -> bool:
+        """Whether a request for the next agent waits, without taking it."""
+        return self._next.exists()
 
     def take_next(self) -> str:
         """The pending request, cleared: "" when none, "now" when forced, otherwise "soon"."""

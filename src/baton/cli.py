@@ -197,6 +197,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 # status, say, stop
 
 
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
 def _when(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -288,6 +294,14 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
             print(f"    reason: {info['reason']}")
         if info.get("usage"):
             print(f"    usage: {json.dumps(info['usage'], sort_keys=True)}")
+    turn = state.get("turn")
+    if isinstance(turn, dict) and turn.get("agent") and _number(turn.get("worked_s")) is not None:
+        worked, spent = _number(turn["worked_s"]), _number(turn.get("spent")) or 0.0
+        print(f"turn: {turn['agent']}, {worked / 3600:.1f} hours worked, USD {spent:.2f} spent")
+    dropped = state.get("dropped")
+    if isinstance(dropped, list) and any(isinstance(a, str) for a in dropped):
+        names = ", ".join(a for a in dropped if isinstance(a, str))
+        print(f"left out of the queue for this goal: {names}")
     phase = state.get("phase")
     if isinstance(phase, dict) and isinstance(phase.get("phase"), str):
         print(f"phase: {phase['phase']} (review cycles used: {phase.get('cycles', 0)})")
@@ -295,7 +309,7 @@ def _print_status(name: str, goal: GoalRef | None) -> int:
     if frees is not None:
         print(
             f"preemption cap: Claude was ended {MAX_PREEMPTS_PER_DAY} times in the last 24 hours "
-            f"to give way to a plan agent, so it is not ended again before {_when(frees)}"
+            f"to give way to another agent, so it is not ended again before {_when(frees)}"
         )
     if state.get("verify_warning"):
         print(f"warning: {state['verify_warning']}")

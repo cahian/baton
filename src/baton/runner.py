@@ -48,7 +48,7 @@ from baton.phases import (
     reason_for,
 )
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, clean_env, kill_group, process_start
-from baton.scheduler import Scheduler, read_availability
+from baton.scheduler import Scheduler, TurnLimits, read_availability
 from baton.store import Store, workdir_lock
 
 GATE_TAIL_CHARS = 4000
@@ -73,7 +73,7 @@ BUILD_ROUNDS_EXTRA = 5
 # How long a job waits before it looks for Superpowers again.
 SKILLS_RETRY_S = 300
 GATE_POLL_S = 0.5
-# While a metered agent runs, the plan agents are read at most this often (seconds), and the
+# While a reserve agent runs, the other agents are read at most this often (seconds), and the
 # watcher is given this long to finish when the round ends.
 PREEMPT_POLL_S = 30
 PREEMPT_JOIN_S = 2
@@ -458,7 +458,7 @@ def tree_fingerprint(workdir: Path) -> str | None:
 
 
 class PreemptionWatch:
-    """Reads the plan agents from a thread of its own while a metered round runs.
+    """Reads the queue agents from a thread of its own while a reserve round runs.
 
     Every read happens here, never in the stream's callback, so a slow read cannot hold up the
     stream. It looks at most once per `poll_s`, and only at plan agents past their cooldown; each
@@ -501,8 +501,21 @@ class PreemptionWatch:
                 pass  # a failed check leaves the round running
 
 
+def turn_limits(goal: Goal) -> dict[str, TurnLimits]:
+    """What ends each agent's turn, from the goal's settings. Only Claude has budgets."""
+    limits = {}
+    for name, cfg in goal.agents.items():
+        paid = name == "claude_api"
+        limits[name] = TurnLimits(
+            turn_max_s=cfg.turn_max_s,
+            turn_budget_usd=float(cfg.turn_budget_usd) if paid else None,
+            goal_budget_usd=float(cfg.goal_budget_usd) if paid else None,
+        )
+    return limits
+
+
 def preempted_sentence(event: Mapping) -> str:
-    """What the person reads for a `round_end` that ended because a plan agent came back."""
+    """What the person reads for a `round_end` that ended because a queue agent came back."""
     back = event.get("back") or "a plan agent"
     agent, n = event.get("agent"), event.get("round")
     return f"round {n}: {agent} stopped because {back} is available again"
@@ -575,6 +588,14 @@ class _Run:
         self.heads: dict[str, str] = {}
         self.pause_until = 0.0
         self.verify_warning = ""
+        # The goal text the scheduler last heard of: a different one is a new goal.
+        self.goal_seen = ""
+        # A rotation decided and not yet announced: (the agent that gave way, why). It is said at
+        # the next pick, once it is known who takes over.
+        self.rotating: tuple[str, str] | None = None
+        # The agent a `rotation` event just named: its round_start does not say it again.
+        self.announced = ""
+        self.next_stuck = False  # a request for the next agent that could not be taken
         self.oneshot_pinned = False  # set when `oneshot` has pinned the objective, once
         # Long-term memory: built the first time it is needed, None when it is off. A round that
         # started a process waits in `pending` until its gate has run.
@@ -614,20 +635,29 @@ class _Run:
         except Exception:
             return ""
 
-    def nap(self, seconds: float, until: float | None = None) -> None:
+    def nap(self, seconds: float, until: float | None = None, wake_on_next: bool = False) -> None:
         """Sleep `seconds` in steps of at most STEP_S, returning early once a stop is requested
-        (or, with `until`, once the clock gets there). The step count does not depend on the
-        clock, so this always sleeps."""
+        (or, with `until`, once the clock gets there, or, with `wake_on_next`, once the person
+        asks for the next agent). The step count does not depend on the clock, so this always
+        sleeps."""
         remaining = seconds
         while remaining > 0 and (until is None or self.clock() < until):
-            if self.stop_requested():
+            if self.stop_requested() or (wake_on_next and self.next_pending()):
                 return
             step = min(STEP_S, remaining)
             self.sleep(step)
             remaining -= step
 
-    def nap_until(self, until: float) -> None:
-        self.nap(until - self.clock(), until)
+    def nap_until(self, until: float, wake_on_next: bool = False) -> None:
+        self.nap(until - self.clock(), until, wake_on_next)
+
+    def next_pending(self) -> bool:
+        """A request for the next agent waits and can be taken: one that cannot be would end
+        every wait at once, so it is not waited for."""
+        try:
+            return not self.next_stuck and self.store.next_pending()
+        except Exception:
+            return False
 
     def honour_stop(self) -> bool:
         """True, after consuming the request, when a stop was asked for."""
@@ -665,6 +695,7 @@ class _Run:
             "owes_round": self.owes_round,
             "oneshot_pinned": self.oneshot_pinned,
             "verify_warning": self.verify_warning,
+            "goal_seen": self.goal_seen,
             **(
                 {
                     "phase": self.ps.to_json(),
@@ -809,7 +840,7 @@ class _Run:
     def start(self) -> None:
         goal = self.goal
         state = self.store.load_state()
-        sched = Scheduler(goal.order, self.adapters, self.store, self.clock)
+        sched = Scheduler(goal.order, self.adapters, self.store, self.clock, turn_limits(goal))
         group = state.get("group")
         if isinstance(group, int) and not isinstance(group, bool) and group > 1:
             # Under the lock, so this can never be another live runner's agent.
@@ -896,6 +927,8 @@ class _Run:
         self.owes_round = self.owes_round or state.get("owes_round") is True
         warning = state.get("verify_warning")
         self.verify_warning = warning if isinstance(warning, str) else ""
+        seen = state.get("goal_seen")
+        self.goal_seen = seen if isinstance(seen, str) else ""
         prepare_workdir(goal)
         if self.phases:
             self.start_phases(state, same_dir)
@@ -971,7 +1004,7 @@ class _Run:
                 seconds=max(0.0, until - self.clock()),
                 agents=self.sched.snapshot()["agents"] if self.sched else {},
             )
-            self.nap_until(until)
+            self.nap_until(until, wake_on_next=True)
         if self.honour_stop():
             return 0
         if self.skills is None and not self.load_skills():
@@ -989,9 +1022,14 @@ class _Run:
             self.nap_until(until)
             return None
         assert self.sched is not None
+        self.sync_goal()
+        if self.take_next():
+            self.rotate("asked by the person")
         # A review goes to someone other than the agent that built, when another can take it.
         avoid = self.builder if self.phases and self.ps.phase == REVIEW else ""
         adapter = self.sched.pick(avoid=avoid) if avoid else self.sched.pick()
+        if adapter is not None and self.rotating:
+            self.announce_rotation(adapter.name)
         self.sched.save()
         if adapter is None:
             until = self.sched.next_wake()
@@ -1001,11 +1039,79 @@ class _Run:
                 seconds=max(0.0, until - self.clock()),
                 agents=self.sched.snapshot()["agents"],
             )
-            self.nap_until(until)
+            self.nap_until(until, wake_on_next=True)
             return None
         if self.run_round(adapter) and not self.unread_notes():
             return self.finish("round completed")
         return None
+
+    def sync_goal(self) -> None:
+        """A goal set, changed or cleared since the last look is a new one: the agents left out
+        for its budget come back and its spend starts again. Only between rounds. A goal that
+        cannot be read is not a change."""
+        assert self.sched is not None
+        current = self.store.read_goal()
+        if current is None or current == self.goal_seen:
+            return
+        self.goal_seen = current
+        self.sched.new_goal()
+        self.persist_softly()
+
+    def take_next(self) -> bool:
+        """Take the person's request for the next agent: True when there was one."""
+        try:
+            asked = self.store.take_next()
+        except OSError:
+            self.next_stuck = True
+            return False
+        self.next_stuck = False
+        return bool(asked)
+
+    def rotate(self, reason: str) -> None:
+        """Hand the queue to the next agent. It is announced at the next pick, because only then
+        is it known who runs: the next one may be unavailable, or the only one. A rotation
+        already waiting to be announced is not made again: a second request in the meantime
+        (a `next` while the gate runs) only changes its reason."""
+        assert self.sched is not None
+        if self.rotating:
+            self.rotating = (self.rotating[0], reason)
+            return
+        self.rotating = (self.sched.current, reason)
+        self.sched.rotate()
+
+    def announce_rotation(self, agent: str) -> None:
+        """Say the rotation decided, now that `agent` is the one picked. When it is the one that
+        gave way (nobody else could run), nothing changed: no event, and its turn starts over."""
+        assert self.sched is not None and self.rotating is not None
+        (previous, reason), self.rotating = self.rotating, None
+        if agent == previous:
+            self.sched.new_turn(agent)
+            return
+        self.emit("rotation", round=self.round_no, previous=previous, agent=agent, reason=reason)
+        self.announced = agent
+
+    def end_turn(self, agent: str, spent: float) -> None:
+        """After a round: the goal's budget may leave `agent` out, and the person's `next` or the
+        end of its turn gives the queue to the next one. Rotation happens only here and between
+        rounds, never in the middle of one."""
+        assert self.sched is not None
+        if (
+            spent > 0
+            and self.goal_seen
+            and agent not in self.sched.dropped
+            and self.sched.goal_over(agent)
+        ):
+            self.sched.drop(agent)
+            budget = self.goal.agents[agent].goal_budget_usd
+            self.emit(
+                "alert",
+                agent=agent,
+                message=f"{agent} spent USD {budget:f} in this goal: it is left out of the queue "
+                "until the goal changes",
+            )
+        reason = "asked by the person" if self.take_next() else self.sched.turn_reason(agent)
+        if reason:
+            self.rotate(reason)
 
     def after_cycle_gate(self, passed: bool) -> None:
         """The gate at the end of a cycle is the only judge. Passed: the next cycle, if one is
@@ -1154,9 +1260,12 @@ class _Run:
         preempted = False
         interrupt_at: float | None = None  # a note is waiting for the tool in flight to end
         tools = None  # this round's tool watch, None when the adapter has none or it failed
+        spent = 0.0  # what the round cost, whichever attempt of it reported it
+        announced = self.announced == agent
+        self.announced = ""
         watch = (
             PreemptionWatch(self.sched, self.adapters, PREEMPT_POLL_S)
-            if getattr(adapter, "metered", False)
+            if getattr(adapter, "reserve", False)
             else None
         )
 
@@ -1249,7 +1358,7 @@ class _Run:
             self.persist_softly()
 
         def attempt(session: str | None) -> RoundResult:
-            nonlocal tools
+            nonlocal tools, spent
             make_watch = getattr(adapter, "tool_watch", None)
             try:
                 tools = make_watch() if make_watch is not None else None
@@ -1289,9 +1398,11 @@ class _Run:
                 agent=agent,
                 resumed=session is not None,
                 previous=self.prev_agent,
+                **({"announced": True} if announced else {}),
             )
             try:
                 attempted = adapter.run_round(prompt, ctx)
+                spent += attempted.cost_usd
             except Exception as exc:
                 close_line()  # before any other event of this attempt
                 self.emit("error", error=f"{agent} round failed: {type(exc).__name__}: {exc}")
@@ -1333,6 +1444,7 @@ class _Run:
         ended = self.clock()
         # Record first: nothing after this can lose a credit_guard or limit outcome.
         self.sched.record(agent, result, seconds=ended - started)
+        self.sched.note_round(agent, ended - started, spent, goal=bool(self.goal_seen))
         if result.outcome in (CREDIT_GUARD, AUTH, SUBAGENT):
             self.emit("alert", agent=agent, outcome=result.outcome, reason=result.reason)
         snapshotted = snapshot_work(goal, n, agent)
@@ -1370,8 +1482,10 @@ class _Run:
             interrupted=interrupted,
             snapshot=snapshotted,
             back=watch.back if result.outcome == PREEMPTED and watch is not None else None,
+            cost_usd=round(spent, 6),
             **({"phase": phase} if self.phases else {}),
         )
+        self.end_turn(agent, spent)
         self.persist_softly()
         if spawned and self.memory() is not None:
             # What the scheduler was told stays as it is; the page says what baton did.

@@ -11,7 +11,7 @@ from baton.adapters.base import (
     Availability,
     RoundResult,
 )
-from baton.scheduler import Scheduler
+from baton.scheduler import Scheduler, TurnLimits
 from baton.store import StateError, Store
 
 
@@ -26,9 +26,10 @@ class Clock:
 class Agent:
     """Adapter stand-in: availability is a settable value or a raising callable."""
 
-    def __init__(self, name, metered=False):
+    def __init__(self, name, metered=False, reserve=False):
         self.name = name
         self.metered = metered
+        self.reserve = reserve
         self.avail = Availability(True)
         self.calls = 0
 
@@ -274,7 +275,7 @@ def test_unknown_names_in_state_or_order_are_ignored(env):
 
 def trio(tmp_path, order=("codex", "antigravity", "claude_api"), saved=None):
     clock = Clock()
-    agents = {n: Agent(n, metered=n == "claude_api") for n in order}
+    agents = {n: Agent(n, metered=n == "claude_api", reserve=n == "claude_api") for n in order}
     store = Store(tmp_path / "goal")
     if saved:
         store.save_state(saved)
@@ -749,12 +750,12 @@ def test_avoid_not_the_pick_changes_nothing(env):
     assert sched.current == "codex"
 
 
-def test_avoid_never_returns_a_metered_agent(tmp_path):
+def test_avoid_never_returns_a_reserve_agent(tmp_path):
     clock = Clock()
     agents = {
         "codex": Agent("codex"),
         "antigravity": Agent("antigravity"),
-        "claude_api": Agent("claude_api", metered=True),
+        "claude_api": Agent("claude_api", metered=True, reserve=True),
     }
     agents["antigravity"].avail = Availability(False, reason="out")
     sched = Scheduler(("codex", "antigravity", "claude_api"), agents, Store(tmp_path / "g"), clock)
@@ -813,3 +814,376 @@ def test_the_subagent_count_is_for_one_run_only(env):
     again = make()  # a new run starts the count again
     again.record("codex", RoundResult(SUBAGENT))
     assert again.pick().name == "codex"
+
+
+# the queue: turns, rotation, dropping
+
+HOUR = 3600
+
+
+def queue(
+    tmp_path, limits=None, saved=None, reserve=False, order=("codex", "antigravity", "claude_api")
+):
+    """The three agents. Claude is metered, and waits for the others only with `reserve`."""
+    clock = Clock()
+    agents = {
+        n: Agent(n, metered=n == "claude_api", reserve=reserve and n == "claude_api") for n in order
+    }
+    store = Store(tmp_path / "goal")
+    if saved:
+        store.save_state(saved)
+    return clock, agents, store, Scheduler(order, agents, store, clock, limits)
+
+
+def test_a_metered_agent_that_does_not_reserve_is_in_the_queue_in_order(tmp_path):
+    clock, agents, _, s = queue(tmp_path, order=("claude_api", "codex"))
+    assert s.pick().name == "claude_api"  # first in order, with codex available
+    out(agents["claude_api"], clock)
+    assert s.pick().name == "codex"
+    clock.now += 2 * HOUR
+    agents["claude_api"].avail = Availability(True)
+    assert s.pick().name == "codex"  # sticky: coming back does not preempt
+
+
+def test_a_metered_agent_that_does_not_reserve_is_never_preempting(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    assert s.plan_ready_to_check() == ["codex", "antigravity", "claude_api"]
+    _, _, _, reserved = queue(tmp_path / "other", reserve=True)
+    assert reserved.plan_ready_to_check() == ["codex", "antigravity"]
+
+
+def test_avoid_may_return_a_metered_agent_that_does_not_reserve(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    out(agents["antigravity"], clock)
+    assert s.pick(avoid="codex").name == "claude_api"
+
+
+def test_the_first_pick_starts_a_turn(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    assert s.snapshot()["turn"] == {"agent": "codex", "worked_s": 0, "spent": 0}
+
+
+def test_a_turn_is_over_when_it_has_worked_its_time(tmp_path):
+    clock, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 5 * HOUR - 1, 0)
+    assert not s.turn_over("codex")
+    s.note_round("codex", 1, 0)
+    assert s.turn_over("codex")
+    assert s.turn_reason("codex") == "5 hours"
+
+
+def test_time_that_passes_without_a_round_is_not_worked_time(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", HOUR, 0)
+    out(agents["codex"], clock, 6 * HOUR)  # a limit, then a long wait with nobody else
+    clock.now += 9 * HOUR
+    agents["codex"].avail = Availability(True)
+    assert s.pick().name == "codex"
+    assert not s.turn_over("codex")
+    assert s.snapshot()["turn"]["worked_s"] == HOUR  # the same turn: nothing reset, nothing added
+
+
+def test_a_limit_does_not_reset_the_spend_of_the_turn(tmp_path):
+    limits = {"claude_api": TurnLimits(turn_budget_usd=50.0)}
+    clock, agents, _, s = queue(tmp_path, limits, order=("claude_api", "codex"))
+    s.pick()
+    s.note_round("claude_api", 60, 30.0)
+    s.record("claude_api", RoundResult(LIMIT, until=clock.now + 900))
+    clock.now += 901
+    agents["codex"].avail = Availability(False, until=clock.now + 5000, reason="out")
+    assert s.pick().name == "claude_api"
+    s.note_round("claude_api", 60, 20.0)
+    assert s.turn_reason("claude_api") == "USD 50"
+
+
+def test_the_time_limit_is_per_agent(tmp_path):
+    limits = {"codex": TurnLimits(turn_max_s=2 * HOUR), "antigravity": TurnLimits(turn_max_s=HOUR)}
+    _, _, _, s = queue(tmp_path, limits)
+    s.pick()
+    s.note_round("codex", HOUR + 1, 0)
+    assert not s.turn_over("codex")
+    s.note_round("codex", HOUR, 0)
+    assert s.turn_reason("codex") == "2 hours"
+
+
+def test_a_turn_is_over_at_its_budget_and_says_so(tmp_path):
+    limits = {"claude_api": TurnLimits(turn_budget_usd=50.0)}
+    _, _, _, s = queue(tmp_path, limits, order=("claude_api", "codex"))
+    s.pick()
+    s.note_round("claude_api", 1, 49.5)
+    assert not s.turn_over("claude_api")
+    s.note_round("claude_api", 1, 0.5)
+    assert s.turn_over("claude_api")
+    assert s.turn_reason("claude_api") == "USD 50"
+
+
+def test_the_turn_of_a_reserve_agent_never_ends(tmp_path):
+    limits = {"claude_api": TurnLimits(turn_budget_usd=50.0)}
+    clock, agents, _, s = queue(tmp_path, limits, reserve=True)
+    out(agents["codex"], clock)
+    out(agents["antigravity"], clock)
+    assert s.pick().name == "claude_api"
+    s.note_round("claude_api", 9 * HOUR, 80.0)
+    assert not s.turn_over("claude_api")
+    assert s.turn_reason("claude_api") == ""
+
+
+def test_an_agent_that_is_not_the_turns_is_not_over(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("antigravity", 9 * HOUR, 0)
+    assert not s.turn_over("antigravity")
+    assert s.snapshot()["turn"]["worked_s"] == 0
+
+
+def test_no_turn_is_over_before_one_starts(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    assert not s.turn_over("codex")
+
+
+def test_note_round_adds_to_the_turn_and_to_the_goal_while_one_is_set(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 100, 1.25, goal=True)
+    s.note_round("codex", 50, 0.75, goal=True)
+    snap = s.snapshot()
+    assert snap["turn"] == {"agent": "codex", "worked_s": 150, "spent": 2.0}
+    assert snap["agents"]["codex"]["goal_spent"] == 2.0
+    assert snap["agents"]["antigravity"]["goal_spent"] == 0
+
+
+def test_spend_without_a_goal_goes_to_the_turn_and_not_to_the_goal(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 10, 4.0)
+    snap = s.snapshot()
+    assert snap["turn"]["spent"] == 4.0 and snap["agents"]["codex"]["goal_spent"] == 0
+
+
+def test_a_round_of_another_agent_counts_for_the_goal_and_not_for_the_turn(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("antigravity", 100, 3.0, goal=True)  # a round that ran for avoid, say
+    snap = s.snapshot()
+    assert snap["turn"] == {"agent": "codex", "worked_s": 0, "spent": 0}
+    assert snap["agents"]["antigravity"]["goal_spent"] == 3.0
+
+
+def test_a_review_borrowed_by_claude_counts_in_the_goal_and_not_in_the_turn(tmp_path):
+    limits = {"claude_api": TurnLimits(turn_budget_usd=50.0, goal_budget_usd=150.0)}
+    clock, agents, _, s = queue(tmp_path, limits)
+    s.pick()  # codex builds
+    out(agents["antigravity"], clock)
+    borrowed = s.pick(avoid="codex")
+    assert borrowed.name == "claude_api"  # reviews may go to Claude
+    assert s.current == "codex"
+    s.note_round("claude_api", 600, 60.0, goal=True)
+    assert s.turn_reason("claude_api") == "" and s.turn_reason("codex") == ""
+    assert s.snapshot()["turn"] == {"agent": "codex", "worked_s": 0, "spent": 0}
+    assert s.snapshot()["agents"]["claude_api"]["goal_spent"] == 60.0
+    s.note_round("claude_api", 600, 90.0, goal=True)
+    assert s.goal_over("claude_api")
+
+
+def test_rotate_moves_to_the_next_agent_and_starts_its_turn(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 100, 4.0)
+    assert s.rotate() == "antigravity"
+    assert s.current == "antigravity"
+    assert s.snapshot()["turn"] == {"agent": "antigravity", "worked_s": 0, "spent": 0}
+    assert s.pick().name == "antigravity"
+    assert s.rotate() == "claude_api"
+    assert s.rotate() == "codex"  # wraps
+
+
+def test_rotate_skips_a_dropped_agent(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.drop("antigravity")
+    assert s.rotate() == "claude_api"
+
+
+def test_rotate_with_one_usable_agent_stays_on_it(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 100, 0)
+    s.drop("antigravity")
+    s.drop("claude_api")
+    assert s.rotate() == "codex"
+    assert s.current == "codex"
+    assert s.snapshot()["turn"]["worked_s"] == 100  # nothing changed, no new turn
+
+
+def test_rotate_does_not_move_onto_a_reserve_agent(tmp_path):
+    _, _, _, s = queue(tmp_path, reserve=True)
+    s.pick()
+    assert s.rotate() == "antigravity"
+    assert s.rotate() == "codex"
+
+
+def test_rotate_leaves_the_pick_to_skip_an_unavailable_agent(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    s.pick()
+    out(agents["antigravity"], clock)
+    assert s.rotate() == "antigravity"
+    assert s.pick().name == "claude_api"  # as pick always skips what is out
+    assert s.snapshot()["turn"]["agent"] == "claude_api"
+
+
+def test_new_turn_starts_the_same_agent_over(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 5 * HOUR, 9.0, goal=True)
+    s.new_turn("codex")
+    assert s.snapshot()["turn"] == {"agent": "codex", "worked_s": 0, "spent": 0}
+    assert s.snapshot()["agents"]["codex"]["goal_spent"] == 9.0  # the goal's spend stays
+
+
+def test_a_pick_of_another_agent_starts_its_turn(tmp_path):
+    clock, agents, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 60, 2.0)
+    out(agents["codex"], clock)
+    assert s.pick().name == "antigravity"  # codex's limit ran out
+    assert s.snapshot()["turn"] == {"agent": "antigravity", "worked_s": 0, "spent": 0}
+
+
+def test_a_pick_of_the_same_agent_keeps_its_turn(tmp_path):
+    _, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 60, 2.0)
+    s.pick()
+    assert s.snapshot()["turn"] == {"agent": "codex", "worked_s": 60, "spent": 2.0}
+
+
+def test_a_dropped_agent_is_not_picked_and_not_watched(tmp_path):
+    clock, agents, _, s = queue(tmp_path, reserve=True)
+    out(agents["codex"], clock)
+    out(agents["antigravity"], clock)
+    s.drop("claude_api")
+    assert s.pick() is None
+    assert "claude_api" not in s.plan_ready_to_check()
+    s.drop("codex")
+    clock.now += 10_001  # the cooldowns are over
+    assert s.plan_ready_to_check() == ["antigravity"]
+
+
+def test_a_dropped_current_agent_continues_from_its_place_in_order(tmp_path):
+    order = ("codex", "claude_api", "antigravity")
+    _, _, _, s = queue(tmp_path, order=order)
+    s.current = "claude_api"
+    s.drop("claude_api")
+    assert s._candidates() == ["antigravity", "codex"]  # not from the top
+    assert s.rotate() == "antigravity"
+
+
+def test_dropped_goes_to_state_and_a_new_goal_clears_it_and_the_spend(tmp_path):
+    _, _, store, s = queue(tmp_path)
+    s.pick()
+    s.note_round("claude_api", 0, 160.0, goal=True)
+    s.drop("claude_api")
+    s.save()
+    assert store.load_state()["dropped"] == ["claude_api"]
+    s.new_goal()
+    assert s.dropped == set()
+    assert s.snapshot()["agents"]["claude_api"]["goal_spent"] == 0
+    assert s.snapshot()["dropped"] == []
+
+
+def test_new_goal_leaves_the_turn_and_the_cooldowns_alone(tmp_path):
+    clock, _, _, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 30, 2.0, goal=True)
+    s.record("antigravity", RoundResult(LIMIT, until=clock.now + 900))
+    s.new_goal()
+    snap = s.snapshot()
+    assert snap["turn"]["spent"] == 2.0 and snap["agents"]["antigravity"]["until"] > clock.now
+
+
+def test_goal_over_compares_the_goal_spend_with_the_goal_budget(tmp_path):
+    limits = {"claude_api": TurnLimits(goal_budget_usd=150.0)}
+    _, _, _, s = queue(tmp_path, limits)
+    s.note_round("claude_api", 0, 149.0, goal=True)
+    assert not s.goal_over("claude_api")
+    s.note_round("claude_api", 0, 1.0, goal=True)
+    assert s.goal_over("claude_api")
+    assert not s.goal_over("codex")  # no goal budget
+
+
+def test_the_turn_the_spend_and_the_dropped_survive_a_restart(tmp_path):
+    clock, _, store, s = queue(tmp_path)
+    s.pick()
+    s.note_round("codex", 3600, 3.5, goal=True)
+    s.note_round("claude_api", 0, 7.0, goal=True)
+    s.drop("claude_api")
+    s.save()
+    again = Scheduler(("codex", "antigravity", "claude_api"), s._adapters, store, clock)
+    snap = again.snapshot()
+    assert snap["turn"] == {"agent": "codex", "worked_s": 3600, "spent": 3.5}
+    assert snap["agents"]["claude_api"]["goal_spent"] == 7.0
+    assert snap["dropped"] == ["claude_api"]
+
+
+def test_an_old_state_without_the_new_keys_loads(tmp_path):
+    saved = {"current": "antigravity", "agents": {"codex": {"until": 0.0}}}
+    _, _, _, s = queue(tmp_path, saved=saved)
+    assert s.current == "antigravity"
+    assert s.snapshot()["dropped"] == [] and s.snapshot()["turn"]["agent"] == ""
+    assert not s.turn_over("antigravity")
+
+
+def test_a_turn_saved_with_started_loads_with_no_worked_time(tmp_path):
+    saved = {"turn": {"agent": "codex", "started": 12.0, "spent": 3.0}}
+    _, _, _, s = queue(tmp_path, saved=saved)
+    assert s.snapshot()["turn"] == {"agent": "codex", "worked_s": 0, "spent": 3.0}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "x",
+        None,
+        7,
+        [],
+        {"agent": "codex"},
+        {"agent": 3, "worked_s": 1.0, "spent": 0.0},
+        {"agent": [], "worked_s": 1.0, "spent": 0.0},
+        {"agent": {}, "worked_s": 1.0, "spent": 0.0},
+        {"agent": None, "worked_s": 1.0, "spent": 0.0},
+        {"agent": "codex", "worked_s": "later", "spent": 0.0},
+        {"agent": "codex", "worked_s": float("nan"), "spent": 0.0},
+        {"agent": "codex", "worked_s": -5, "spent": 0.0},
+        {"agent": "codex", "worked_s": 1.0, "spent": "lots"},
+        {"agent": "nobody", "worked_s": 1.0, "spent": 0.0},
+    ],
+)
+def test_a_damaged_turn_is_no_turn(tmp_path, bad):
+    _, _, _, s = queue(tmp_path, saved={"turn": bad})
+    assert s.snapshot()["turn"]["agent"] == ""
+
+
+def test_damaged_spend_and_dropped_are_read_as_nothing(tmp_path):
+    saved = {
+        "dropped": ["nobody", 4, "claude_api", []],
+        "agents": {"codex": {"goal_spent": "a lot"}, "claude_api": {"goal_spent": -4}},
+    }
+    _, _, _, s = queue(tmp_path, saved=saved)
+    snap = s.snapshot()
+    assert snap["dropped"] == ["claude_api"]
+    assert snap["agents"]["codex"]["goal_spent"] == 0
+    assert snap["agents"]["claude_api"]["goal_spent"] == 0
+
+
+def test_a_reserve_agent_keeps_the_fallback_behaviour(tmp_path):
+    clock, agents, _, s = queue(tmp_path, reserve=True)
+    assert s.pick().name == "codex"
+    out(agents["codex"], clock)
+    out(agents["antigravity"], clock)
+    assert s.pick().name == "claude_api"
+    agents["codex"].avail = Availability(True)
+    clock.now += 10_001
+    assert s.plan_ready_to_check() == ["codex", "antigravity"]

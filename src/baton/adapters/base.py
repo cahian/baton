@@ -39,6 +39,8 @@ class RoundResult:
     # COMPLETED only: the round was cut off by its own cap, so its work is not finished. The
     # scheduler treats it as completed; a phase must not advance on it, nor a goal finish.
     bounded: bool = False
+    # What the round cost, in USD, when the agent reports it (claude_api does): 0 otherwise.
+    cost_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -171,9 +173,11 @@ class ToolWatch:
 
 class Adapter(Protocol):
     name: str
-    # True for an agent paid by use, with no reset that would ever stop it: it runs only while
-    # no plan agent can, and a plan agent coming back ends its round.
+    # True for an agent paid by use, with no reset that would ever stop it. It only means budgets.
     metered: bool
+    # True for an agent that waits for the others: it runs only while no other agent can, and
+    # another coming back ends its round.
+    reserve: bool
 
     def availability(self) -> Availability: ...
 

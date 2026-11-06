@@ -57,9 +57,10 @@ class World:
 class Fake:
     """Scripted adapter. Each script step is `fn(agent, prompt, ctx) -> RoundResult`."""
 
-    def __init__(self, name, metered=False):
+    def __init__(self, name, metered=False, reserve=False):
         self.name = name
         self.metered = metered
+        self.reserve = reserve
         self.avail = Availability(True)
         self.script = []
         self.prompts = []
@@ -272,7 +273,7 @@ def test_state_error_is_survived_and_cooldowns_are_kept(tmp_path, work, agents, 
     flaky = FlakyStore(tmp_path / "flaky")
 
     def limit_then_break_store(agent, prompt, ctx):
-        flaky.fail_loads = 3  # record's save, the next iteration's saves
+        flaky.fail_loads = 4  # the saves of record and note_round, and the next iteration's
         return RoundResult(LIMIT, until=world.now + 3600)
 
     agents["codex"].script = [limit_then_break_store]
@@ -1992,9 +1993,9 @@ FALLBACK = '"codex", "antigravity", "claude_api"'
 
 @pytest.fixture
 def fallback(tmp_path, work, store, agents, world, monkeypatch):
-    """Codex and Antigravity are out until t0 + 3600; claude_api (metered) is next to run."""
+    """Codex and Antigravity are out until t0 + 3600; claude_api (reserve) is next to run."""
     monkeypatch.setattr(runner, "PREEMPT_POLL_S", 0.02)
-    agents["claude_api"] = Fake("claude_api", metered=True)
+    agents["claude_api"] = Fake("claude_api", metered=True, reserve=True)
     for name in ("codex", "antigravity"):
         agents[name].avail = Availability(False, until=world.now + 3600, reason="used up")
     goal = make_goal(tmp_path, work, order=FALLBACK)
@@ -3499,3 +3500,525 @@ def test_without_oneshot_no_goal_is_pinned(go, agents, work, store):
     assert go() == 0
     assert store.goal() == ""
     assert "fixed by the person" not in agents["codex"].prompts[0]
+
+
+# the queue: turns end, and the person can ask for the next agent
+
+HOURS = 3600
+CLAUDE_FIRST = '"claude_api", "codex"'
+
+
+def rotations(store):
+    return [e for e in store.events() if e["kind"] == "rotation"]
+
+
+def after(world, seconds, then=None):
+    """A round that takes `seconds` on the world's clock."""
+
+    def step(agent, prompt, ctx):
+        world.now += seconds
+        return then(agent, prompt, ctx) if then else RoundResult(COMPLETED)
+
+    return step
+
+
+def costing(usd, then=None):
+    def step(agent, prompt, ctx):
+        return (
+            replace(then(agent, prompt, ctx), cost_usd=usd)
+            if then
+            else RoundResult(COMPLETED, cost_usd=usd)
+        )
+
+    return step
+
+
+def claude_world(agents):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    return agents
+
+
+def test_round_end_carries_the_cost_of_the_round(go, agents, work, store):
+    agents["codex"].script = [result(COMPLETED, cost_usd=1.25), done(work)]
+    assert go() == 0
+    costs = [e["cost_usd"] for e in store.events() if e["kind"] == "round_end"]
+    assert costs == [1.25, 0.0]
+
+
+def test_a_failed_resume_counts_its_first_attempt_too(go, agents, work, store):
+    def first(agent, prompt, ctx):
+        ctx.on_session("sid-1")
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [
+        first,
+        result(TRANSIENT, resume_failed=True, cost_usd=0.5),
+        result(COMPLETED, cost_usd=1.0),
+        done(work),
+    ]
+    assert go() == 0
+    ends = [e for e in store.events() if e["kind"] == "round_end"]
+    assert ends[1]["cost_usd"] == 1.5
+
+
+def test_a_turn_over_by_time_rotates_after_the_round(go, agents, work, store, world):
+    agents["codex"].script = [after(world, 5 * HOURS)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "codex",
+        "antigravity",
+        "5 hours",
+    )
+    order = [
+        e["kind"] for e in store.events() if e["kind"] in ("round_end", "rotation", "round_start")
+    ]
+    assert order == ["round_start", "round_end", "rotation", "round_start", "round_end"]
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "codex",
+        "antigravity",
+    ]
+
+
+def test_the_round_after_a_rotation_does_not_show_a_second_line(go, agents, work, store, world):
+    agents["codex"].script = [after(world, 5 * HOURS), done(work)]
+    agents["antigravity"].script = [after(world, 5 * HOURS)]
+    assert go() == 0
+    starts = [e for e in store.events() if e["kind"] == "round_start"]
+    shown = [gateway.render_event("round_start", e) for e in starts]
+    assert not any("rotation" in text for text in shown)
+    assert len(rotations(store)) == 2
+    assert "[baton] rotation: codex -> antigravity (5 hours)" in gateway.render_event(
+        "rotation", rotations(store)[0]
+    )
+
+
+def test_a_change_of_agent_without_a_rotation_event_still_shows_its_line(
+    go, agents, work, store, world
+):
+    agents["codex"].script = [result(LIMIT, until=world.now + 3600)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert rotations(store) == []
+    start = [e for e in store.events() if e["kind"] == "round_start"][1]
+    assert "rotation: codex -> antigravity" in gateway.render_event("round_start", start)
+
+
+def test_a_turn_over_by_budget_rotates_and_says_the_amount(tmp_path, work, store, agents, world):
+    claude_world(agents)
+    agents["claude_api"].script = [costing(50.0)]
+    agents["codex"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order=CLAUDE_FIRST)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "claude_api",
+        "codex",
+        "USD 50",
+    )
+    assert "(USD 50)" in gateway.render_event("rotation", event)
+
+
+def test_the_turn_limits_come_from_the_goal(tmp_path, work, store, agents, world):
+    top = "\n[agents.codex]\nturn_max_s = 600\n"
+    agents["codex"].script = [after(world, 600)]
+    agents["antigravity"].script = [done(work)]
+    goal = make_goal(tmp_path, work, top=top)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store)[0]["reason"] == "10 minutes"
+
+
+def test_a_turn_not_over_keeps_the_agent(go, agents, work, store, world):
+    agents["codex"].script = [after(world, 5 * HOURS - 100), done(work)]
+    assert go() == 0
+    assert rotations(store) == [] and len(agents["antigravity"].prompts) == 0
+
+
+def test_the_turn_survives_a_restart(go, agents, work, store, world):
+    def first(agent, prompt, ctx):
+        world.now += 3 * HOURS
+        store.request_stop()  # the first run ends after this round
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [first, say(["x"]), after(world, 2 * HOURS)]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert store.load_state()["turn"]["agent"] == "codex"
+    assert go() == 0  # the second run: 3 + 2 hours on the same turn
+    assert [e["reason"] for e in rotations(store)] == ["5 hours"]
+
+
+def test_next_asked_during_a_round_rotates_when_it_ends(go, agents, work, store):
+    def asks(agent, prompt, ctx):
+        store.request_next()
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [asks]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "codex",
+        "antigravity",
+        "asked by the person",
+    )
+    assert store.take_next() == ""  # taken
+
+
+def test_next_now_ends_the_round_and_rotates(go, agents, work, store):
+    def asks(agent, prompt, ctx):
+        store.request_next(now=True)
+        store.request_interrupt()
+        for _ in range(100):
+            if ctx.should_kill():
+                return RoundResult(COMPLETED, reason="stop requested")
+        raise AssertionError("the interrupt never reached the round")
+
+    agents["codex"].script = [asks]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    first_end = [e for e in store.events() if e["kind"] == "round_end"][0]
+    assert first_end["interrupted"] is True
+    assert rotations(store)[0]["reason"] == "asked by the person"
+    assert len(agents["codex"].prompts) == 1
+
+
+def test_next_asked_between_rounds_is_taken_before_the_next_round(go, agents, work, store):
+    store.request_next()
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    assert agents["codex"].prompts == []
+    assert rotations(store)[0]["reason"] == "asked by the person"
+    assert store.take_next() == ""
+
+
+def test_next_asked_while_the_job_waits_is_taken(go, agents, work, store, world):
+    t0 = world.now
+    agents["codex"].script = [result(LIMIT, until=t0 + 3600), done(work)]
+    agents["antigravity"].script = [result(LIMIT, until=t0 + 7200)]
+    asked = []
+
+    def sleep(seconds):
+        if not asked:
+            asked.append(True)
+            store.request_next()
+        world.sleep(seconds)
+
+    assert go(sleep=sleep) == 0
+    assert [e["reason"] for e in rotations(store)] == ["asked by the person"]
+    assert store.take_next() == ""
+    assert sum(world.sleeps) < 3600 + 20  # the wait went on only as long as it had to
+
+
+def test_with_one_usable_agent_next_is_taken_and_nothing_is_said(
+    tmp_path, work, store, agents, world
+):
+    store.request_next()
+    agents["codex"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order='"codex"')
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store) == [] and store.take_next() == ""
+    assert len(agents["codex"].prompts) == 1
+
+
+def test_with_one_usable_agent_a_long_turn_stays_quiet(tmp_path, work, store, agents, world):
+    agents["codex"].script = [after(world, 6 * HOURS), done(work)]
+    goal = make_goal(tmp_path, work, order='"codex"')
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store) == [] and len(agents["codex"].prompts) == 2
+
+
+GOAL_CAPS = "\n[agents.claude_api]\nturn_budget_usd = 500\n"
+
+
+def goal_world(tmp_path, work, agents):
+    claude_world(agents)
+    return make_goal(tmp_path, work, order=CLAUDE_FIRST, top=GOAL_CAPS)
+
+
+def test_crossing_the_goal_budget_drops_the_agent_and_alerts(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [costing(100.0), costing(60.0)]
+    agents["codex"].script = [done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "claude_api",
+        "claude_api",
+        "codex",
+    ]
+    alerts = [e for e in store.events() if e["kind"] == "alert"]
+    assert len(alerts) == 1 and "claude_api" in alerts[0]["message"]
+    assert "150" in alerts[0]["message"]
+    state = store.load_state()
+    assert state["dropped"] == ["claude_api"]
+    assert state["agents"]["claude_api"]["goal_spent"] == 160.0
+
+
+def test_the_goal_budget_only_applies_while_a_goal_is_set(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    agents["claude_api"].script = [costing(100.0), costing(60.0), done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e for e in store.events() if e["kind"] == "alert"] == []
+    assert store.load_state().get("dropped") == []
+    assert len(agents["codex"].prompts) == 0
+
+
+def test_a_new_goal_brings_the_dropped_agent_back_and_clears_its_spend(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [costing(160.0), done(work)]
+
+    def changes_goal(agent, prompt, ctx):
+        store.set_goal("make it small")
+        return RoundResult(LIMIT, until=world.now + 3600)
+
+    agents["codex"].script = [changes_goal]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "claude_api",
+        "codex",
+        "claude_api",
+    ]
+    state = store.load_state()
+    assert state["dropped"] == [] and state["agents"]["claude_api"]["goal_spent"] == 0
+
+
+def test_clearing_the_goal_also_brings_the_agent_back(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [costing(160.0), done(work)]
+
+    def clears_goal(agent, prompt, ctx):
+        store.clear_goal()
+        return RoundResult(LIMIT, until=world.now + 3600)
+
+    agents["codex"].script = [clears_goal]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["dropped"] == []
+    assert agents["claude_api"].script == []  # it ran its second round
+
+
+def test_a_dropped_agent_stays_dropped_across_a_restart_with_the_same_goal(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+
+    def spends_and_stops(agent, prompt, ctx):
+        store.request_stop()
+        return RoundResult(COMPLETED, cost_usd=160.0)
+
+    agents["claude_api"].script = [spends_and_stops]
+    agents["codex"].script = [done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["dropped"] == ["claude_api"]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert len(agents["claude_api"].prompts) == 1  # not asked again for this goal
+    assert len(agents["codex"].prompts) == 1
+
+
+def test_an_agent_that_does_not_reserve_is_never_ended_for_another(
+    tmp_path, work, store, agents, world
+):
+    claude_world(agents)
+    ran = []
+
+    def claude(agent, prompt, ctx):
+        ran.append(ctx.should_kill())
+        return RoundResult(COMPLETED)
+
+    agents["claude_api"].script = [claude, claude, done(work)]
+    goal = make_goal(tmp_path, work, order=CLAUDE_FIRST)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert ran == [False, False]
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == ["claude_api"] * 3
+
+
+# a rotation is announced when the agent that takes over is not the one that gave way
+
+
+def says_nothing_and_restarts(store, expected_worked_s):
+    assert rotations(store) == []
+    starts = [e for e in store.events() if e["kind"] == "round_start"]
+    assert not any(e.get("announced") for e in starts)
+    assert store.load_state()["turn"]["worked_s"] == expected_worked_s
+
+
+def test_a_turn_over_with_claude_unavailable_says_nothing_and_starts_the_turn_over(
+    tmp_path, work, store, agents, world
+):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    agents["claude_api"].avail = Availability(False, until=world.now + 10**6, reason="no key file")
+    agents.pop("antigravity")
+    agents["codex"].script = [after(world, 5 * HOURS), after(world, HOURS), done(work)]
+    goal = make_goal(tmp_path, work, order='"codex", "claude_api"')
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    says_nothing_and_restarts(store, HOURS)  # the second turn has worked one hour
+    assert len(agents["codex"].prompts) == 3
+
+
+def test_a_turn_over_with_the_others_cooling_says_nothing_and_starts_the_turn_over(
+    go, agents, work, store, world
+):
+    agents["antigravity"].avail = Availability(False, until=world.now + 10**6, reason="used up")
+    agents["codex"].script = [after(world, 5 * HOURS), after(world, HOURS), done(work)]
+    assert go() == 0
+    says_nothing_and_restarts(store, HOURS)
+
+
+def test_a_reserve_claude_that_ran_a_long_time_is_not_rotated(tmp_path, work, store, agents, world):
+    agents["claude_api"] = Fake("claude_api", metered=True, reserve=True)
+    for name in ("codex", "antigravity"):
+        agents[name].avail = Availability(False, until=world.now + 10**6, reason="used up")
+    agents["claude_api"].script = [costing(80.0, after(world, 6 * HOURS)), done(work)]
+    goal = make_goal(tmp_path, work, order=FALLBACK)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert rotations(store) == []
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == ["claude_api"] * 2
+
+
+def test_the_rotation_names_the_agent_that_took_over_not_the_one_rotated_to(
+    tmp_path, work, store, agents, world
+):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    agents["antigravity"].avail = Availability(False, until=world.now + 10**6, reason="used up")
+    agents["codex"].script = [after(world, 5 * HOURS)]
+    agents["claude_api"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order=FALLBACK)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"], event["reason"]) == (
+        "codex",
+        "claude_api",
+        "5 hours",
+    )
+    starts = [e for e in store.events() if e["kind"] == "round_start"]
+    assert starts[1]["agent"] == "claude_api" and starts[1]["announced"] is True
+
+
+def test_a_rotation_waits_for_the_agent_that_takes_over_when_none_can_run(
+    go, agents, work, store, world
+):
+    t0 = world.now
+    agents["codex"].script = [after(world, 5 * HOURS, result(LIMIT, until=t0 + 6 * HOURS))]
+    agents["antigravity"].script = [done(work)]
+    back = t0 + 5 * HOURS + 60
+    agents["antigravity"].availability = lambda: (
+        Availability(True) if world.now >= back else Availability(False, until=back, reason="out")
+    )
+    assert go() == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"]) == ("codex", "antigravity")
+    kinds_seen = [e["kind"] for e in store.events() if e["kind"] in ("wait", "rotation")]
+    assert kinds_seen.index("wait") < kinds_seen.index("rotation")  # said once somebody took over
+
+
+def test_the_cost_of_a_round_that_kept_its_reservation_counts_in_the_goal(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+    agents["claude_api"].script = [
+        costing(100.0),
+        costing(60.0),
+    ]  # a kill or a timeout would carry 5
+    agents["codex"].script = [done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["agents"]["claude_api"]["goal_spent"] == 160.0
+
+
+def test_spend_is_not_counted_for_the_goal_while_none_is_set(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    agents["claude_api"].script = [costing(100.0), done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert store.load_state()["agents"]["claude_api"]["goal_spent"] == 0
+
+
+def test_a_goal_set_during_a_round_does_not_charge_the_money_spent_before_it(
+    tmp_path, work, store, agents, world
+):
+    goal = goal_world(tmp_path, work, agents)
+
+    def sets_goal(agent, prompt, ctx):
+        store.set_goal("first goal")
+        return RoundResult(COMPLETED, cost_usd=3.0)
+
+    agents["claude_api"].script = [costing(160.0), sets_goal, done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e for e in store.events() if e["kind"] == "alert"] == []
+    assert store.load_state()["dropped"] == []
+
+
+def test_a_goal_that_cannot_be_read_changes_nothing(tmp_path, work, store, agents, world):
+    goal = goal_world(tmp_path, work, agents)
+    store.set_goal("make it fast")
+
+    def unreadable_then_back(agent, prompt, ctx):
+        (store.root / "goal.md").unlink()
+        (store.root / "goal.md").mkdir()  # a read error, not "no goal"
+        return RoundResult(LIMIT, until=world.now + 60)
+
+    def readable_again(agent, prompt, ctx):
+        (store.root / "goal.md").rmdir()
+        store.set_goal("make it fast")
+        return RoundResult(LIMIT, until=world.now + 60)
+
+    agents["claude_api"].script = [costing(160.0)]
+    agents["codex"].script = [unreadable_then_back, readable_again, done(work)]
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [e["agent"] for e in store.events() if e["kind"] == "round_start"] == [
+        "claude_api",
+        "codex",
+        "codex",
+        "codex",
+    ]  # claude stayed out of the queue through the read error, and after the goal came back
+    assert store.load_state()["dropped"] == ["claude_api"]
+
+
+def test_a_next_that_cannot_be_taken_does_not_spin_the_wait(go, agents, work, store, world):
+    t0 = world.now
+    agents["codex"].script = [result(LIMIT, until=t0 + 1800), done(work)]
+    agents["antigravity"].script = [result(LIMIT, until=t0 + 3600)]
+    store.request_next()
+
+    def broken():
+        raise PermissionError("cannot take it")
+
+    store.take_next = broken  # the file stays, and next_pending keeps saying yes
+    assert go() == 0
+    assert kinds(store).count("wait") <= 3  # not one per step of the wait
+
+
+def test_a_next_asked_after_the_turn_ended_does_not_rotate_a_second_time(
+    tmp_path, work, store, agents, world
+):
+    """The verify gate runs between the end of the turn and the next pick: a `next` that comes
+    then joins the rotation already decided."""
+    ask = f"echo soon > {store.root / 'next'}"
+    mark = tmp_path / "ran"
+    verify = f"if [ -f {mark} ]; then {ask}; fi; touch {mark}; test -f {work}/DONE"
+    agents["codex"].script = [after(world, 6 * HOURS), done(work)]
+    agents["antigravity"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order='"codex", "antigravity"', verify=verify)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    (event,) = rotations(store)
+    assert (event["previous"], event["agent"]) == ("codex", "antigravity")
+    assert event["reason"] == "asked by the person"  # the latest reason
+    assert len(agents["codex"].prompts) == 1 and len(agents["antigravity"].prompts) == 1
+
+
+def test_a_next_after_the_turn_ended_does_not_skip_an_agent(tmp_path, work, store, agents, world):
+    agents["claude_api"] = Fake("claude_api", metered=True)
+    ask = f"echo soon > {store.root / 'next'}"
+    mark = tmp_path / "ran"
+    verify = f"if [ -f {mark} ]; then {ask}; fi; touch {mark}; test -f {work}/DONE"
+    agents["codex"].script = [after(world, 6 * HOURS)]
+    agents["antigravity"].script = [done(work)]
+    goal = make_goal(tmp_path, work, order=FALLBACK, verify=verify)
+    assert run_goal(goal, agents, store, clock=world.clock, sleep=world.sleep) == 0
+    assert [(e["previous"], e["agent"]) for e in rotations(store)] == [("codex", "antigravity")]
+    assert agents["claude_api"].prompts == []  # paid Claude did not start early

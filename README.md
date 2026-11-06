@@ -4,11 +4,13 @@
 
 baton keeps one long coding goal moving for days by passing it between coding agents, stopping
 each one before it can spend money it should not. It works with Codex and Antigravity alone;
-Claude is an optional third, a paid backup that only joins once you save an API key for it.
+Claude is an optional third, paid by use, that only joins the queue once you save an API key for
+it. Its turn ends at USD 50 or 5 hours, whichever comes first, it is left out of a goal after USD
+150 spent in that goal, and the monthly ceiling stays above all of that.
 
 You give it a goal (an objective, a working directory and a verification command). It runs one
-agent until that agent nears its limit, hands the work to the next, and when every agent is out,
-sleeps until the earliest reset and carries on. It finishes only when the verification command
+agent until that agent nears its limit or its turn (5 hours) ends, hands the work to the next, and
+when every agent is out, sleeps until the earliest reset and carries on. It finishes only when the verification command
 exits 0; an agent saying "done" means nothing.
 
 Every agent runs through its vendor's own CLI. baton reimplements no agent. Context moves between
@@ -18,7 +20,7 @@ is resumed when its turn comes again.
 Inside a goal the work follows a cycle of plan, build and review, with a strong and a working
 model per provider (see [Phases](#phases-plan-build-review)).
 
-![How baton works: Codex and Antigravity rotate, Claude is the backup, and every goal runs plan, build, review and verify.](docs/assets/baton-diagram.png)
+![How baton works: Codex and Antigravity rotate, Claude takes its turn after them, and every goal runs plan, build, review and verify.](docs/assets/baton-diagram.png)
 
 ## What you need
 
@@ -31,7 +33,7 @@ two projects it did not write. Everything it depends on or works with:
 | [OpenCode](https://opencode.ai) | the chat window you type in; baton shows up in it as the model `baton/auto` | only for the chat interface: `baton run` works without it | the installer on [opencode.ai](https://opencode.ai) |
 | [Codex CLI](https://github.com/openai/codex) | runs GPT models, through your plan | at least one of Codex and Antigravity, signed in to a plan | `npm install -g @openai/codex`, then sign in |
 | [Antigravity CLI](https://antigravity.google) (`agy`) | runs Gemini models, through your plan | at least one of Codex and Antigravity, signed in to a plan | the installer on antigravity.google, then sign in |
-| [Claude Code](https://claude.com/claude-code) | an optional paid backup that runs only while both others are out | optional; needs a Console API key, not a subscription | install Claude Code, then save the key (Quick start, step 3) |
+| [Claude Code](https://claude.com/claude-code) | an optional third in the queue, paid by use: a turn ends at USD 50 or 5 hours, and a goal leaves it out after USD 150 | optional; needs a Console API key, not a subscription | install Claude Code, then save the key (Quick start, step 3) |
 | [Superpowers](https://github.com/obra/superpowers) | the working methods (planning, test-driven building, verification, code review) that baton puts in every round | **required**, by design: no round runs without it (a goal waits until it is installed), and `baton doctor` fails; see [Superpowers is required](#superpowers-is-required) | `git clone https://github.com/obra/superpowers ~/.config/baton/superpowers`; it is also found automatically from the official Claude Code plugin install, and any other location needs `[superpowers] dir` |
 | [ai-memory](https://github.com/akitaonrails/ai-memory) | long-term memory across goals in the same directory | optional | download the release binary for your platform from its releases page and put it on `PATH`; do not run `ai-memory setup`, which wires global hooks (see [Long-term memory](#long-term-memory)) |
 | launchd | keeps `baton serve` running in the background on macOS | macOS only, recommended: `baton install-service` | built in to macOS; on Linux keep `baton serve` running in a terminal or tmux |
@@ -89,9 +91,11 @@ Claude is optional. Open `~/.config/baton/defaults.toml` in any text editor and 
 - **No Claude (the simplest):** change nothing, and skip step 3. Without a saved key, Claude never
   runs and baton uses Codex and Antigravity only. To switch it off for good, set `enabled = false`
   under `[agents.claude_api]`.
-- **With the Claude backup:** set `monthly_budget_usd` to the credit you actually have, and
+- **With Claude:** set `monthly_budget_usd` to the credit you actually have, and
   `budget_reset_day` to the day of the month it renews. baton stops 10% before that number. Then
-  do step 3.
+  do step 3. Claude joins the queue after the other two; its turn ends at USD 50 or 5 hours,
+  whichever comes first, and a goal leaves it out after USD 150. To keep it for last, so that it
+  runs only while the others are out, set `reserve = true` under `[agents.claude_api]`.
 
 Change `enabled` for `codex` or `antigravity` the same way if you only have one of them.
 
@@ -247,26 +251,48 @@ adds a working model for building):
 2. **Gemini 4 Argon**, through Antigravity (`agy`).
 3. **Claude Opus 5.5**, through a Console API key (never a subscription login).
 
-Codex and Antigravity are the plan agents: their included usage comes back at a reset. Claude is
-paid by use and has no reset that would ever stop it, so it is a fallback, wherever it stands in
-`order`. **Claude runs only while both others are out.**
+That is the queue. An agent gives way to the next after **5 hours of work**, or sooner when its
+limit runs out. Only the time its rounds ran counts: a cooldown, a wait or a stopped service does
+not. Claude's turn also ends at **USD 50**, whichever comes first, and after **USD 150** spent in
+one goal (a goal is what you pin with `baton: goal`) Claude is left out of the queue until the goal
+changes. The others have no budget of their own. Claude is paid by use and has no reset that would
+ever stop it, so the ledger's monthly ceiling (see [The Claude ledger](#the-claude-ledger))
+stays above all of this.
 
-**Claude is optional.** baton works with Codex and Antigravity alone, and that is the default
-experience: until you save a key file (Quick start, step 3), Claude never runs and the rotation is
-the other two. It joins as a backup only once the key is there. To turn it off for good, set
-`enabled = false` under `[agents.claude_api]` in `defaults.toml`, or leave it out of `order` in a
-goal file. `baton doctor` reports an unconfigured Claude as one `ok` line, not a problem.
+**Claude is optional.** baton works with Codex and Antigravity alone: until you save a key file
+(Quick start, step 3), Claude never runs and the rotation is the other two. It joins the queue
+once the key is there. To turn it off for good, set `enabled = false` under `[agents.claude_api]`
+in `defaults.toml`, or leave it out of `order` in a goal file. `baton doctor` reports an
+unconfigured Claude as one `ok` line, not a problem.
 
-The first plan agent in `order` starts. The current one keeps working until it is unavailable,
-then the next plan agent takes over, wrapping around. A plan agent that comes back does not
-preempt another plan agent that is working. When both are out, Claude runs. While it does, baton
-reads the plan agents (without a model call) from their reset time onward, at most every 30
-seconds, and as soon as one is available it ends the Claude round and that agent takes over. If
-both are, the first in `order` goes first. This is not a failure: Claude gets no cooldown. A plan
-agent whose round fails within five minutes of such a takeover stops being allowed to end Claude
-rounds until it completes one. At most six Claude rounds a day are ended this way (`baton
-status` says when the cap is active). When no agent can run, baton waits for the earliest known reset.
-Change the order, or disable an agent, in the goal file.
+The first agent in `order` starts. The current one keeps working until it is unavailable, its turn
+is over, or you type `baton: next` (or `baton next`); then the next one in `order` takes over,
+wrapping around. This happens only between two rounds: a turn that ends while a round runs lets
+the round finish, and `baton: next now` ends the round at the next gap between tool calls. Each
+change is one line in the chat, `[baton] rotation: codex -> antigravity (5 hours)`, with the reason
+(`asked by the person`, `5 hours`, `USD 50`), said once the next agent actually starts. When no
+other agent can run (it is out, or has no key), the agent stays, nothing is said and its turn
+starts over. A review may go to Claude when it is the only other agent that can take it; that
+round counts in the goal's spend, not in the turn. An agent that comes back from its limit does
+not preempt another that is working. When no agent can run, baton waits for the earliest known reset, and takes a `next` that arrives meanwhile.
+
+**Reserve.** With `reserve = true` under `[agents.claude_api]`, Claude leaves the queue and waits
+for the others, wherever it stands in `order`: it runs only while every other agent is out. While
+it does, baton reads the others (without a model call) from their reset time onward, at most every
+30 seconds, and as soon as one is available it ends the Claude round and that agent takes over.
+If more than one is, the first in `order` goes first. This is not a failure: Claude gets no
+cooldown. An agent whose round fails within five minutes of such a takeover stops being allowed to
+end Claude rounds until it completes one. At most six Claude rounds a day are ended this way
+(`baton status` says when the cap is active). Without `reserve` (the default) none of this
+happens.
+
+The turn of a reserve Claude never ends. The limits are settings (`turn_max_s` for every agent, in
+seconds, default 18000; `turn_budget_usd`, default 50, and `goal_budget_usd`, default 150, for
+Claude). They go in `defaults.toml` or in a goal file. A repository's `baton.toml` may only lower
+them (and `round_budget_usd`), may not turn a `reserve` off, and may not enable an agent that
+`defaults.toml` disables. A round that ends without a cost report (killed, timed out) counts its
+whole reservation against the turn and the goal, as the ledger does. Change the
+order, or disable an agent, in the goal file.
 
 ## Phases: plan, build, review
 
@@ -464,7 +490,7 @@ budget is baton's own:
   steps, so a round can pass it slightly and the reserve covers that. If the ceiling would be passed, the round shrinks to what is left, and below
   5 USD the agent is unavailable until the next period.
 - A round that ends without a result keeps its whole reservation counted. Crashes overcount and
-  never undercount. So does a round ended because a plan agent came back: it has no result, and
+  never undercount. So does a round ended because another agent came back (`reserve = true`): it has no result, and
   whatever it spent before is counted as the whole 5 USD. The ledger drifts high, never low, and
   the small default keeps that drift small. A corrupt ledger makes the agent unavailable; it is never recreated silently.
 - Optionally, `admin_key_file` points to an Admin API key. baton then also reads the Console cost
@@ -527,6 +553,10 @@ monthly_budget_usd = 200   # what the organization holds
 reserve_pct = 10           # kept back; the spend ceiling is 200 - 10% = 180
 budget_reset_day = 1       # day of the month the period starts, 00:00 UTC
 round_budget_usd = 5       # most one round may spend (a killed round counts all of it)
+reserve = false            # true: Claude waits for the others, and runs only while they are out
+turn_max_s = 18000         # a turn ends after this long (every agent has it): 5 hours
+turn_budget_usd = 50       # or after this much spent in the turn
+goal_budget_usd = 150      # after this much in one goal, Claude is left out until the goal changes
 key_file = "~/.config/baton/anthropic.key"
 admin_key_file = ""        # optional Admin API key file, to cross-check spend
 
@@ -655,8 +685,8 @@ and the file's name in the prompt. A message gets at least one round, even if th
 already passes. A request that repeats what was already accepted, as a client's retry does, attaches
 to the stream and interrupts nothing, so it costs no round. `baton jobs` lists every job, and
 `baton status`, `baton say`, `baton goal`, `baton next` and `baton stop` accept its name (`session-<id>`) in place of a goal
-file. The stream shows the agents' text, one line per rotation, a sentence when a returning plan
-agent ends a Claude round, waits and gate results, and when no agent can run it says why, for
+file. The stream shows the agents' text, one line per rotation, a sentence when a returning
+agent ends a reserve Claude round, waits and gate results, and when no agent can run it says why, for
 each one. Title requests are answered locally and spend nothing. The
 working directory is read from OpenCode's own database (`~/.local/share/opencode/opencode.db`, or
 the path in `BATON_OPENCODE_DB`); baton never guesses one.

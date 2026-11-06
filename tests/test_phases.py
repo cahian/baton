@@ -242,8 +242,8 @@ pytestmark = pytest.mark.phases
 class Agent(Fake):
     """A scripted adapter that also keeps the tier of each round, and reports a session id."""
 
-    def __init__(self, name, metered=False):
-        super().__init__(name, metered)
+    def __init__(self, name, metered=False, reserve=False):
+        super().__init__(name, metered, reserve)
         self.tiers = []
 
     def run_round(self, prompt, ctx):

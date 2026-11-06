@@ -343,6 +343,23 @@ def test_next_is_taken_once_and_remembers_now(st):
     assert st.take_next() == "now"
 
 
+def test_read_goal_tells_no_goal_from_a_goal_that_cannot_be_read(st):
+    assert st.read_goal() == ""  # none set
+    st.set_goal("ship it")
+    assert st.read_goal() == "ship it"
+    st.clear_goal()
+    (st.root / "goal.md").mkdir()  # whatever makes it unreadable
+    assert st.read_goal() is None
+    assert st.goal() == ""  # the old reading, unchanged
+
+
+def test_next_pending_looks_without_taking(st):
+    assert st.next_pending() is False
+    st.request_next(False)
+    assert st.next_pending() is True and st.next_pending() is True
+    assert st.take_next() == "soon" and st.next_pending() is False
+
+
 def test_a_later_plain_next_does_not_downgrade_a_pending_next_now(st):
     st.request_next(True)
     st.request_next(False)

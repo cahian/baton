@@ -370,6 +370,7 @@ class _ToolWatch(ToolWatch):
 class CodexAdapter:
     name = "codex"
     metered = False
+    reserve = False
     # Seconds between the runner's checks; the limits are read every cfg.poll_s of poll_clock.
     tick_s = 1.0
 

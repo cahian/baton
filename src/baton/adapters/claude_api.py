@@ -257,6 +257,7 @@ class _Stream:
         self.is_error = False
         self.subtype = ""
         self.cost: Decimal | None = None
+        self.kept: Decimal | None = None  # the reservation the ledger went on counting
         self.result_text = ""
         self.kinds: set[str] = set()
         self.subagents: set[str] = set()  # tool uses whose model was seen
@@ -442,6 +443,10 @@ class ClaudeApiAdapter:
         self._wall_clock = wall_clock
 
     @property
+    def reserve(self) -> bool:
+        return self.cfg.reserve
+
+    @property
     def ceiling(self) -> Decimal:
         return self.ledger.ceiling
 
@@ -527,6 +532,16 @@ class ClaudeApiAdapter:
         return argv
 
     def run_round(self, prompt: str, ctx: RoundContext) -> RoundResult:
+        stream = _Stream()
+        result = self._run_round(prompt, ctx, stream)
+        # What the ledger counts is what the round cost: the reported cost, or, when the round
+        # ended without one and the reservation stays, the whole reservation (it overcounts).
+        cost = stream.cost if stream.cost is not None else stream.kept
+        if cost is not None:
+            result = replace(result, cost_usd=float(cost))
+        return result
+
+    def _run_round(self, prompt: str, ctx: RoundContext, stream: _Stream) -> RoundResult:
         now = self._wall_clock()
         if not self.cfg.enabled:
             return RoundResult(LIMIT, until=now + NO_KEY_RETRY_S, reason="claude_api is disabled")
@@ -558,7 +573,6 @@ class ClaudeApiAdapter:
                 reason=f"the spend ceiling leaves less than {MIN_GRANT_USD} USD for a round",
             )
         reservation_id, granted = reservation
-        stream = _Stream()
         spawned = False
 
         def on_spawn(pid: int) -> None:
@@ -601,6 +615,7 @@ class ClaudeApiAdapter:
             )
         except OSError as exc:
             if spawned:
+                stream.kept = granted
                 return RoundResult(
                     TRANSIENT, reason=f"runner failed after start: {type(exc).__name__}"
                 )
@@ -613,6 +628,8 @@ class ClaudeApiAdapter:
             self._settle(reservation_id, stream.cost)
         elif self._never_reached_the_api(exit_, stream):
             self._release(reservation_id)
+        else:
+            stream.kept = granted
         if exit_.stopped is not None:
             if exit_.stopped.outcome == COMPLETED and (stream.is_error or stream.kinds):
                 # The stop (a plan agent is back, a stop request) landed after the API had

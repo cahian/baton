@@ -27,9 +27,10 @@ TOOLS = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
 class Fake:
     """Scripted adapter. A step is `fn(agent, prompt, ctx) -> RoundResult`."""
 
-    def __init__(self, name, metered=False):
+    def __init__(self, name, metered=False, reserve=False):
         self.name = name
         self.metered = metered
+        self.reserve = reserve
         self.script = []
         self.prompts = []
         self.sessions = []
@@ -192,7 +193,7 @@ def gw(fakes, monkeypatch, tmp_path):
     db = tmp_path / "opencode.db"
     make_db(db, [(SESSION, str(fakes.work)), ("ses_other", str(fakes.work))])
     monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
-    # These tests drive the fake named claude_api first. It is declared non-metered: they test
+    # These tests drive the fake named claude_api first. It is not a reserve agent: they test
     # the gateway's mechanics, and the real claude_api would run only after the plan agents.
     monkeypatch.setattr(config, "DEFAULT_ORDER", ("claude_api", "antigravity", "codex"))
     agents = {"claude_api": Fake("claude_api"), "codex": Fake("codex")}
@@ -644,6 +645,16 @@ def test_a_fragment_is_shown_as_it_is_and_a_line_gets_its_newline():
     assert gateway.render_event("output", {"text": "\n", "fragment": True}) == "\n"
     assert gateway.render_event("output", {"text": "rende"}) == "rende\n"
     assert gateway.render_event("output", {"text": "rende", "fragment": False}) == "rende\n"
+
+
+def test_a_rotation_event_is_one_line_and_its_round_start_adds_none():
+    rotation = {"previous": "codex", "agent": "antigravity", "reason": "5 hours", "round": 3}
+    text = gateway.render_event("rotation", rotation)
+    assert text == "\n[baton] rotation: codex -> antigravity (5 hours)\n\n"
+    start = {"round": 4, "agent": "antigravity", "previous": "codex", "announced": True}
+    assert gateway.render_event("round_start", start) == "\n[baton] round 4: antigravity\n\n"
+    start.pop("announced")  # a change nobody announced still shows its line
+    assert "rotation: codex -> antigravity" in gateway.render_event("round_start", start)
 
 
 def test_an_agent_that_gives_no_reason_is_not_left_out():
