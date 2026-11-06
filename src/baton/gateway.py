@@ -262,6 +262,26 @@ def opencode_db() -> Path:
     )
 
 
+def _session_idle_at(session: str) -> tuple[bool, int | None]:
+    """Read a baseline, without treating an unavailable or older database as a stop."""
+    db = opencode_db()
+    if not db.is_file():
+        return False, None
+    try:
+        conn = sqlite3.connect(
+            f"file:{quote(str(db))}?mode=ro", uri=True, timeout=INBOX_DB_TIMEOUT_S
+        )
+        try:
+            row = conn.execute(
+                "select time_idle from session_v2 where id = ?", (session,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False, None
+    return (True, row[0]) if row and (row[0] is None or type(row[0]) is int) else (False, None)
+
+
 def session_directory(session: str) -> Path:
     """The directory OpenCode recorded for `session`. Never guessed: raises GatewayError."""
     db = opencode_db()
@@ -527,6 +547,8 @@ class Job:
         self._done = False
         self._delivered = 0
         self._cut = 0
+        self._idle_known, self._idle_at = _session_idle_at(session)
+        self._opencode_stopping = False
         self._end = ""  # how the last run ended: "finished", "stopped" or ""
         self.store = _JobStore(state_dir(name), self._on_event)
         self._thread = threading.Thread(target=self._run, name=f"baton-{name}", daemon=True)
@@ -545,6 +567,33 @@ class Job:
     def has_undelivered(self) -> bool:
         with self._cond:
             return self._first + len(self._items) - 1 > self._delivered
+
+    def opencode_stopping(self) -> bool:
+        with self._cond:
+            return self._opencode_stopping
+
+    def observe_opencode(self, busy: object, idle: object, outcome: object) -> bool:
+        """Stop once for a new terminal interruption; an unknown baseline is only observed."""
+        if type(idle) is not int and idle is not None:
+            return False
+        with self._cond:
+            if self._opencode_stopping:
+                return True
+            if not self._idle_known:
+                self._idle_known, self._idle_at = True, idle
+                return False
+            if type(busy) is not int or type(idle) is not int:
+                return False
+            if busy > idle:
+                self._idle_at = idle
+                return False
+            if outcome != "interrupted" or idle == self._idle_at or self._done:
+                return False
+            self.store.request_stop(now=True)
+            self.store.request_interrupt()
+            self._idle_at = idle
+            self._opencode_stopping = True
+            return True
 
     def held(self) -> bool:
         """Between rounds, with a restart of the gateway waiting: nothing is in flight."""
@@ -1030,6 +1079,18 @@ class JobManager:
             )
             try:
                 for job in running:
+                    if job.opencode_stopping():
+                        continue
+                    try:
+                        status = conn.execute(
+                            "select time_busy, time_idle, idle_outcome "
+                            "from session_v2 where id = ?",
+                            (job.session,),
+                        ).fetchone()
+                    except sqlite3.Error:
+                        status = None  # old schemas may not expose execution state
+                    if status and job.observe_opencode(*status):
+                        continue
                     rows = conn.execute(
                         "select id, payload from session_inbox "
                         "where session_id = ? and type = 'user' and delivery = 'steer' "

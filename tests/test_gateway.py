@@ -1682,6 +1682,46 @@ def test_serve_kill_9_kills_the_orphan_and_resumes_the_job(fakes, monkeypatch, t
                 os.kill(int(fakes.codex_pidfile.read_text()), signal.SIGKILL)
 
 
+def test_opencode_interrupt_stops_real_agent_process(fakes, monkeypatch, tmp_path):
+    db = inbox_db(tmp_path)
+    make_db(db, [(SESSION, str(fakes.work))])
+    set_session_status(tmp_path, 100, 90, "succeeded")
+    monkeypatch.setenv("BATON_OPENCODE_DB", str(db))
+    (fakes.work / "baton.toml").write_text(
+        'order = ["codex"]\nsnapshot = false\nphases = false\n'
+        "[agents.antigravity]\nenabled = false\n[agents.claude_api]\nenabled = false\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "baton.cli", "serve", "--port", "0"],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "FAKE_CODEX_EXEC_SLEEP": "60"},
+    )
+    stream = None
+    try:
+        line = proc.stdout.readline()
+        assert "127.0.0.1" in line, line
+        port = int(line.rsplit(":", 1)[1].split("/")[0])
+        stream = Stream(port, request("work for a long time"))
+        assert wait_for(fakes.codex_pidfile.exists)
+        pid = int(fakes.codex_pidfile.read_text())
+        state = Store(state_dir(gateway.job_name(SESSION)))
+        assert wait_for(lambda: state.load_state().get("group") == pid)
+        set_session_status(tmp_path, 100, 110, "interrupted")
+        assert wait_for(lambda: not _alive(pid), seconds=8)
+        assert wait_for(lambda: job_json(state.root)["status"] == gateway.STOPPED)
+    finally:
+        if stream:
+            stream.close()
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=10)
+        proc.stdout.close()
+        if fakes.codex_pidfile.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(fakes.codex_pidfile.read_text()), signal.SIGKILL)
+
+
 def test_serve_stops_the_agent_group_on_sigterm(fakes, monkeypatch, tmp_path):
     db = tmp_path / "opencode.db"
     make_db(db, [(SESSION, str(fakes.work))])
@@ -1793,6 +1833,80 @@ def add_inbox_row(
 
 def user_texts(job):
     return [m["content"] for m in job.context if m["role"] == "user"]
+
+
+def set_session_status(tmp_path, busy, idle, outcome, session=SESSION):
+    with sqlite3.connect(inbox_db(tmp_path)) as conn:
+        columns = {row[1] for row in conn.execute("pragma table_info(session_v2)")}
+        for column, kind in (
+            ("time_busy", "integer"),
+            ("time_idle", "integer"),
+            ("idle_outcome", "text"),
+        ):
+            if column not in columns:
+                conn.execute(f"alter table session_v2 add column {column} {kind}")
+        conn.execute(
+            "update session_v2 set time_busy=?, time_idle=?, idle_outcome=? where id=?",
+            (busy, idle, outcome, session),
+        )
+
+
+def test_opencode_interrupt_stops_job_and_promoted_queue_resumes(gw, tmp_path):
+    set_session_status(tmp_path, 100, 90, "interrupted")
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    first = gw.stream("go")
+    first.read_until("busy")
+    job = gw.job()
+    add_inbox_row(tmp_path, "row1", "continue after stop", delivery="queue")
+    gw.manager.poll_inbox()
+    assert job.is_running()  # stale interrupted baseline is not a new stop
+    with sqlite3.connect(inbox_db(tmp_path)) as conn:
+        conn.execute(
+            "insert into session_inbox values (?, ?, 'user', ?, 'steer', 2, 1)",
+            ("row2", SESSION, json.dumps({"text": "not consumed while stopping"})),
+        )
+        conn.execute(
+            "update session_v2 set time_busy=100, time_idle=110, "
+            "idle_outcome='interrupted' where id=?",
+            (SESSION,),
+        )
+    gw.manager.poll_inbox()
+    gw.manager.poll_inbox()
+    assert wait_for(lambda: not job.is_running(), seconds=3)
+    assert job_json(job.store.root)["status"] == gateway.STOPPED
+    assert user_texts(job) == ["go"]
+    first.close()
+    with sqlite3.connect(inbox_db(tmp_path)) as conn:
+        assert conn.execute("select delivery from session_inbox where id='row1'").fetchone() == (
+            "queue",
+        )
+        assert conn.execute("select delivery from session_inbox where id='row2'").fetchone() == (
+            "steer",
+        )
+        conn.execute("delete from session_inbox where id='row2'")  # disposable OpenCode fixture
+    resumed = gw.stream("go", "continue after stop")
+    assert "[baton] done" in resumed.read_all()
+    resumed.close()
+    assert gw.job() is not job
+    assert any("continue after stop" in prompt for prompt in gw.agents["claude_api"].prompts)
+
+
+def test_opencode_busy_or_other_session_interrupt_does_not_stop_job(gw, tmp_path):
+    set_session_status(tmp_path, 100, 90, "succeeded")
+    release = threading.Event()
+    gw.agents["claude_api"].script = [wait_event(release, "busy")]
+    first = gw.stream("go")
+    try:
+        first.read_until("busy")
+        set_session_status(tmp_path, 120, 110, "interrupted")  # busy again, e.g. reconnect
+        set_session_status(tmp_path, 100, 120, "interrupted", session="ses_other")
+        gw.manager.poll_inbox()
+        assert gw.job().is_running()
+        assert gw.job().store.stop_request() == ""
+    finally:
+        release.set()
+        first.read_all()
+        first.close()
 
 
 def test_queued_row_waits_until_opencode_promotes_it(gw, tmp_path):
