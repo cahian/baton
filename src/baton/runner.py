@@ -55,7 +55,16 @@ from baton.phases import (
     reason_for,
     verdict,
 )
-from baton.proc import DEAD, OURS, UNKNOWN, check_group, clean_env, kill_group, process_start
+from baton.proc import (
+    DEAD,
+    OURS,
+    UNKNOWN,
+    check_group,
+    clean_env,
+    kill_group,
+    mask_secrets,
+    process_start,
+)
 from baton.scheduler import Scheduler, TurnLimits, read_availability
 from baton.store import Store, workdir_lock
 
@@ -67,6 +76,8 @@ HANDOFF_HEAD_CHARS = 4000
 # Waits are sliced so a stop request is noticed within this many seconds.
 STEP_S = 5
 ERROR_SLEEP_S = 60
+# A run held for a restart of the gateway looks again this often.
+HOLD_POLL_S = 1
 GIT_TIMEOUT_S = 120
 COMMITS_MAX_CHARS = 2000
 # A round that completes sooner than this, without the goal being met, is followed by a pause of
@@ -185,7 +196,10 @@ def build_prompt(
         parts.append(f"Output of the last verify run (tail):\n{gate_tail[-GATE_TAIL_CHARS:]}")
     round_tail = round_tail.strip()
     if round_tail:
-        parts.append(f"Tail of the previous round:\n{round_tail[-ROUND_TAIL_CHARS:]}")
+        parts.append(
+            "Tail of the previous round (`[masked]` stands for a credential baton hid; "
+            f"it is not in the code):\n{round_tail[-ROUND_TAIL_CHARS:]}"
+        )
     notes = notes.strip()
     if notes:
         parts.append(f"Notes from the person:\n{notes}")
@@ -355,6 +369,12 @@ def prepare_workdir(goal: Goal) -> None:
     _exclude_baton(goal.workdir)
 
 
+# What a repository is told to leave out of the work, in `.git/info/exclude`: baton's own files, and
+# the bytecode that running a project's tests leaves behind, which a snapshot must not commit.
+EXCLUDED = (".baton/", "__pycache__/", "*.pyc")
+_EXCLUDED_ALIASES = {".baton/": (".baton", ".baton/", "/.baton", "/.baton/")}
+
+
 def _exclude_baton(workdir: Path) -> None:
     try:
         found = _git(workdir, "rev-parse", "--git-path", "info/exclude")
@@ -362,16 +382,18 @@ def _exclude_baton(workdir: Path) -> None:
             return
         path = workdir / found.stdout.strip()
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            lines = []
-        if any(line.strip() in (".baton", ".baton/", "/.baton", "/.baton/") for line in lines):
+            text = ""
+        have = {line.strip() for line in text.splitlines()}
+        missing = [x for x in EXCLUDED if not have & set(_EXCLUDED_ALIASES.get(x, (x,)))]
+        if not missing:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
-            if lines and not path.read_text(encoding="utf-8").endswith("\n"):
+            if text and not text.endswith("\n"):
                 fh.write("\n")
-            fh.write(".baton/\n")
+            fh.write("".join(f"{x}\n" for x in missing))
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -669,6 +691,7 @@ class _Run:
         # A different goal file later is not the goal the person set (None while no goal is set).
         self.goal_terms: dict[str, Any] | None = None
         self.held = ""  # why this run holds (a goal it cannot do), said once
+        self.restart_held = False  # held for a restart of the gateway, and said so
         # A rotation decided and not yet announced: (the agent that gave way, why). It is said at
         # the next pick, once it is known who takes over.
         self.rotating: tuple[str, str] | None = None
@@ -738,6 +761,7 @@ class _Run:
         The step count does not depend on the clock, so this always sleeps."""
         remaining = seconds
         while remaining > 0 and (until is None or self.clock() < until):
+            self.hold_for_restart()  # a wait is a point between rounds: a restart may come now
             if (
                 self.stop_requested()
                 or (wake_on_next and self.next_pending())
@@ -752,6 +776,22 @@ class _Run:
         self, until: float, wake_on_next: bool = False, wake_on_note: bool = False
     ) -> None:
         self.nap(until - self.clock(), until, wake_on_next, wake_on_note)
+
+    def hold_for_restart(self) -> bool:
+        """True while a restart of the gateway waits for this run and no stop is asked for. It
+        tells the store it is held (the gateway restarts once every running job is), and says so
+        once in the log; once the request is gone, or a stop is asked for, it is held no more. Only
+        called between rounds: a round in progress is never held. A person's stop wins."""
+        try:
+            pending = self.store.restart_pending() and not self.stop_requested()
+            if pending != self.restart_held:
+                self.restart_held = pending
+                self.store.report_held(pending)
+                if pending:
+                    self.emit("held", round=self.round_no)
+        except Exception:
+            return False
+        return pending
 
     def note_waiting(self) -> bool:
         """A message from the person waits in the inbox (or was already taken in, unread)."""
@@ -1150,6 +1190,9 @@ class _Run:
     def step(self) -> int | None:
         if not self.ready:
             self.start()
+        if self.hold_for_restart():
+            self.nap(HOLD_POLL_S)
+            return None
         self.sync_goal()
         with_goal = self.goal_on()
         if with_goal and self.hold():
@@ -1210,6 +1253,9 @@ class _Run:
             self.nap_until(until)
             return None
         assert self.sched is not None
+        if self.hold_for_restart():  # after any wait above, and before any agent is picked
+            self.nap(HOLD_POLL_S)
+            return None
         if self.consensus is not None:
             return self.consensus_step()
         if self.take_next():
@@ -1922,6 +1968,7 @@ class _Run:
                 text = None
             if not text:
                 return
+            text = mask_secrets(text)  # before it reaches the tail, the log of events and the chat
             if fragment:
                 # Joined with the next one by the reader, which adds no newline of its own.
                 buf = (buf + text)[-ROUND_TAIL_CHARS:]

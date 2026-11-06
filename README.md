@@ -214,6 +214,7 @@ baton jobs                   # everything running; names look like session-<id>
 baton status session-<id>    # where it is and what it has spent
 baton stop session-<id>      # stop it
 baton doctor                 # limits and spending right now
+baton restart                # restart the gateway between rounds (see Keeping it running)
 ```
 
 ### 9. Let it run until the job is really done
@@ -589,6 +590,15 @@ budget is baton's own:
   but a balance drop it causes still stops baton's round.
 - **Antigravity's output when its quota actually runs out has not been observed.** The limit reads
   are expected to stop it first.
+- **Masking is by pattern.** Before it is shown, kept in the round tail or put in the log of events,
+  the agent's output has the value of `Bearer ...` and of `token`, `api_key`, `secret`, `password`
+  and `passwd` assignments (also in a longer name such as `DB_PASSWORD`) and the well-known token
+  shapes (`sk-`, `ghp_`, `AKIA`, `xoxb-`) replaced by `[masked]`. A quoted value is masked from 8
+  characters, spaces included. An unquoted value is masked only when it holds a digit or a symbol
+  other than `.`, `_`, `-`, so code such as `password = self.password` is left alone: **an unquoted
+  value of letters only is not caught.** A placeholder (`$TOKEN`, `${TOKEN}`, `<token>`) is never
+  masked. A secret in another shape, or split across two streamed fragments, is not caught either,
+  and the raw round log keeps what the agent printed. The next agent is told what `[masked]` is.
 - **A response held open for days through OpenCode is untested** beyond seconds. The job does not
   depend on it: `baton jobs` and `baton status session-<id>` show where it is, and a new message
   in the session reattaches the stream.
@@ -711,7 +721,7 @@ each cut to its first 8000 characters, and gives assistant messages the room tha
 gap marked with `...`. With `ai-memory` installed, what earlier goals learned in the directory is
 added too (see [Long-term memory](#long-term-memory); `memory = false` turns it off). After each round baton commits
 uncommitted work locally as `baton: snapshot round <n> (<agent>)` so a hard stop loses nothing. It
-never pushes (`snapshot = false` turns the commits off).
+never pushes (`snapshot = false` turns the commits off). `.baton/`, `__pycache__/` and `*.pyc` are kept out of it through `.git/info/exclude`.
 
 ### `baton.toml`
 
@@ -806,6 +816,17 @@ agent or `node` moves. Your verification commands get that same `PATH`, so a too
 elsewhere must be called by its full path. A verification command that exits 126 or 127 can never
 pass, so baton says so once in the chat and in `baton status`, and the rounds go on.
 
+**Restarting the gateway.** `baton restart` writes a request that the running `baton serve` sees.
+Each job then holds at the next point between rounds (also inside a wait), says so once, and the
+gateway sends itself SIGTERM when every running job is held, so no round is cut off. A job in the
+middle of a round is never held, and a `baton stop` still ends a hold. The jobs are resumed after
+the restart, exactly as after any restart. Under launchd (`baton install-service`) KeepAlive brings
+the service back; without a supervisor the gateway simply exits and you start `baton serve` again.
+It works whether or not jobs run. `baton restart --now` does not wait for the jobs: it is the same
+as stopping the service, and the jobs resume. A request left over when the service starts is
+dropped. To cancel a request that is still waiting, delete the file `.restart` in the state directory
+(`~/.local/state/baton/.restart` unless `BATON_STATE_DIR` moves it): the held jobs go on at once.
+
 [`examples/baton-serve.plist`](examples/baton-serve.plist) shows the same file with placeholders,
 for writing it by hand.
 
@@ -822,6 +843,7 @@ for writing it by hand.
 | `baton goal <goal.toml or job> "text"` / `--off` | Fix the goal every prompt opens with, or clear it. |
 | `baton next <goal.toml or job> [--now]` | Ask for the next agent in the queue; `--now` also ends the round after its tool call. |
 | `baton stop <goal.toml or job> [--now]` | Stop after the current round, or kill the round with `--now`. |
+| `baton restart [--now]` | Restart the gateway once every running job is between rounds; `--now` does not wait. Jobs resume. |
 | `baton opencode-config [--port 18777]` | Print the provider JSON for `opencode.json`. |
 | `baton install-service [--port 18777]` | Write the launchd plist and load it (macOS). |
 

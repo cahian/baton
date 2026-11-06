@@ -230,6 +230,20 @@ def test_say_and_stop_commands(fakes):
     assert store_for(fakes).stop_request() == "now"
 
 
+def test_restart_asks_the_gateway_and_says_what_it_did(fakes, capsys):
+    from baton.store import restart_path, restart_request
+
+    assert main(["restart"]) == 0  # no gateway, no job: still fine, and still says what it did
+    out = capsys.readouterr().out
+    assert restart_request() == "soon" and restart_path().is_file()
+    assert "between rounds" in out and str(restart_path()) in out
+    assert main(["restart", "--now"]) == 0
+    assert restart_request() == "now"
+    assert "without waiting" in capsys.readouterr().out
+    assert main(["restart"]) == 0  # asking again never downgrades a request to now
+    assert restart_request() == "now"
+
+
 def test_status_prints_cooldowns(fakes, capsys):
     store = store_for(fakes)
     until = time.time() + 3600

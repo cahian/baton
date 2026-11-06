@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from baton import gateway
 from baton.adapters.antigravity import (
     GEMINI_MODELS,
     AntigravityAdapter,
@@ -636,6 +637,44 @@ def test_round_completes_when_nothing_moves(fake, tmp_path):
     # are always read together
     assert reads.calls["/usage"] >= 2 and reads.calls["/usage"] == reads.calls["/credits"]
     assert any("text_delta" in x for x in lines)
+
+
+def test_a_whole_real_shaped_round_goes_through_the_adapter_and_the_chat(fake, tmp_path):
+    """tests/fixtures/agy_round.jsonl has the shapes of a real round, with invented ids: init at the
+    top level, split text deltas, tool steps ACTIVE then DONE or ERROR, a background task, a plain
+    status line and a result with usage."""
+    recorded = Path(__file__).parent / "fixtures" / "agy_round.jsonl"
+    wrapper = Path(fake.bin)
+    reads = wrapper.read_text().splitlines()[1]  # the limit reads still go to the fake
+    wrapper.write_text(
+        f'#!/bin/sh\ncase "$2" in /usage|/credits) {reads} ;; esac\ncat "{recorded}"\n'
+    )
+    agent = adapter(fake.bin, Reads())
+    watch = agent.tool_watch()
+    lines, sessions, shown, busy = [], [], [], []
+
+    def on_output(line):
+        lines.append(line)
+        watch.feed(line)
+        busy.append(watch.busy)
+        text = agent.render(line)
+        if text:
+            fragment = agent.is_fragment(line)
+            shown.append(gateway.render_event("output", {"text": text, "fragment": fragment}))
+
+    res = agent.run_round("go", make_ctx(tmp_path, on_output=on_output, on_session=sessions.append))
+    assert res.outcome == COMPLETED
+    assert sessions == ["conv-7f3a91"]
+    assert lines == recorded.read_text().splitlines()
+    text = "".join(shown)
+    assert "Checking the build in the background.\n" in text
+    assert "The file is missing; nothing else to do.\n" in text
+    assert "$ git status\n" in text and "manage_task: start\n" in text
+    assert "view_file: /work/project/missing.txt\n" in text
+    assert "root agent idle; waiting for 1 background task(s) to finish\n" in text
+    assert any(busy) and not watch.busy  # open steps and the task, then all closed
+    assert watch.open == set() and watch.tasks == set() and not watch.waiting
+    assert busy[lines.index("root agent idle; waiting for 1 background task(s) to finish")]
 
 
 def test_stdin_closed(fake, tmp_path):

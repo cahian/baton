@@ -25,7 +25,15 @@ from baton.gateway import DEFAULT_PORT, build_goal, opencode_config, serve
 from baton.runner import pin_goal, preempted_sentence, run_goal
 from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
 from baton.service import ServiceError, install
-from baton.store import AlreadyRunning, StateError, Store, state_base, state_dir
+from baton.store import (
+    AlreadyRunning,
+    StateError,
+    Store,
+    request_restart,
+    restart_path,
+    state_base,
+    state_dir,
+)
 
 STATUS_EVENTS = 8
 
@@ -460,6 +468,17 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_restart(args: argparse.Namespace) -> int:
+    request_restart(now=args.now)
+    when = (
+        "without waiting for the jobs" if args.now else "once every running job is between rounds"
+    )
+    print(f"restart requested ({restart_path()}): the gateway restarts {when}")
+    print("jobs are resumed after it; launchd brings the service back, and with no gateway running")
+    print("the request is dropped at the next start")
+    return 0
+
+
 # doctor
 
 
@@ -565,6 +584,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("goal", help="goal file, or a job name such as session-<id>")
     p.add_argument("--now", action="store_true", help="kill the current round")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("restart", help="restart the gateway once its jobs are between rounds")
+    p.add_argument(
+        "--now", action="store_true", help="do not wait for the jobs to be between rounds"
+    )
+    p.set_defaults(func=cmd_restart)
 
     p = sub.add_parser("install-service", help="run `baton serve` under launchd (macOS)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)

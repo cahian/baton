@@ -46,6 +46,38 @@ def state_dir(name: str) -> Path:
     return state_base() / name
 
 
+# restart: one request for the whole gateway, not for a goal
+
+# Hidden: no goal can be named with a leading dot, so no job directory is ever this file.
+RESTART_FILE = ".restart"
+
+
+def restart_path() -> Path:
+    return state_base() / RESTART_FILE
+
+
+def request_restart(now: bool = False) -> None:
+    """Ask the gateway to restart once its running jobs are between rounds, or, with `now`, at once
+    (the jobs are resumed either way: a restart is never a stop)."""
+    if not now and restart_request() == "now":
+        return  # never downgrade
+    state_base().mkdir(parents=True, exist_ok=True, mode=0o700)
+    _atomic_write(restart_path(), "now\n" if now else "soon\n")
+
+
+def restart_request() -> str:
+    """ "" when none, "now" when forced, otherwise "soon"."""
+    try:
+        content = restart_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return "now" if content == "now" else "soon"
+
+
+def clear_restart() -> None:
+    restart_path().unlink(missing_ok=True)
+
+
 # Directories in use, across every process: one claim file per running goal, flocked by its
 # runner for as long as it runs, so a claim ends with the process however that dies.
 WORKDIRS_DIR = ".workdirs"
@@ -450,6 +482,16 @@ class Store:
         except FileNotFoundError:
             return ""
         return "now" if content == "now" else "soon"
+
+    # restart
+
+    def restart_pending(self) -> bool:
+        """Whether a restart waits for this run to hold. Only the gateway's jobs say yes: a
+        runner outside it has nothing to restart."""
+        return False
+
+    def report_held(self, held: bool) -> None:
+        """This run is, or no longer is, at a point between rounds where a restart may happen."""
 
     # lock
 

@@ -31,6 +31,9 @@ from baton.store import (
     StateError,
     Store,
     WorkdirBusy,
+    clear_restart,
+    request_restart,
+    restart_request,
     state_base,
     workdir_conflict,
     workdir_lock,
@@ -352,6 +355,101 @@ def test_stop_during_wait_wakes_early(go, agents, store, world):
     assert 20 <= sum(world.sleeps) <= 30
 
 
+# a restart of the gateway
+
+
+class GatewayStore(Store):
+    """What the gateway's job store adds: it sees the restart request and hears when held."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.reports: list[bool] = []
+
+    def restart_pending(self):
+        return restart_request() != ""
+
+    def report_held(self, held):
+        self.reports.append(held)
+
+
+@pytest.fixture
+def gstore(tmp_path):
+    return GatewayStore(tmp_path / "state")
+
+
+def test_a_restart_holds_the_run_before_it_picks_an_agent(go, agents, work, gstore, world):
+    request_restart()
+    agents["codex"].script = [done(work)]
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        assert agents["codex"].prompts == []  # nothing runs while it is held
+        if len(world.sleeps) >= 3:
+            clear_restart()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert len(world.sleeps) == 3 and len(agents["codex"].prompts) == 1
+    held = [e for e in gstore.events() if e["kind"] == "held"]
+    assert len(held) == 1  # said once, however long it holds
+    assert gstore.reports == [True, False]
+    assert "baton restart" in gateway.render_event("held", held[0])
+
+
+def test_a_restart_never_holds_a_round_that_is_running(go, agents, work, gstore, world):
+    def ask_for_a_restart(agent, prompt, ctx):
+        assert gstore.reports == []
+        request_restart()  # in the middle of the round: it ends first
+        return RoundResult(COMPLETED)
+
+    agents["codex"].script = [ask_for_a_restart, done(work)]
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        clear_restart()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert len(agents["codex"].prompts) == 2
+    assert gstore.reports == [True, False]
+
+
+def test_a_stop_ends_the_hold_and_is_honoured(go, agents, gstore, world):
+    request_restart()
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        gstore.request_stop()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert agents["codex"].prompts == [] and kinds(gstore)[-1] == "stopped"
+    assert gstore.reports[0] is True and gstore.reports[-1] is False
+    assert restart_request() == "soon"  # the restart itself is the gateway's to clear
+
+
+def test_a_run_in_a_long_wait_counts_as_held(go, agents, gstore, world):
+    agents["codex"].script = [result(LIMIT, until=world.now + 7200)]
+    agents["antigravity"].script = [result(LIMIT, until=world.now + 7200)]
+    seen = []
+
+    def sleep(seconds):
+        world.sleep(seconds)
+        if sum(world.sleeps) >= 10:
+            request_restart()
+        if sum(world.sleeps) >= 30:
+            seen.append(list(gstore.reports))
+            gstore.request_stop()
+
+    assert go(st=gstore, sleep=sleep) == 0
+    assert seen == [[True]]  # held inside the wait, which goes on
+    assert sum(world.sleeps) < 60
+
+
+def test_a_run_outside_the_gateway_ignores_a_restart(go, agents, work, store):
+    request_restart()
+    agents["codex"].script = [done(work)]
+    assert go() == 0
+    assert "held" not in kinds(store) and len(agents["codex"].prompts) == 1
+
+
 # no verify command
 
 
@@ -409,6 +507,16 @@ def test_prompt_contains_objective_gate_tail_handoff_and_rules(tmp_path, work, g
         ".baton/HANDOFF.md",
     ):
         assert needle in prompt, needle
+
+
+def test_the_prompt_says_what_masked_is_only_with_a_tail(tmp_path, work):
+    goal = make_goal(tmp_path, work)
+    args = dict(gate_tail="", notes="", handoff="", resumed=False)
+    with_tail = build_prompt(goal, round_tail="password=[masked]", **args)
+    assert "Tail of the previous round" in with_tail
+    head = with_tail.split("Tail of the previous round", 1)[1].split("\n", 1)[0]
+    assert "[masked]" in head and "credential" in head and len(head) < 200
+    assert "[masked]" not in build_prompt(goal, round_tail="", **args)
 
 
 def test_previous_round_tail_reaches_next_agent(go, agents, work, world):
@@ -839,6 +947,21 @@ def test_output_events_only_for_rendered_lines(go, agents, work, store):
     assert [e["text"] for e in outs] == ["visible"]
 
 
+def test_a_credential_in_the_output_is_masked_in_the_event_and_the_next_prompt(
+    go, agents, work, store, world
+):
+    secret = "hunter2hunter"
+    agents["codex"].script = [
+        say(["$ ls", f"password={secret}"], result(LIMIT, until=world.now + 3600))
+    ]
+    agents["antigravity"].script = [done(work)]
+    assert go() == 0
+    outs = [e["text"] for e in store.events() if e["kind"] == "output"]
+    assert outs == ["$ ls", "password=[masked]"]
+    assert secret not in agents["antigravity"].prompts[0]
+    assert "password=[masked]" in agents["antigravity"].prompts[0]
+
+
 class Streaming(Fake):
     """An adapter that streams fragments: a line starting with `~` is one, the rest are whole."""
 
@@ -974,6 +1097,27 @@ def test_baton_dir_created_and_excluded(go, agents, work):
     assert exclude.splitlines().count(".baton/") == 1
     assert go() == 0
     assert (work / ".git" / "info" / "exclude").read_text().splitlines().count(".baton/") == 1
+
+
+def test_pycache_and_pyc_are_excluded_beside_baton(go, work):
+    subprocess.run(["git", "init", "-q", str(work)], check=True)
+    exclude = work / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    exclude.write_text(".baton/")  # an older baton wrote only this, and no final newline
+    (work / "DONE").write_text("x")
+    assert go() == 0
+    assert go() == 0
+    lines = exclude.read_text().splitlines()
+    assert [lines.count(x) for x in (".baton/", "__pycache__/", "*.pyc")] == [1, 1, 1]
+    (work / "pkg" / "__pycache__").mkdir(parents=True)
+    (work / "pkg" / "__pycache__" / "a.cpython-313.pyc").write_bytes(b"x")
+    (work / "b.pyc").write_bytes(b"x")
+    ignored = subprocess.run(
+        ["git", "-C", str(work), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "pyc" not in ignored and "__pycache__" not in ignored
 
 
 def test_non_git_workdir_is_fine(go, work):

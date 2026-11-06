@@ -18,7 +18,7 @@ from baton.adapters.base import COMPLETED, LIMIT, Availability, RoundResult
 from baton.cli import build_adapters, main
 from baton.gateway import content_text, make_server
 from baton.proc import process_start
-from baton.store import Store, state_dir, workdir_lock
+from baton.store import Store, request_restart, restart_request, state_dir, workdir_lock
 
 SESSION = "ses_abc123"
 TOOLS = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
@@ -2858,3 +2858,162 @@ def test_a_big_goal_that_starts_a_job_is_filed_once_too(gw):
     s.close()
     assert "`.baton/notes/" in session_store().goal()
     assert len(list((gw.work / ".baton" / "notes").iterdir())) == 1
+
+
+# a native restart
+
+
+class StubJob:
+    def __init__(self, running=True, held=False):
+        self.running, self.is_held = running, held
+
+    def is_running(self):
+        return self.running
+
+    def held(self):
+        return self.is_held
+
+
+@pytest.fixture
+def kills(monkeypatch):
+    """Every signal the gateway sends itself. The real os.kill is never reached."""
+    sent = []
+    monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    return sent
+
+
+def test_the_gateway_signals_itself_only_when_every_running_job_is_held(gw, kills):
+    manager = gw.manager
+    assert manager.restart_tick() is False and kills == []  # no request
+    request_restart()
+    manager._jobs.update(a=StubJob(held=True), b=StubJob(held=False), c=StubJob(running=False))
+    assert manager.restart_tick() is False and kills == []  # b is in the middle of a round
+    assert restart_request() == "soon"
+    manager._jobs["b"].is_held = True
+    assert manager.restart_tick() is True
+    assert kills == [(os.getpid(), signal.SIGTERM)]
+    assert restart_request() == ""  # removed first, so the next start is not held by it
+    assert manager.restart_tick() is False and len(kills) == 1
+    manager._jobs.clear()
+
+
+def test_a_restart_with_no_job_running_goes_ahead(gw, kills):
+    request_restart()
+    assert gw.manager.restart_tick() is True and len(kills) == 1
+
+
+def test_a_forced_restart_does_not_wait_for_a_job(gw, kills):
+    gw.manager._jobs["a"] = StubJob(held=False)
+    request_restart(now=True)
+    assert gw.manager.restart_tick() is True and len(kills) == 1
+    gw.manager._jobs.clear()
+
+
+def test_a_job_held_between_rounds_lets_the_gateway_restart(gw, kills):
+    request_restart()
+    s = gw.stream("go")
+    assert wait_for(lambda: gw.job() is not None and gw.job().held())
+    assert gw.agents["claude_api"].prompts == []  # held before it picked an agent
+    assert any(e["kind"] == "held" for e in gw.events())
+    assert "baton restart" in s.read_until("baton restart")
+    assert gw.manager.restart_tick() is True
+    assert kills == [(os.getpid(), signal.SIGTERM)]
+    assert wait_for(lambda: len(gw.agents["claude_api"].prompts) == 1)  # request gone: it goes on
+    assert not gw.job().held()
+
+
+def test_a_job_in_the_middle_of_a_round_is_not_held(gw, kills):
+    gw.agents["claude_api"].script = [until_killed("busy")]
+    s = gw.stream("go")
+    s.read_until("busy")
+    request_restart()
+    time.sleep(0.2)
+    assert not gw.job().held() and gw.manager.restart_tick() is False and kills == []
+    gw.job().store.request_stop(now=True)
+    s.read_all()
+
+
+def test_a_person_s_stop_still_works_while_a_job_is_held(gw, kills):
+    request_restart()
+    s = gw.stream("go")
+    assert wait_for(lambda: gw.job() is not None and gw.job().held())
+    gw.job().store.request_stop()
+    assert "stopped" in s.read_all()
+    assert gw.agents["claude_api"].prompts == []
+
+
+def test_serve_forgets_a_stale_request_before_recover_and_watches_after(monkeypatch):
+    calls = []
+
+    class Manager:
+        def forget_restart(self):
+            calls.append("forget")
+
+        def recover(self):
+            calls.append("recover")
+            return 0
+
+        def watch_restart(self):
+            calls.append("watch")
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    class Server:
+        server_address = ("127.0.0.1", 1)
+
+        def serve_forever(self, poll_interval):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(gateway, "make_server", lambda port, adapters_for: (Server(), Manager()))
+    gateway.serve(1, lambda goal: {})
+    assert calls == ["forget", "recover", "watch", "shutdown"]
+
+
+def test_forgetting_a_stale_request_removes_it_and_never_raises(gw, capsys, monkeypatch):
+    request_restart()
+    gw.manager.forget_restart()
+    assert restart_request() == "" and capsys.readouterr().out == ""
+
+    def broken():
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(gateway, "clear_restart", broken)
+    gw.manager.forget_restart()  # serve goes on
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1 and "restart" in lines[0] and "read-only" in lines[0]
+
+
+def test_a_request_that_cannot_be_removed_signals_nothing(gw, kills, capsys, monkeypatch):
+    request_restart()
+
+    def broken():
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(gateway, "clear_restart", broken)
+    assert gw.manager.restart_tick() is False and gw.manager.restart_tick() is False
+    assert kills == []  # a file that stays would restart it again and again
+    assert len(capsys.readouterr().out.splitlines()) == 1  # said once
+
+
+def test_the_restart_loop_acts_on_a_request(gw, kills, monkeypatch):
+    monkeypatch.setattr(gateway, "RESTART_POLL_S", 0.02)
+    gw.manager.watch_restart()
+    assert gw.manager._restarter.is_alive() and kills == []
+    request_restart()
+    assert wait_for(lambda: kills != [])
+    assert kills == [(os.getpid(), signal.SIGTERM)] and restart_request() == ""
+    assert wait_for(lambda: not gw.manager._restarter.is_alive())  # its work is done
+
+
+def test_the_restart_loop_stops_with_the_manager(gw, kills, monkeypatch):
+    monkeypatch.setattr(gateway, "RESTART_POLL_S", 0.02)
+    gw.manager.watch_restart()
+    gw.manager.shutdown(timeout=5)
+    assert wait_for(lambda: not gw.manager._restarter.is_alive())
+    request_restart()
+    time.sleep(0.1)
+    assert kills == []

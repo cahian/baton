@@ -36,7 +36,10 @@ from baton.store import (
     AlreadyRunning,
     StateError,
     Store,
+    clear_restart,
     overlapping,
+    restart_path,
+    restart_request,
     state_base,
     state_dir,
     workdir_conflict,
@@ -64,6 +67,8 @@ MAX_RESTARTS = 5
 SETTLE_POLL_S = 0.05
 # While a job runs, OpenCode's inbox is read this often, with this long to wait on a lock.
 INBOX_POLL_S = 2.0
+# How often the gateway looks for a restart request whose jobs are all held.
+RESTART_POLL_S = 1.0
 INBOX_DB_TIMEOUT_S = 1.0
 # What a note taken from the inbox waits for its echo, the later POST of the same words, before
 # it is forgotten (the person may have cancelled that message in OpenCode, which sends nothing).
@@ -390,6 +395,11 @@ def render_event(kind: str, f: Mapping) -> str:
         return f"\n[baton] done: {f.get('reason')} (round {f.get('round')}).\n"
     if kind == "stopped":
         return f"\n[baton] stopped after round {f.get('round')}.\n"
+    if kind == "held":
+        return (
+            "\n[baton] a `baton restart` is waiting: this job holds between rounds and goes on "
+            "when baton is back\n\n"
+        )
     return ""
 
 
@@ -444,6 +454,7 @@ class _JobStore(Store):
         super().__init__(root)
         self._listener = listener
         self.halted = False
+        self.held = False  # at a point between rounds, with a restart waiting
 
     def halt(self) -> None:
         """Stop the run now because the server is going away. Held in memory and not in the stop
@@ -460,6 +471,12 @@ class _JobStore(Store):
     def consume_stop(self) -> None:
         """Nothing yet: until job.json says `stopped`, the file is all that keeps a restart from
         resuming this job. The job clears it after saving that status."""
+
+    def restart_pending(self) -> bool:
+        return restart_request() != ""
+
+    def report_held(self, held: bool) -> None:
+        self.held = held
 
     def emit(self, kind: str, **fields: object) -> None:
         try:
@@ -523,6 +540,10 @@ class Job:
     def is_running(self) -> bool:
         with self._cond:
             return not self._done
+
+    def held(self) -> bool:
+        """Between rounds, with a restart of the gateway waiting: nothing is in flight."""
+        return self.store.held and self.is_running()
 
     def join(self, timeout: float) -> bool:
         self._thread.join(timeout)
@@ -903,6 +924,61 @@ class JobManager:
         self._echoes: set[tuple[str, tuple[int, str]]] = set()
         self._poller: threading.Thread | None = None
         self._poller_stop = threading.Event()
+        self._restarter: threading.Thread | None = None
+        self._restart_unclearable = False  # said once
+
+    # a restart asked for with `baton restart`
+
+    def forget_restart(self) -> None:
+        """Drop a request left by the last run, before its jobs are taken up again. A file that
+        cannot be removed is said once in the log and never stops `serve`."""
+        try:
+            clear_restart()
+        except OSError as exc:
+            print(
+                f"baton: could not remove the restart request {restart_path()}: {exc}", flush=True
+            )
+
+    def watch_restart(self) -> None:
+        """Start the thread that acts on restart requests, once the jobs are up again."""
+        self._restarter = threading.Thread(
+            target=self._restart_loop, name="baton-restart", daemon=True
+        )
+        self._restarter.start()
+
+    def _restart_loop(self) -> None:
+        while not self._poller_stop.wait(RESTART_POLL_S):
+            try:
+                if self.restart_tick():
+                    return
+            except Exception:
+                pass  # looked at again on the next tick
+
+    def restart_tick(self) -> bool:
+        """Restart the gateway, by sending it the SIGTERM that `launchctl` would, if a restart is
+        asked for and every running job is held between rounds (or the request says `now`). The
+        request is removed first, so it never outlives the process it was for; one that cannot be
+        removed signals nothing, since it would restart the next process too. True when sent."""
+        request = restart_request()
+        if not request:
+            return False
+        with self._lock:
+            running = [job for job in self._jobs.values() if job.is_running()]
+        if request != "now" and not all(job.held() for job in running):
+            return False
+        try:
+            clear_restart()
+        except OSError as exc:
+            if not self._restart_unclearable:
+                self._restart_unclearable = True
+                print(
+                    f"baton: restart not done, the request {restart_path()} cannot be removed: "
+                    f"{exc}",
+                    flush=True,
+                )
+            return False
+        os.kill(os.getpid(), signal.SIGTERM)
+        return True
 
     # OpenCode's inbox
 
@@ -1621,9 +1697,11 @@ def serve(port: int, adapters_for: Callable[[Goal], Mapping[str, Adapter]]) -> N
     print(f"baton: gateway listening on http://{host}:{bound}/v1", flush=True)
     with _Shutdown():
         try:
+            manager.forget_restart()
             resumed = manager.recover()
             if resumed:
                 print(f"baton: resumed {resumed} unfinished job(s)", flush=True)
+            manager.watch_restart()
             server.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:
             pass

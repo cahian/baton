@@ -11,6 +11,11 @@ from baton.store import (
     StateError,
     Store,
     WorkdirBusy,
+    clear_restart,
+    request_restart,
+    restart_path,
+    restart_request,
+    state_base,
     state_dir,
     workdir_conflict,
     workdir_lock,
@@ -385,3 +390,31 @@ def test_the_first_version_of_the_check_is_kept_once_and_can_be_dropped(st):
     st.drop_first_check()  # nothing to drop is fine
     st.keep_first_check("new goal\n")
     assert st.first_check() == "new goal\n"
+
+
+def test_a_restart_request_is_a_file_in_the_state_base_and_never_a_job_s(st):
+    assert restart_request() == "" and restart_path().parent == state_base()
+    assert restart_path().name == ".restart"  # no goal name can start with a dot
+    request_restart()
+    assert restart_request() == "soon" and restart_path().read_text() == "soon\n"
+    request_restart(now=True)
+    assert restart_request() == "now"
+    clear_restart()
+    clear_restart()  # nothing to remove is not an error
+    assert restart_request() == ""
+    request_restart()
+    assert not st.restart_pending()  # a plain store (a `baton run`) never holds for it
+    st.report_held(True)  # and has nobody to tell
+
+
+def test_a_goal_named_restart_does_not_meet_the_request_file(st):
+    state_dir("restart").mkdir(parents=True)  # a job with the name of the old file
+    request_restart()
+    assert restart_request() == "soon" and state_dir("restart").is_dir()
+    clear_restart()
+    assert state_dir("restart").is_dir()
+
+
+def test_a_restart_request_that_cannot_be_read_is_none(st):
+    restart_path().mkdir(parents=True)  # whatever sits there, reading it never raises
+    assert restart_request() == ""

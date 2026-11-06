@@ -1180,3 +1180,109 @@ def test_scrub_drops_every_variable_that_matches_before_the_adapter_adds_its_own
         extra_env={"XX_TWO": "its-own-value-123"},  # added back after the scrub
     )
     assert shown[0] == "['XX_TWO', 'YY_KEEP']"
+
+
+# masking what an agent printed
+
+
+@pytest.mark.parametrize(
+    "text, shown",
+    [
+        ("Authorization: Bearer abc123def456ghi", "Authorization: Bearer [masked]"),
+        ("use Bearer abc123def456ghi.", "use Bearer [masked]."),
+        ("password=hunter2hunter", "password=[masked]"),
+        ("API_KEY: abcdef0123456789", "API_KEY: [masked]"),
+        ('{"token": "abcdef0123456789"}', '{"token": "[masked]"}'),
+        ('{\\"token\\":\\"abcdef0123456789\\"}', '{\\"token\\":\\"[masked]\\"}'),
+        ("export GITHUB_TOKEN=ghp_" + "a1" * 12, "export GITHUB_TOKEN=[masked]"),
+        ("SECRET_KEY=abc123def456", "SECRET_KEY=[masked]"),
+        ("AWS_SECRET_ACCESS_KEY=abc123def456", "AWS_SECRET_ACCESS_KEY=[masked]"),
+        ("DB_PASSWORD=abc123def456", "DB_PASSWORD=[masked]"),
+        ("key sk-" + "Ab3" * 10 + " end", "key [masked] end"),
+        ("ghp_" + "a1" * 12, "[masked]"),
+        ("id AK" + "IAABCDEFGHIJKLMNOP.", "id [masked]."),
+        ("xo" + "xb-1234567890-abcdefghij", "[masked]"),
+        # a quoted value runs to its closing quote, spaces included, and is masked at 8 characters
+        ('"password": "correct horse battery staple"', '"password": "[masked]"'),
+        ("password = 'correct horse'", "password = '[masked]'"),
+        ('password="abcdefgh" next', 'password="[masked]" next'),
+        # an unquoted one may hold , ( ) and ends at white space, & or #
+        ("password=abc,def123456", "password=[masked]"),
+        ("password=Ab(cd)ef12345", "password=[masked]"),
+        ("password=abc12345, then", "password=[masked], then"),
+        ("url?token=abc12345&x=1", "url?token=[masked]&x=1"),
+        ("token=abc12345#comment", "token=[masked]#comment"),
+        ("password=$ecretPass1!", "password=[masked]"),
+        ("secret: Zz9+/abcdefgh=", "secret: [masked]"),
+    ],
+)
+def test_mask_secrets_keeps_the_name_and_hides_the_value(text, shown):
+    assert proc.mask_secrets(text) == shown
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "$ ls -la",
+        "$ git status",
+        "run the tests and fix the failing ones",
+        "def token_count(items): return len(items)",
+        "password = os.environ['PASSWORD']",
+        "token = get_token(self)",
+        "token=short",
+        "secret: abc",
+        "password=$PASSWORD",
+        "password=${PASSWORD},",
+        "token=${TOKEN}",
+        "api_key: <token>",
+        'api_key: "<your api key>"',
+        'token: "${GITHUB_TOKEN}"',
+        "Authorization: Bearer <token>",
+        "Authorization: Bearer $TOKEN",
+        "secret=xxxxxxxxxxxx",
+        "secret=********",
+        "use Bearer authentication for the API",
+        "use Bearer authentication.",
+        "task-force-assessment-of-the-project and risk-assessment-table",
+        "x = self.password",
+        "password = self.password",
+        "DB_PASSWORD = settings.DB_PASSWORD",
+        "secret: process.env.SECRET,",
+        "token = AuthToken",
+        "const token = readToken(req);",
+        "max_tokens=4096",
+        "token_url=https://example.com/oauth/token",
+        "password_file=/etc/app/password",
+        "",
+    ],
+)
+def test_mask_secrets_leaves_ordinary_text_alone(text):
+    assert proc.mask_secrets(text) == text
+
+
+def test_mask_secrets_is_idempotent():
+    once = proc.mask_secrets('password=hunter2hunter, "token": "a long quoted one"')
+    assert proc.mask_secrets(once) == once
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "a" * 65536,
+        "token_" * 11000,
+        "password=" * 8000,
+        'token="' * 9000,
+        "token=" + "x1" * 32768,
+        "Bearer " + "a1" * 32768,
+        'password="' + "x" * 65536,
+        "-" * 65536,
+    ],
+)
+def test_mask_secrets_is_fast_on_a_64k_line(line):
+    started = time.monotonic()
+    proc.mask_secrets(line)
+    assert time.monotonic() - started < 1.0
+
+
+def test_a_value_is_masked_up_to_4096_characters():
+    assert proc.mask_secrets("password=" + "a1" * 4000) == "password=[masked]" + "a1" * 1952
