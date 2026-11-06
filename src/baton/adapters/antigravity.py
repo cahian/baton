@@ -544,7 +544,14 @@ class AntigravityAdapter:
         except Exception as exc:
             return Availability(False, until=now + RETRY_S, reason=f"cannot read limits: {exc}")
 
-    def argv(self, prompt: str, session_id: str | None, tier: str = "strong") -> list[str]:
+    def argv(
+        self,
+        prompt: str,
+        session_id: str | None,
+        tier: str = "strong",
+        *,
+        read_only: bool = False,
+    ) -> list[str]:
         cfg = tier_config(self.cfg, tier)
         # A NUL byte would make exec fail; a leading slash would run a slash command instead.
         prompt = prompt.replace("\x00", "")
@@ -553,13 +560,16 @@ class AntigravityAdapter:
         argv = [
             cfg.bin,
             "-p",
-            prompt,
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--model",
             cfg.model,
         ]
-        if cfg.full_access:
+        if read_only:
+            argv += ["--mode", "plan"]
+        if cfg.full_access and not read_only:
             argv.append("--dangerously-skip-permissions")
         if session_id is not None:
             argv += ["--conversation", session_id]
@@ -603,12 +613,16 @@ class AntigravityAdapter:
                 return self._subagent(event, ctx, subagents)
             return None
 
-        argv = self.argv(prompt, ctx.session_id, ctx.tier)
+        argv = self.argv(prompt, ctx.session_id, ctx.tier, read_only=ctx.read_only)
+        # Send the prompt as one NDJSON user event instead of argv. OpenCode compaction may
+        # include the entire chat history, which can exceed macOS's per-argument size limit.
+        stdin_text = (
+            json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n"
+        )
 
         def start(run_ctx: RoundContext) -> RoundResult:
-            # The prompt travels in argv; stdin stays closed (None), or agy waits on it.
             exit_ = run_streaming(
-                argv, ctx.workdir, None, run_ctx, on_line, guard.tick, tick_s=self.tick_s
+                argv, ctx.workdir, stdin_text, run_ctx, on_line, guard.tick, tick_s=self.tick_s
             )
             if exit_.stopped is not None:
                 return exit_.stopped
@@ -693,3 +707,11 @@ class AntigravityAdapter:
             error = body.get("error")
             return f"error: {error}" if isinstance(error, str) and error else None
         return None
+
+    def response_text(self, line: str) -> str | None:
+        """Return model text deltas while keeping tool status out of summary-only responses."""
+        event = _parse_event(line)
+        if event is None or event.get("event") != "step_update":
+            return None
+        delta = _payload(event).get("text_delta")
+        return delta if isinstance(delta, str) and delta else None

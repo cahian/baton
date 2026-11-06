@@ -45,7 +45,7 @@ threshold_pct = 90
 poll_s = 15
 turn_max_s = 18000
 
-# Superpowers is required (git clone https://github.com/obra/superpowers ~/.config/baton/superpowers).
+# Superpowers is optional and used only when a goal sets `phases = true`.
 # Leave `dir` empty: only the official Claude Code plugin install and that clone are found
 # automatically. An install anywhere else needs `dir`. Only this file may set it: a goal file or a repository's baton.toml cannot.
 [superpowers]

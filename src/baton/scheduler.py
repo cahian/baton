@@ -279,15 +279,23 @@ class Scheduler:
         agent["until"] = known if known is not None else now + UNAVAILABLE_RETRY_S
         agent["reason"] = avail.reason
 
-    def pick(self, avoid: str | None = None) -> Adapter | None:
+    def pick(self, avoid: str | None = None, prefer: str | None = None) -> Adapter | None:
         """The adapter to run now, or None when every agent is cooling down or unavailable.
 
+        `prefer` asks for exactly one vendor: no other vendor is substituted when it is resting.
         `avoid` names the agent a round should not go to, if another plan agent can take it (a
         review is better done by someone other than the builder). When it is the agent that would
         be returned and another queue agent reads available, that one is returned for this round
         only: `current` stays where it was, so the next ordinary round continues as before. A
         reserve agent is never returned because of `avoid`."""
         with self._lock:
+            if prefer is not None:
+                if prefer not in self._agents or prefer in self._dropped:
+                    return None
+                found = self._try(prefer)
+                if found is not None:
+                    self._begin(prefer)
+                return found
             for name in self._candidates():
                 found = self._try(name)
                 if found is None:
@@ -348,6 +356,14 @@ class Scheduler:
                 return True
             return avail.ok or not avail.permanent
 
+    def reset_cooldown(self, name: str) -> None:
+        """Make a person-requested vendor selection recheck current availability immediately."""
+        with self._lock:
+            if name in self._agents:
+                self._agents[name]["until"] = 0.0
+                self._agents[name]["reason"] = ""
+                self._save_quietly()
+
     def plan_ready_to_check(self) -> list[str]:
         """The queue agents whose cooldown has passed and that are not blocked, in `order`: the
         ones worth reading while a reserve agent runs. Moves nothing. Nothing at all once the day's
@@ -368,10 +384,16 @@ class Scheduler:
             if name in self._agents:
                 self._apply(self._agents[name], avail)
 
-    def next_wake(self) -> float:
-        """Epoch of the earliest possible retry, never sooner than 30 s from now."""
+    def next_wake(self, prefer: str | None = None) -> float:
+        """Epoch of the earliest possible retry, never sooner than 30 s from now.
+
+        With `prefer`, only that vendor's cooldown is considered.
+        """
         with self._lock:
             now = self._clock()
+            if prefer is not None:
+                agent = self._agents.get(prefer)
+                return max(agent["until"] if agent else now, now + MIN_WAIT_S)
             untils = [a["until"] for a in self._agents.values() if a["until"] > now]
             return max(min(untils), now + MIN_WAIT_S) if untils else now + MIN_WAIT_S
 
@@ -398,11 +420,11 @@ class Scheduler:
             self._save_quietly()
 
     def turn_reason(self, agent: str) -> str:
-        """Why the turn `agent` holds is over (`5 hours`, `USD 50`), or "" while it is not, when
-        it holds none, or when `agent` reserves: the turn of a reserve agent never ends. Worked
-        time counts first."""
+        """Why `agent`'s turn is over (`5 hours`, `USD 50`), or "" while it is not or it holds
+        none. An explicitly selected reserve vendor is subject to the same turn limit.
+        Worked time counts first."""
         with self._lock:
-            if self._turn["agent"] != agent or self._adapters[agent].reserve:
+            if self._turn["agent"] != agent:
                 return ""
             limits = self._limits.get(agent, TurnLimits())
             if self._turn["worked_s"] >= limits.turn_max_s:

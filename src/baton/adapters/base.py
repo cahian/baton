@@ -75,6 +75,10 @@ class RoundContext:
     on_session_total: Callable[[str, Decimal], None] = lambda session, total: None
     # "strong" (plan, review and the plain relay) or "build": which of the two models runs.
     tier: str = "strong"
+    # Summary-only requests must not write to the user's repository.
+    read_only: bool = False
+    # Use Codex's native persistent Goal tool for whole-task mode.
+    native_goal: bool = False
     # Told, with the tool and the model when the stream shows it, of every subagent a round starts.
     on_subagent: Callable[[str, str | None], None] = lambda tool, model: None
 
@@ -193,6 +197,10 @@ class Adapter(Protocol):
     def run_round(self, prompt: str, ctx: RoundContext) -> RoundResult: ...
 
     def render(self, line: str) -> str | None: ...
+
+    def response_text(self, line: str) -> str | None:
+        """Text safe to return for a response-only request; excludes commands and tool activity."""
+        ...
 
     def is_work(self, line: str) -> bool:
         """True when `line` shows the agent acting on its prompt. An error message or noise that

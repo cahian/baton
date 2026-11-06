@@ -21,6 +21,7 @@ import time
 import tomllib
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import replace
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,8 +29,10 @@ from urllib.parse import quote
 
 from baton import runner as runner_module
 from baton.adapters.base import Adapter
-from baton.commands import GOAL, GOAL_OFF, NEXT, Command, parse_command
+from baton.commands import GOAL, GOAL_OFF, HELP, NEXT, USE, Command, parse_command
 from baton.config import Goal, GoalError, check_repo_table, goal_from_table
+from baton.help import HELP_TEXT
+from baton.oneshot import append_transcript, message_transcript
 from baton.proc import DEAD, OURS, UNKNOWN, check_group, kill_group
 from baton.runner import file_large_note, pin_goal, preempted_sentence, run_goal
 from baton.store import (
@@ -248,6 +251,45 @@ def title_for(messages: list) -> str:
     words = [w for w in re.sub(r"</?[A-Za-z_][^>\n]*>", " ", source).split() if w.strip("\"'`")]
     title = " ".join(w.strip("\"'`") for w in words[:TITLE_WORDS])
     return title or "New session"
+
+
+def is_title_request(messages: list) -> bool:
+    """OpenCode's title-only prompt, distinct from other requests that omit tools."""
+    index = last_user_index(messages)
+    return index is not None and TITLE_PREFIX.casefold() in _text_of(messages[index]).casefold()
+
+
+COMPACTION_MARKERS = (
+    "you must summarize the conversation above into a structured summary",
+    "update the existing checkpoint in the conversation above into one consolidated summary",
+)
+COMPACTION_NUDGE = "the previous response did not fill in the required summary template"
+
+
+def is_compaction_request(messages: list) -> bool:
+    """Recognize OpenCode's explicit compaction instruction in the latest user message."""
+    index = last_user_index(messages)
+    if index is None:
+        return False
+    text = _text_of(messages[index]).casefold()
+    if any(marker in text for marker in COMPACTION_MARKERS):
+        return True
+    if COMPACTION_NUDGE in text:
+        return any(
+            _role(message) == "user"
+            and any(marker in _text_of(message).casefold() for marker in COMPACTION_MARKERS)
+            for message in messages[:index]
+        )
+    return False
+
+
+def compaction_objective(messages: list) -> str:
+    """Keep OpenCode's instruction intact and inline its complete user/assistant/tool history."""
+    index = last_user_index(messages)
+    instruction = _text_of(messages[index]).strip() if index is not None else ""
+    source_messages = messages[:index] if index is not None else messages
+    source = message_transcript(source_messages)
+    return f"{source}### user\n{instruction}\n"
 
 
 # the session's directory
@@ -521,12 +563,15 @@ class Job:
         restarted: bool = False,
         inbox_seen: Iterable[str] = (),
         inbox_taken: Mapping[str, dict] | None = None,
+        response_only: bool = False,
     ) -> None:
         self.session = session
         self.name = name
         self.workdir = workdir
         self.resolved = workdir.resolve()
         self.goal = goal
+        self.response_only = response_only
+        self._response_round: list[str] = []
         # The conversation up to the newest message handed to this job.
         self.context = context
         self.restarted = restarted  # taken up again by a new server, not started by a message
@@ -556,7 +601,7 @@ class Job:
     # life
 
     def start(self) -> None:
-        if self.restarted:
+        if self.restarted and not self.response_only:
             self._push("\n[baton] baton restarted: continuing this job\n\n")
         self._thread.start()
 
@@ -665,7 +710,7 @@ class Job:
     def _note_waiting(self) -> bool:
         """True when a run that finished left a note in the inbox. A run that was stopped
         leaves notes alone."""
-        if self._end != "finished":
+        if self.response_only or self._end != "finished":
             return False
         try:
             return bool((self.store.root / "inbox.md").read_text(encoding="utf-8").strip())
@@ -675,6 +720,8 @@ class Job:
     def objective(self) -> str:
         """The briefing for a fresh round: the conversation so far, including every message
         accepted while the job runs."""
+        if self.response_only:
+            return self.goal.objective
         with self._cond:
             return compose_objective(self.context[:-1], self.context[-1]["content"])
 
@@ -693,6 +740,7 @@ class Job:
                 "workdir": str(self.workdir),
                 "objective": self.objective(),
                 "conversation": slim_conversation(self.context),
+                "response_only": self.response_only,
                 "accepted": sorted(self._accepted),
                 "inbox_seen": list(self._inbox_seen),
                 "inbox_taken": {h: dict(e) for h, e in self._inbox_taken.items()},
@@ -742,6 +790,21 @@ class Job:
             with self._cond:
                 self._closing = True
                 self._end = kind
+        if self.response_only:
+            if kind == "round_start":
+                self._response_round = []
+            elif kind == "output":
+                rendered = render_event(kind, fields)
+                if rendered:
+                    self._response_round.append(rendered)
+            elif kind == "round_end" and (
+                fields.get("outcome") != "completed" or fields.get("interrupted")
+            ):
+                self._response_round = []
+            elif kind == "finished":
+                self._push("".join(self._response_round))
+                self._response_round = []
+            return  # compaction receives only the vendor's structured summary text
         self._push(render_event(kind, fields))
 
     def add_note(
@@ -824,6 +887,11 @@ class Job:
                 self.store.clear_goal()
                 self._push("\n[baton] goal cleared\n\n")
                 return self.add_note(GOAL_CLEARED_NOTE, mark, row, original)
+            if command.kind == HELP:
+                self._push("\n" + HELP_TEXT + "\n")
+                self._took_row(original, row)
+                self._accept_or_save(mark)
+                return True
             if command.kind == NEXT:
                 self.store.request_next(command.now)
                 if command.now:
@@ -836,6 +904,27 @@ class Job:
                     )
                 else:
                     self._push("\n[baton] next requested: it moves on when this round ends\n\n")
+            if command.kind == USE:
+                if (
+                    command.agent not in self.goal.order
+                    or command.agent not in self.goal.agents
+                    or not self.goal.agents[command.agent].enabled
+                ):
+                    self._push(
+                        f"\n[baton] {command.agent} is not enabled for this job. Check "
+                        "`baton.toml` and run `baton doctor`.\n\n"
+                    )
+                    self._took_row(original, row)
+                    self._accept_or_save(mark)
+                    return True
+                self.store.request_next(command.now, agent=command.agent)
+                if command.now:
+                    try:
+                        self.store.request_interrupt()
+                    except OSError:
+                        pass
+                when = "after the current tool call" if command.now else "when this round ends"
+                self._push(f"\n[baton] selecting {command.agent} {when}\n\n")
             self._took_row(original, row)
             self._accept_or_save(mark)
             return True
@@ -1259,7 +1348,14 @@ class JobManager:
                             self._save_mark(session, mark, old)
                             raise GatewayError(refusal)
                     job = self._create(
-                        session, workdir, messages[:index], objective, accepted, inbox, say=not said
+                        session,
+                        workdir,
+                        messages[:index],
+                        objective,
+                        accepted,
+                        inbox,
+                        say=not said,
+                        all_messages=messages,
                     )
                     if command is not None and not said:  # an echo's goal was set when it was taken
                         job.store.set_goal(objective)
@@ -1303,6 +1399,8 @@ class JobManager:
             if root.is_dir():
                 Store(root).clear_goal()
             raise GatewayError("goal cleared")
+        if command.kind == HELP:
+            raise GatewayError(HELP_TEXT)
         raise GatewayError("no job is running, so there is nothing to move on")
 
     def _save_mark(self, session: str, mark: tuple[int, str], old: Job | None) -> None:
@@ -1345,7 +1443,9 @@ class JobManager:
                 "done."
             )
 
-    def _briefing(self, name: str, workdir: Path, before: list, text: str) -> tuple[Goal, bool]:
+    def _briefing(
+        self, name: str, workdir: Path, before: list, text: str, response_only: bool = False
+    ) -> tuple[Goal, bool]:
         """The goal for `text` as the newest message, and whether an agent has a session of its
         own to resume (its prompt then carries only notes, so `text` must also go in the inbox)."""
         try:
@@ -1356,6 +1456,17 @@ class JobManager:
         resumed = (
             state.get("workdir") == str(workdir) and isinstance(sessions, dict) and bool(sessions)
         )
+        if response_only:
+            goal = build_goal(name, workdir, text)
+            return replace(
+                goal,
+                phases=False,
+                oneshot=False,
+                verify_command=None,
+                snapshot=False,
+                memory=False,
+                response_only=True,
+            ), False
         objective = compose_objective(before, text)
         return build_goal(name, workdir, objective), resumed
 
@@ -1368,16 +1479,42 @@ class JobManager:
         accepted: Iterable[tuple[int, str]],
         inbox: tuple[list[str], dict[str, dict]] = ([], {}),
         say: bool = True,
+        all_messages: list | None = None,
     ) -> Job:
         name = job_name(session)
-        # A huge message goes to a file, and only its start is in the objective, which travels
-        # in a command line.
-        text, _ = file_large_note(workdir, text, time.time())
-        goal, resumed = self._briefing(name, workdir, before, text)
+        full_context = (
+            all_messages
+            if all_messages is not None
+            else [*before, {"role": "user", "content": text}]
+        )
+        response_only = is_compaction_request(full_context)
+        if response_only:
+            text = compaction_objective(full_context)
+        else:
+            # A huge message goes to a file, and only its start is in the objective, which travels
+            # in a command line.
+            text, _ = file_large_note(workdir, text, time.time())
+        goal, resumed = self._briefing(name, workdir, before, text, response_only)
         context = [*before, {"role": "user", "content": text}]
         job = Job(
-            session, name, workdir, goal, self._adapters_for, context, accepted, False, *inbox
+            session,
+            name,
+            workdir,
+            goal,
+            self._adapters_for,
+            context,
+            accepted,
+            False,
+            *inbox,
+            response_only=response_only,
         )
+
+        if not response_only:
+            append_transcript(
+                workdir,
+                "# OpenCode conversation\n\n" + message_transcript(full_context),
+                name,
+            )
 
         # A stop or interrupt left by something earlier is not about this message.
         job.store.clear_stop()
@@ -1465,8 +1602,24 @@ class JobManager:
         workdir = Path(directory)
         if not workdir.is_dir():
             raise GatewayError(f"its directory does not exist: {workdir}")
-        objective = compose_objective(conversation[:-1], conversation[-1]["content"])
+        response_only = record.get("response_only") is True
+        saved_objective = record.get("objective")
+        objective = (
+            saved_objective
+            if response_only and isinstance(saved_objective, str) and saved_objective
+            else compose_objective(conversation[:-1], conversation[-1]["content"])
+        )
         goal = build_goal(name, workdir, objective)
+        if response_only:
+            goal = replace(
+                goal,
+                phases=False,
+                oneshot=False,
+                verify_command=None,
+                snapshot=False,
+                memory=False,
+                response_only=True,
+            )
         job = Job(
             session,
             name,
@@ -1478,6 +1631,7 @@ class JobManager:
             restarted=True,
             inbox_seen=_inbox_seen_ids(record.get("inbox_seen")),
             inbox_taken=_taken(record.get("inbox_taken")),
+            response_only=response_only,
         )
         with self._lock:
             if self._closed:
@@ -1601,7 +1755,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(400, "messages must be a non-empty list")
             return
         stream = body.get("stream") is True
-        if not body.get("tools"):
+        if not body.get("tools") and is_title_request(messages):
             self._reply_text(stream, title_for(messages))
             return
         session = self.headers.get("x-opencode-session", "").strip()

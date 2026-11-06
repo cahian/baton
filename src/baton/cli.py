@@ -22,6 +22,7 @@ from baton.adapters.codex import CodexAdapter
 from baton.config import AgentConfig, Goal, GoalError, GoalRef, load_goal, read_goal_ref
 from baton.doctor import run_checks
 from baton.gateway import DEFAULT_PORT, build_goal, opencode_config, serve
+from baton.help import HELP_TEXT
 from baton.proc import ROUND_VARIABLE
 from baton.runner import pin_goal, preempted_sentence, run_goal
 from baton.scheduler import MAX_PREEMPTS_PER_DAY, preempt_cap_frees_at
@@ -461,6 +462,38 @@ def cmd_next(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_use(args: argparse.Namespace) -> int:
+    name, ref = _resolve(args.goal)
+    agent = "claude_api" if args.agent == "claude" else args.agent
+    try:
+        if ref is not None:
+            goal = load_goal(ref.path)
+        else:
+            workdir = _job_workdir(Store(state_dir(name)))
+            if workdir is None:
+                raise GoalError(f"job {name!r} has no saved working directory")
+            goal = build_goal(name, workdir, "vendor selection")
+        if agent not in goal.order or not goal.agents[agent].enabled:
+            raise GoalError(
+                f"{agent} is not enabled for {name}; check the goal and run `baton doctor`"
+            )
+        adapter = build_adapters(goal).get(agent)
+        available = adapter.availability() if adapter is not None else None
+        if available is None or (not available.ok and available.permanent):
+            reason = available.reason if available is not None else "no adapter is configured"
+            raise GoalError(f"{agent} cannot run: {reason}; configure it and run `baton doctor`")
+    except GoalError as exc:
+        _err(str(exc))
+        return 2
+    store = Store(state_dir(name))
+    store.request_next(now=args.now, agent=agent)
+    if args.now:
+        store.request_interrupt()
+    when = "after the current tool call" if args.now else "when the current round ends"
+    print(f"{agent} selected; it takes over {when}")
+    return 0
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     name, _ = _resolve(args.goal)
     store = Store(state_dir(name))
@@ -533,6 +566,11 @@ def cmd_opencode_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_help(args: argparse.Namespace) -> int:
+    print(HELP_TEXT)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="baton", description="Relay one coding goal between Codex, Antigravity and Claude."
@@ -542,6 +580,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="check binaries, logins, stray keys and live limits")
     p.add_argument("goal", nargs="?", help="goal file (optional)")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("help", help="show CLI and OpenCode commands, including vendor selection")
+    p.set_defaults(func=cmd_help)
 
     p = sub.add_parser("run", help="run one goal in the foreground")
     p.add_argument("goal", help="goal file")
@@ -581,6 +622,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_next)
 
+    p = sub.add_parser("use", help="select a specific vendor for the next round")
+    p.add_argument("goal", help="goal file, or a job name such as session-<id>")
+    p.add_argument("agent", choices=("codex", "antigravity", "claude", "claude_api"))
+    p.add_argument(
+        "--now", action="store_true", help="also end the current round after its tool call"
+    )
+    p.set_defaults(func=cmd_use)
+
     p = sub.add_parser("stop", help="request a stop")
     p.add_argument("goal", help="goal file, or a job name such as session-<id>")
     p.add_argument("--now", action="store_true", help="kill the current round")
@@ -603,7 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # The commands that steer a goal: an agent's own shell has no business running them.
-STEERING = ("cmd_goal", "cmd_next", "cmd_restart", "cmd_stop")
+STEERING = ("cmd_goal", "cmd_next", "cmd_restart", "cmd_stop", "cmd_use")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

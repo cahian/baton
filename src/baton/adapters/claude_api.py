@@ -517,8 +517,17 @@ class ClaudeApiAdapter:
 
     # the round
 
-    def argv(self, granted: Decimal, session_id: str | None, tier: str = "strong") -> list[str]:
+    def argv(
+        self,
+        granted: Decimal,
+        session_id: str | None,
+        tier: str = "strong",
+        *,
+        read_only: bool = False,
+    ) -> list[str]:
         cfg = tier_config(self.cfg, tier)
+        tools = "Read" if read_only else TOOLS
+        allowed = "Read" if read_only else ALLOWED_TOOLS
         argv = [
             cfg.bin,
             "-p",
@@ -534,10 +543,10 @@ class ClaudeApiAdapter:
             cfg.model,
             "--effort",
             cfg.effort,
-            "--dangerously-skip-permissions",
+            *([] if read_only else ["--dangerously-skip-permissions"]),
             # `=` form: these flags are variadic and would eat the arguments after them
-            f"--tools={TOOLS}",
-            f"--allowedTools={ALLOWED_TOOLS}",
+            f"--tools={tools}",
+            f"--allowedTools={allowed}",
             f"--settings={guard_settings()}",
             "--max-budget-usd",
             format(granted, "f"),
@@ -599,7 +608,7 @@ class ClaudeApiAdapter:
             return self._on_line(line, stream, ctx)
 
         run_ctx = replace(ctx, on_spawn=on_spawn)
-        argv = self.argv(granted, ctx.session_id, ctx.tier)
+        argv = self.argv(granted, ctx.session_id, ctx.tier, read_only=ctx.read_only)
         # Whatever happens from here on (an exception, a signal) leaves the reservation in the
         # ledger: it is only replaced when the stream really reported a cost, or released when
         # nothing was ever started.
@@ -889,3 +898,24 @@ class ClaudeApiAdapter:
             texts += [e for e in event.get("errors") or [] if isinstance(e, str)]
             return f"error: {' '.join(texts)}" if texts else None
         return None
+
+    def response_text(self, line: str) -> str | None:
+        """Keep only assistant text blocks; tool-use blocks are not summary text."""
+        event = _parse(line)
+        if event is None or event.get("type") != "assistant" or event.get("error"):
+            return None
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_use" for block in content
+        ):
+            return None
+        parts = [
+            block["text"].strip()
+            for block in (content if isinstance(content, list) else [])
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and block["text"].strip()
+        ]
+        return "\n".join(parts) or None

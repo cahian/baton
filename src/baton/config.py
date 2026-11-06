@@ -103,9 +103,8 @@ REPO_FORBIDDEN = ("bin", "key_file", "admin_key_file", "full_access", "poll_s")
 REPO_LOWER_ONLY = ("turn_max_s", "turn_budget_usd", "goal_budget_usd", "round_budget_usd")
 MAX_THRESHOLD_PCT = 90
 ANTIGRAVITY_MODEL_PREFIX = "gemini-"
-# Whether a goal runs plan, build and review phases when it does not say. Tests turn it off, so
-# they pin the plain relay, and the tests about phases turn it back on.
-PHASES_DEFAULT = True
+# Whole-task vendor runs are the default. Baton-managed plan/build/review remains an opt-in.
+PHASES_DEFAULT = False
 
 
 class GoalError(Exception):
@@ -178,9 +177,11 @@ class Goal:
     verify_timeout_s: int
     agents: dict[str, AgentConfig]
     path: Path
-    phases: bool = True
+    phases: bool = PHASES_DEFAULT
     # The objective is pinned as the goal when the job starts: it holds until the person changes it.
     oneshot: bool = False
+    # Internal OpenCode request mode: return a summary only, without code-task instructions.
+    response_only: bool = False
 
 
 def _table(data: dict[str, Any], key: str, where: str) -> dict[str, Any]:
@@ -541,15 +542,13 @@ def goal_from_table(
 
     phases = _bool(data, "phases", PHASES_DEFAULT, "")
     oneshot = _bool(data, "oneshot", False, "")
-    if oneshot and "phases" in data and not phases:
-        raise GoalError("oneshot needs phases: a goal ends in consensus, and phases = false here")
 
     return Goal(
         name=name,
         workdir=workdir,
         objective=objective,
         order=tuple(order_raw),
-        round_max_s=_int(data, "round_max_s", 3600, "", 1, 10**7),
+        round_max_s=_int(data, "round_max_s", TURN_MAX_S, "", 1, 10**7),
         idle_s=_int(data, "idle_s", 1200, "", 1, 10**7),
         snapshot=_bool(data, "snapshot", True, ""),
         memory=_bool(data, "memory", True, ""),

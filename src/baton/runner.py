@@ -34,6 +34,7 @@ from baton.adapters.base import (
 )
 from baton.config import Goal, GoalError, load_memory, load_superpowers
 from baton.memory import Memory, RoundEntry
+from baton.oneshot import TranscriptWriter, append_transcript, one_shot_block, transcript_path
 from baton.phases import (
     BUILD,
     CHECK_FILE,
@@ -162,6 +163,7 @@ def build_prompt(
     skills: str = "",
     pinned_goal: str = "",
     goal_check: bool = False,
+    continuity: str = "",
 ) -> str:
     """The prompt for one round.
 
@@ -171,6 +173,8 @@ def build_prompt(
     after the handoff in both. `pinned_goal`, when the person has fixed one, opens every prompt.
     `goal_check` says the goal has no verify command but its check is `.baton/VERIFY.sh`.
     """
+    if goal.response_only:
+        return goal.objective.strip() + "\n"
     parts: list[str] = []
     pinned_goal = pinned_goal.strip()
     if pinned_goal:
@@ -212,8 +216,12 @@ def build_prompt(
     memory = memory.strip()
     if memory:
         parts.append(memory)
+    continuity = continuity.strip()
+    if continuity:
+        parts.append(continuity)
     if not resumed:
-        parts.append(RULES)
+        if goal.phases:
+            parts.append(RULES)
     # The skills come first and the phase block last, so what baton asks of this round is read last.
     skills = skills.strip()
     if skills:
@@ -483,11 +491,11 @@ def changed_paths(workdir: Path) -> list[str]:
 
 
 def goal_refusal(goal: Goal) -> str:
-    """Why a goal may not be set here, "" when it may: a goal ends only in consensus, which is
-    phases, and an approval is bound to the state of the tree, which is git."""
-    if not goal.phases:
-        return PHASES_REFUSAL
-    if not _is_repo(goal.workdir):
+    """Why a goal may not be set here, "" when it may.
+
+    Baton-managed consensus needs both phases and a git tree. A native one-shot goal does not.
+    """
+    if goal.phases and not _is_repo(goal.workdir):
         return REPO_REFUSAL
     return ""
 
@@ -734,6 +742,11 @@ class _Run:
         # The agent a `rotation` event just named: its round_start does not say it again.
         self.announced = ""
         self.next_stuck = False  # a request for the next agent that could not be taken
+        self.forced_agent = ""  # an exact vendor selected by the person, retained until picked
+        self.forced_wait_warning = ""
+        # Direct selection suppresses reserve preemption for that turn.
+        self.explicit_turn_agent = ""
+        self.response_only = goal.response_only
         self.oneshot_pinned = False  # set when `oneshot` has pinned the objective, once
         # Long-term memory: built the first time it is needed, None when it is off. A round that
         # started a process waits in `pending` until its gate has run.
@@ -882,6 +895,8 @@ class _Run:
             "note_seen": dict(self.note_seen),
             "owes_round": self.owes_round,
             "oneshot_pinned": self.oneshot_pinned,
+            "forced_agent": self.forced_agent,
+            "explicit_turn_agent": self.explicit_turn_agent,
             "verify_warning": self.verify_warning,
             "goal_seen": self.goal_seen,
             "goal_ever": self.goal_ever,
@@ -1110,6 +1125,12 @@ class _Run:
         rounds = state.get("round")
         self.round_no = rounds if isinstance(rounds, int) and rounds > 0 else 0
         self.oneshot_pinned = state.get("oneshot_pinned") is True
+        forced = state.get("forced_agent")
+        self.forced_agent = forced if isinstance(forced, str) and forced in self.adapters else ""
+        explicit = state.get("explicit_turn_agent")
+        self.explicit_turn_agent = (
+            explicit if isinstance(explicit, str) and explicit in self.adapters else ""
+        )
         if goal.oneshot and not self.oneshot_pinned:
             # Once, and saved below before any round: a restart must not undo `goal off`. A goal
             # the person already set counts as the pin.
@@ -1157,7 +1178,15 @@ class _Run:
             self.goal_terms["budgets"] = self.terms_now()["budgets"]  # a state from before them
         if self.store.take_terms_reset():  # the goal was said again: its terms are as they are now
             self.goal_terms = self.terms_now()
-        prepare_workdir(goal)
+        if not self.response_only:
+            prepare_workdir(goal)
+            transcript = transcript_path(goal.workdir, goal.name)
+            if not transcript.exists():
+                append_transcript(
+                    goal.workdir,
+                    f"# Baton task\n\n### user\n{goal.objective.strip()}\n",
+                    goal.name,
+                )
         if self.phases:
             self.start_phases(state, same_dir)
         self.sched = sched
@@ -1246,7 +1275,8 @@ class _Run:
         if self.hold_for_restart():
             self.nap(HOLD_POLL_S)
             return None
-        self.sync_goal()
+        if not self.response_only:
+            self.sync_goal()
         with_goal = self.goal_on()
         if with_goal and self.hold():
             return 0 if self.honour_stop() else None
@@ -1291,7 +1321,7 @@ class _Run:
             self.nap_until(until, wake_on_next=True)
         if self.honour_stop():
             return 0
-        if self.skills is None and not self.load_skills():
+        if self.phases and self.skills is None and not self.load_skills():
             # Superpowers is mandatory: no round runs without it, and the job waits, running,
             # and looks again, so installing it is all that is needed.
             until = self.clock() + SKILLS_RETRY_S
@@ -1315,21 +1345,45 @@ class _Run:
             self.rotate("asked by the person")
         # A review goes to someone other than the agent that built, when another can take it.
         avoid = self.builder if self.phases and self.ps.phase == REVIEW else ""
-        adapter = self.sched.pick(avoid=avoid) if avoid else self.sched.pick()
+        if self.forced_agent:
+            self.explicit_turn_agent = self.forced_agent
+        adapter = (
+            self.sched.pick(prefer=self.forced_agent)
+            if self.forced_agent
+            else self.sched.pick(avoid=avoid)
+            if avoid
+            else self.sched.pick()
+        )
         if adapter is not None and self.rotating:
             self.announce_rotation(adapter.name)
+        if adapter is not None and self.forced_agent == adapter.name:
+            self.forced_agent = ""
         self.sched.save()
         if adapter is None:
-            until = self.sched.next_wake()
+            if self.forced_agent and not self.sched.can_run(self.forced_agent):
+                info = self.sched.snapshot()["agents"].get(self.forced_agent, {})
+                reason = info.get("reason") or "the vendor is not configured or has no usable key"
+                if reason != self.forced_wait_warning:
+                    self.forced_wait_warning = reason
+                    self.emit(
+                        "alert",
+                        message=f"the selected vendor {self.forced_agent} cannot run: {reason}; "
+                        "configure it or select another vendor",
+                    )
+                self.nap(HOLD_RETRY_S, wake_on_next=True)
+                return None
+            until = self.sched.next_wake(prefer=self.forced_agent or None)
+            reason = f"waiting for {self.forced_agent}" if self.forced_agent else ""
             self.emit(
                 "wait",
+                **({"reason": reason} if reason else {}),
                 until=until,
                 seconds=max(0.0, until - self.clock()),
                 agents=self.sched.snapshot()["agents"],
             )
             self.nap_until(until, wake_on_next=True)
             return None
-        if self.run_round(adapter) and not self.unread_notes():
+        if self.run_round(adapter) and (self.response_only or not self.unread_notes()):
             return self.finish("round completed")
         return None
 
@@ -1450,12 +1504,21 @@ class _Run:
     def take_next(self) -> bool:
         """Take the person's request for the next agent: True when there was one."""
         try:
-            asked = self.store.take_next()
+            timing, agent = self.store.take_next_request()
         except OSError:
             self.next_stuck = True
             return False
         self.next_stuck = False
-        return bool(asked)
+        if agent:
+            if self.sched is None or agent in self.sched.order:
+                self.forced_agent = agent
+                self.forced_wait_warning = ""
+                if self.sched is not None:
+                    self.sched.reset_cooldown(agent)
+                self.persist_softly()
+            else:
+                self.notice(f"{agent} is not enabled for this job; the usual queue continues")
+        return bool(timing)
 
     def rotate(self, reason: str) -> None:
         """Hand the queue to the next agent. It is announced at the next pick, because only then
@@ -1463,9 +1526,19 @@ class _Run:
         already waiting to be announced is not made again: a second request in the meantime
         (a `next` while the gate runs) only changes its reason."""
         assert self.sched is not None
+        if self.forced_agent:
+            self.explicit_turn_agent = self.forced_agent
+            if self.rotating:
+                self.rotating = (self.rotating[0], "selected by the person")
+                return
+            if self.forced_agent == self.sched.current:
+                return  # selecting the current vendor keeps its already-used turn limit
+            self.rotating = (self.sched.current, "selected by the person")
+            return
         if self.rotating:
             self.rotating = (self.rotating[0], reason)
             return
+        self.explicit_turn_agent = ""
         self.rotating = (self.sched.current, reason)
         self.sched.rotate()
 
@@ -1523,9 +1596,9 @@ class _Run:
     # a goal the person set: the check, the lock on it, and consensus
 
     def goal_on(self) -> bool:
-        """True while a goal is set, whatever else this run is set up to do. A set goal is always
-        goal mode: it ends only in consensus, and a run that cannot do that (no phases, no git
-        repository: `goal_refusal`) holds rather than fall back to ending on a pass."""
+        """Whether Baton-managed phase consensus is active for this run."""
+        if not self.phases or self.response_only:
+            return False
         current = self.store.read_goal()
         return bool(self.goal_seen if current is None else current)
 
@@ -2002,7 +2075,7 @@ class _Run:
             store.take_interrupt()  # one that arrived between rounds has nothing left to end
         except OSError:
             pass
-        left_in_inbox = self.collect_notes()
+        left_in_inbox = False if self.response_only else self.collect_notes()
         if phase == CONSENSUS and (left_in_inbox or self.carried_notes.strip()):
             # A message came after the step looked: it ends the approval before any agent is
             # asked, and its text is for the build that follows. This round never started.
@@ -2011,10 +2084,10 @@ class _Run:
             self.message_ends_consensus()
             return False
         newest_note = self.newest_note()
-        handoff = self.read_handoff()
+        handoff = "" if self.response_only else self.read_handoff()
         # The conversation of an agent is tied to its model: per role with phases, and a review
         # is always a fresh one.
-        key = agent
+        key = "" if self.response_only else agent
         if self.phases:
             key = f"{agent}:{phase}" if phase not in (REVIEW, CONSENSUS) else ""
         sid = self.sessions.get(key) if key else None
@@ -2023,9 +2096,11 @@ class _Run:
         # review (which has no session) under its own.
         head_key = key or f"{agent}:{phase}"
         since = commits_since(goal.workdir, self.heads.get(head_key, ""))
-        head_before = _head(goal.workdir) if self.memory() is not None else ""
-        recalled = self.recall(n)
-        if self.mem is not None and self.stop_requested():
+        head_before = (
+            _head(goal.workdir) if not self.response_only and self.memory() is not None else ""
+        )
+        recalled = "" if self.response_only else self.recall(n)
+        if not self.response_only and self.mem is not None and self.stop_requested():
             # A stop that came while memory was being read: no process is spawned for this round,
             # so it does not exist. The counter and the state go back, and the loop honours it.
             self.round_no = n - 1
@@ -2051,24 +2126,31 @@ class _Run:
         preempted = False
         interrupt_at: float | None = None  # a note is waiting for the tool in flight to end
         tools = None  # this round's tool watch, None when the adapter has none or it failed
+        writer: TranscriptWriter | None = None
+        writer_pending = ""  # fragments stay together until the whole line can be masked
         spent = 0.0  # what the round cost, whichever attempt of it reported it
         announced = self.announced == agent
         self.announced = ""
         watch = (
             PreemptionWatch(self.sched, self.adapters, PREEMPT_POLL_S)
-            if getattr(adapter, "reserve", False) and phase != CONSENSUS
+            if getattr(adapter, "reserve", False)
+            and self.explicit_turn_agent != agent
+            and phase != CONSENSUS
             else None
         )
 
         def close_line() -> None:
-            nonlocal buf, mid_line
+            nonlocal buf, mid_line, writer_pending
             if mid_line:
                 buf = (buf + "\n")[-ROUND_TAIL_CHARS:]
                 self.emit("output", agent=agent, round=n, text="\n", fragment=True)
+                if writer is not None:
+                    writer.write(mask_secrets(writer_pending) + "\n")
+                writer_pending = ""
                 mid_line = False
 
         def on_output(line: str) -> None:
-            nonlocal buf, worked, mid_line, tools
+            nonlocal buf, worked, mid_line, tools, writer_pending
             if tools is not None:
                 try:
                     tools.feed(line)
@@ -2076,7 +2158,11 @@ class _Run:
                     tools = None
             fragment = False
             try:
-                text = adapter.render(line)
+                if self.response_only:
+                    response_text = getattr(adapter, "response_text", None)
+                    text = response_text(line) if response_text is not None else None
+                else:
+                    text = adapter.render(line)
                 is_work = getattr(adapter, "is_work", None)
                 if text and (is_work is None or is_work(line)):
                     worked = True
@@ -2086,14 +2172,18 @@ class _Run:
                 text = None
             if not text:
                 return
+            raw_text = text
             text = mask_secrets(text)  # before it reaches the tail, the log of events and the chat
             if fragment:
                 # Joined with the next one by the reader, which adds no newline of its own.
                 buf = (buf + text)[-ROUND_TAIL_CHARS:]
                 mid_line = not text.endswith("\n")
+                writer_pending += raw_text
                 self.emit("output", agent=agent, round=n, text=text, fragment=True)
                 return
             close_line()
+            if writer is not None:
+                writer.write(text + "\n")
             buf = (buf + text + "\n")[-ROUND_TAIL_CHARS:]
             self.emit("output", agent=agent, round=n, text=text)
 
@@ -2146,6 +2236,8 @@ class _Run:
                 return  # a review keeps no conversation
             before = self.sessions.get(key)
             self.sessions[key] = session
+            if writer is not None:
+                writer.write(f"\nNative session id: {session}\n")
             if before and before != session and before in self.session_totals:
                 # The session went on under a new id: its total goes on with it.
                 self.session_totals[session] = self.session_totals.pop(before)
@@ -2159,12 +2251,17 @@ class _Run:
                 self.persist_softly()
 
         def attempt(session: str | None) -> RoundResult:
-            nonlocal tools, spent
+            nonlocal tools, spent, writer
             make_watch = getattr(adapter, "tool_watch", None)
             try:
                 tools = make_watch() if make_watch is not None else None
             except Exception:
                 tools = None
+            continuity = ""
+            if not self.response_only and not self.phases:
+                continuity = one_shot_block(
+                    agent, self.sessions, transcript_path(goal.workdir, goal.name)
+                )
             prompt = build_prompt(
                 goal if self.objective is None else replace(goal, objective=self.objective()),
                 self.gate_tail,
@@ -2180,7 +2277,15 @@ class _Run:
                 # A resumed conversation already holds the methods from its first round, except
                 # that the plan round after a failed gate always gets systematic-debugging.
                 skills=self.skills_block(agent, phase, fresh=session is None),
+                continuity=continuity,
             )
+            if not self.response_only:
+                writer = TranscriptWriter(
+                    goal.workdir,
+                    goal.name,
+                    f"Round {n} — {agent} (session {session or 'new'})",
+                    prompt,
+                )
             ctx = RoundContext(
                 workdir=goal.workdir,
                 log_path=store.round_log(n, agent),
@@ -2194,6 +2299,8 @@ class _Run:
                 session_total=saved_total(self.session_totals.get(session)) if session else None,
                 on_session_total=on_session_total,
                 tier=TIER[phase] if phase else "strong",
+                read_only=self.response_only,
+                native_goal=not self.phases and not self.response_only and agent == "codex",
                 on_subagent=on_subagent,
             )
             self.emit(
@@ -2230,6 +2337,8 @@ class _Run:
         finally:
             if watch is not None:
                 watch.stop()
+            if writer is not None:
+                writer.close()
         if preempted and watch is not None and result.outcome in (COMPLETED, TIMEOUT, TRANSIENT):
             # What the adapter made of being killed (a stop, a crash) is not the round's story.
             # A credit_guard, limit or auth that came with it is real and stays.
@@ -2263,7 +2372,7 @@ class _Run:
         )
         if result.outcome in (CREDIT_GUARD, AUTH, SUBAGENT):
             self.emit("alert", agent=agent, outcome=result.outcome, reason=result.reason)
-        snapshotted = snapshot_work(goal, n, agent)
+        snapshotted = False if self.response_only else snapshot_work(goal, n, agent)
         if phase == CONSENSUS and spawned and not drift and self.consensus is not None:
             # A clean round: baton's own snapshot may have committed what the check left behind,
             # and that is the tree the next approver is judged against.
@@ -2310,9 +2419,12 @@ class _Run:
         if phase == CONSENSUS:
             # After the notes were marked read: a rejection leaves one for the build that follows.
             self.after_consensus(agent, completed, spawned, drift, said)
+        one_shot_limit = not self.phases and (result.outcome == TIMEOUT or result.bounded)
         self.end_turn(agent, spent, rotate=phase != CONSENSUS)
+        if one_shot_limit and not self.take_next():
+            self.rotate("one-shot round limit reached")
         self.persist_softly()
-        if spawned and self.memory() is not None:
+        if spawned and not self.response_only and self.memory() is not None:
             # What the scheduler was told stays as it is; the page says what baton did.
             ended_by_us = (
                 killed and not preempted and result.outcome in (COMPLETED, TIMEOUT, TRANSIENT)
@@ -2366,7 +2478,7 @@ class _Run:
 
     def phase_block(self, phase: str) -> str:
         """The instructions of the phase for this round's prompt, "" without phases."""
-        if not phase:
+        if not phase or self.response_only:
             return ""
         tasks = open_tasks(read_plan(self.goal.workdir))
         approving: dict[str, str] = {}

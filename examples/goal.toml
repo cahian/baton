@@ -9,11 +9,11 @@ objective = "Make the build pass on all platforms."
 # or USD 50 for claude_api) or `baton: next` asks for the next one, and then the next in this order
 # takes over, wrapping around. With `reserve = true` below, claude_api instead waits for the others.
 order = ["codex", "antigravity", "claude_api"]
-round_max_s = 3600   # one round may not run longer than this
+round_max_s = 18000  # up to the default 5-hour vendor turn limit
 idle_s = 1200        # nor stay silent longer than this
 snapshot = true      # commit uncommitted work locally after each round (never pushes)
 memory = true        # long-term memory through ai-memory; false turns it off for this goal
-phases = true        # plan, build and review with a strong and a working model; false: the plain relay
+phases = false       # default: one vendor owns the complete task; true: Baton plan/build/review
 oneshot = false      # true: the objective is pinned as the goal when the job first starts
 
 # The gate. The goal is finished only when this exits 0. Without it, the goal is finished as

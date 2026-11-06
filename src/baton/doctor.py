@@ -298,7 +298,7 @@ def _interactive() -> Check:
 
 
 def _superpowers() -> Check:
-    """Superpowers is required: a goal waits, and runs no round, until it is found."""
+    """Check Superpowers for phase-managed goals, which use its planning/review skills."""
     name = "superpowers"
     try:
         found = superpowers.find_skills(load_superpowers())
@@ -384,6 +384,7 @@ def run_checks(goal: Goal | None, env: Mapping[str, str]) -> list[Check]:
             checks.append(Check(f"{name} limits", False, blocking, "skipped: no binary"))
         if name == "codex":
             checks.append(_interactive())
-    checks.append(_superpowers())
+    if goal is not None and goal.phases:
+        checks.append(_superpowers())
     checks.append(_memory(goal))
     return checks

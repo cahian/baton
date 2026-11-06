@@ -464,24 +464,45 @@ class Store:
 
     # next
 
-    def request_next(self, now: bool = False) -> None:
-        """Ask for the next agent in the queue. `now` does not wait for the round to end."""
-        if not now and self._next.exists():
-            return  # a request already waits, and never downgrade a `now`
-        _atomic_write(self._next, "now\n" if now else "soon\n")
+    def request_next(self, now: bool = False, agent: str | None = None) -> None:
+        """Ask for the next agent, or a named one. `now` interrupts after the current tool call.
+
+        The optional second line is backward-compatible with old `soon` / `now` requests.
+        """
+        previous = self.next_request()
+        mode = "now" if now or previous[0] == "now" else "soon"
+        payload = mode + (f"\n{agent}" if agent else "") + "\n"
+        _atomic_write(self._next, payload)
 
     def next_pending(self) -> bool:
         """Whether a request for the next agent waits, without taking it."""
         return self._next.exists()
 
-    def take_next(self) -> str:
-        """The pending request, cleared: "" when none, "now" when forced, otherwise "soon"."""
+    def next_request(self) -> tuple[str, str | None]:
+        """The pending request as (timing, optional exact vendor), without consuming it."""
         try:
-            content = self._next.read_text(encoding="utf-8").strip()
+            lines = self._next.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return "", None
+        mode = "now" if lines and lines[0].strip() == "now" else "soon"
+        agent = lines[1].strip() if len(lines) > 1 and lines[1].strip() else None
+        return mode, agent
+
+    def take_next_request(self) -> tuple[str, str | None]:
+        """Consume the pending request as (timing, optional exact vendor)."""
+        try:
+            lines = self._next.read_text(encoding="utf-8").splitlines()
             self._next.unlink()
         except FileNotFoundError:
-            return ""
-        return "now" if content == "now" else "soon"
+            return "", None
+        mode = "now" if lines and lines[0].strip() == "now" else "soon"
+        agent = lines[1].strip() if len(lines) > 1 and lines[1].strip() else None
+        return mode, agent
+
+    def take_next(self) -> str:
+        """The pending request, cleared: "" when none, "now" when forced, otherwise "soon"."""
+        mode, _ = self.take_next_request()
+        return mode
 
     # restart
 

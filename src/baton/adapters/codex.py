@@ -393,7 +393,15 @@ class CodexAdapter:
         except Exception as exc:
             return Availability(False, until=now + RETRY_S, reason=f"cannot read limits: {exc}")
 
-    def argv(self, session_id: str | None, workdir: str, tier: str = "strong") -> list[str]:
+    def argv(
+        self,
+        session_id: str | None,
+        workdir: str,
+        tier: str = "strong",
+        *,
+        read_only: bool = False,
+        native_goal: bool = False,
+    ) -> list[str]:
         cfg = tier_config(self.cfg, tier)
         common = [
             "--json",
@@ -411,19 +419,29 @@ class CodexAdapter:
             hook_config(),
             "--dangerously-bypass-hook-trust",
         ]
+        if native_goal:
+            common += ["--enable", "goals"]
         if session_id is None:
             access = (
-                ["--dangerously-bypass-approvals-and-sandbox"]
-                if cfg.full_access
-                else ["--sandbox", "workspace-write"]
+                ["--sandbox", "read-only", "--ask-for-approval", "never"]
+                if read_only
+                else (
+                    ["--dangerously-bypass-approvals-and-sandbox"]
+                    if cfg.full_access
+                    else ["--sandbox", "workspace-write"]
+                )
             )
             return [cfg.bin, "exec", *common, *access, "-C", workdir, "-"]
         # `exec resume` takes neither --sandbox nor -C: the sandbox goes through -c and the
         # working directory is the process's own.
         access = (
-            ["--dangerously-bypass-approvals-and-sandbox"]
-            if cfg.full_access
-            else ["-c", 'sandbox_mode="workspace-write"']
+            ["-c", 'sandbox_mode="read-only"', "-a", "never"]
+            if read_only
+            else (
+                ["--dangerously-bypass-approvals-and-sandbox"]
+                if cfg.full_access
+                else ["-c", 'sandbox_mode="workspace-write"']
+            )
         )
         return [cfg.bin, "exec", "resume", *common, *access, session_id, "-"]
 
@@ -468,7 +486,13 @@ class CodexAdapter:
                     )
             return None
 
-        argv = self.argv(ctx.session_id, str(ctx.workdir), ctx.tier)
+        argv = self.argv(
+            ctx.session_id,
+            str(ctx.workdir),
+            ctx.tier,
+            read_only=ctx.read_only,
+            native_goal=ctx.native_goal,
+        )
 
         def start(run_ctx: RoundContext) -> RoundResult:
             exit_ = run_streaming(
@@ -534,3 +558,19 @@ class CodexAdapter:
             text = _event_message(event)
             return f"error: {text}" if text else None
         return None
+
+    def response_text(self, line: str) -> str | None:
+        """Only completed model messages belong in an OpenCode compaction summary."""
+        event = _parse_event(line)
+        item = event.get("item") if event is not None else None
+        text = item.get("text") if isinstance(item, dict) else None
+        return (
+            text
+            if event is not None
+            and event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(text, str)
+            and text.strip()
+            else None
+        )
