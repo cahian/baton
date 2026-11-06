@@ -1,6 +1,6 @@
 # OpenCode 2.2.5: investigação de sincronização
 
-Estado: **investigação parcial**. Não implementar a integração com base apenas neste documento: falta reproduzir execução ativa, duplo Esc, reconexão e promoção com a TUI real e definir um mecanismo seguro de confirmação de entrega.
+Estado: contrato proposto a partir da revisão do código v2.2.5 e de experimentos isolados. A integração completa com o gateway ainda precisa ser implementada e validada de ponta a ponta.
 
 ## Evidência do código v2.2.5
 
@@ -14,13 +14,15 @@ Estado: **investigação parcial**. Não implementar a integração com base ape
 
 Servidor `opencode v2.2.5` em localhost, porta separada, com diretórios XDG e workspace descartáveis. Criada sessão descartável; `GET /api/session/{id}/inbox` retornou lista vazia e `POST /api/session/{id}/interrupt?resume=true` retornou `interrupted: false` quando ociosa. Um prompt `queue` com `resume: false` apareceu na inbox; `DELETE` retornou 204 e esvaziou a fila, mas consultar a mensagem pelo mesmo ID retornou 404. Isto confirma que cancelar não preserva o histórico como mensagem entregue. Nenhuma sessão nem banco real foram alterados.
 
-## Pontos abertos antes da implementação
+## Contrato proposto para o gateway
 
-1. Reproduzir, com execução ativa e TUI descartáveis, duplo Esc, sequência de eventos/status e chegada de steer e queue. Investigar o intervalo entre aceite da interrupção e evento terminal.
-2. Reproduzir desconexão/reconexão e correlacionar eventos por sessão; demonstrar que não dispara parada.
-3. Descobrir se existe mecanismo suportado de promoção/entrega externa que preserve a transação, histórico e evento de UI, sem criar execução duplicada. Caso não exista, avaliar mudança no OpenCode ou um protocolo alternativo, sem supor que cancel ou SQL direto sejam equivalentes.
-4. Determinar descoberta do servidor e autenticação da instância concreta que originou a requisição; validar múltiplas instâncias, permissões e indisponibilidade sem expor segredos. O servidor isolado forneceu credencial temporária própria; isto não estabelece como descobrir a instância de produção.
-5. Verificar idempotência, recuperação após falha e ordem das mensagens antes de definir um protocolo de persistência e confirmação.
+O OpenCode mantém a mensagem em `session_inbox` até uma fronteira entre steps de [`SessionRunner.drain`](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/core/src/session/runner/llm.ts). O step aguarda o término do stream do modelo. Um `steer` admitido durante esse stream acorda o coordenador; depois que o step conclui, a promoção publica `InboxDelivered`, remove o item pendente e projeta a mensagem no histórico. O gateway atual mantém seu SSE aberto por todo o job; assim o OpenCode pode manter a mensagem visível na fila mesmo depois de o baton recebê-la.
+
+O caminho proposto é ler apenas itens `type=user` e `delivery=steer` da sessão correta via SQLite **somente leitura**. Depois de persistir a aceitação e emitir o aviso de recebimento, finalizar normalmente aquele SSE com `finish_reason=stop` e `[DONE]`. O OpenCode pode então alcançar a fronteira do step e promover o item por seu próprio mecanismo. O POST seguinte, contendo o eco, deve reconectar ao mesmo job a partir da saída já entregue e deduplicar a mensagem pelo ID/estado persistido. Essa sequência é uma proposta inferida do código: ainda requer validação integrada de ordenação, múltiplos steers, falhas de escrita, corrida entre finalização do job e novo POST e reinício. `queue` permanece pendente até o OpenCode promovê-la; não antecipar seu consumo. Não chamar a API privada do OpenCode, cancelar itens nem modificar o banco.
+
+Para parada, ler `session_v2` da mesma sessão, em modo read-only. `Execution.Started` grava `time_busy`; a projeção de `Execution.Interrupted` grava `idle_outcome=interrupted` e avança `time_idle`, exceto quando o motivo é `shutdown`. O duplo Esc observado produz esse estado quando a execução termina. Um novo `time_idle` com `idle_outcome=interrupted` e `time_idle >= time_busy` é candidato a sinal de parada; guardar baseline e deduplicar por sessão para não reagir a uma interrupção antiga. A coluna `idle_outcome` não identifica por si só o motivo exato, e interrupção/retomada rápidas, timestamps iguais, projeção assíncrona, sessão ausente e indisponibilidade do banco exigem testes. Desconexão de stream ou TUI isoladamente não é sinal de parada. Quando uma mensagem posteriormente promovida chegar em novo POST, o gateway deve retomar na mesma sessão sem duplicá-la.
+
+Este desenho não requer descobrir nem autenticar a API do OpenCode: usa o banco local configurado, aberto `mode=ro`. Uma sessão remota, privada ou com outro banco não deve ser associada por suposição ao banco local; suporte a esse caso exige associação confiável adicional. Manter o job seguro se a leitura falhar e verificar isolamento entre sessões. O polling do estado terminal pode perder transições transitórias entre leituras; a solução precisa testar e tratar essa limitação antes de afirmar sincronização perfeita.
 
 ## Reprodução adicional em TUI e servidor isolados
 
