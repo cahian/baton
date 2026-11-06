@@ -1,6 +1,6 @@
 # OpenCode 2.2.5: investigação de sincronização
 
-Estado: contrato proposto a partir da revisão do código v2.2.5 e de experimentos isolados. A integração completa com o gateway ainda precisa ser implementada e validada de ponta a ponta.
+Estado: contrato implementado em `src/baton/gateway.py`, coberto em `tests/test_gateway.py` e validado de ponta a ponta com uma instância descartável do `opencode v2.2.5`.
 
 ## Evidência do código v2.2.5
 

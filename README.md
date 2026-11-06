@@ -790,11 +790,14 @@ and context on its side.
 3. Select `baton/auto` in OpenCode and write your request.
 
 Each OpenCode session becomes a job that runs in its own thread inside `baton serve`, independent of
-the HTTP connection. A dropped connection never stops it, and a new message in the session becomes
+the HTTP connection. A dropped connection never stops it, while an explicit OpenCode session
+interrupt (double `Esc`) stops the running job at once; a new message in the session becomes
 a note that ends the running round once its current tool call is done (after five minutes at the
-latest). A message typed while the reply streams, which OpenCode queues in its database and posts
-only when the reply ends, is read from there every 2 seconds (read-only, and any failure is
-silent), delivered as a note at once, and not delivered again when OpenCode later posts it. Every
+latest). A steering message typed while the reply streams, which OpenCode queues in its database,
+is read from there every 0.2 seconds (read-only, and any failure is silent), delivered as a note at
+once, and ends the current stream after the receipt so OpenCode drains its queue immediately and
+opens the continuation stream without delivering the note again (parked `queue` items wait until
+OpenCode promotes them). Every
 conversation of the job reads every note, not only the first one to take it, and a note over 8000
 characters goes to a file under `.baton/notes/` in the directory, with its first 1000 characters
 and the file's name in the prompt. A message gets at least one round, even if the gate
