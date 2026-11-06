@@ -66,7 +66,7 @@ SHUTDOWN_S = 25.0
 MAX_RESTARTS = 5
 SETTLE_POLL_S = 0.05
 # While a job runs, OpenCode's inbox is read this often, with this long to wait on a lock.
-INBOX_POLL_S = 2.0
+INBOX_POLL_S = 0.2
 # How often the gateway looks for a restart request whose jobs are all held.
 RESTART_POLL_S = 1.0
 INBOX_DB_TIMEOUT_S = 1.0
@@ -526,6 +526,7 @@ class Job:
         self._closing = False  # the run has said it is over
         self._done = False
         self._delivered = 0
+        self._cut = 0
         self._end = ""  # how the last run ended: "finished", "stopped" or ""
         self.store = _JobStore(state_dir(name), self._on_event)
         self._thread = threading.Thread(target=self._run, name=f"baton-{name}", daemon=True)
@@ -540,6 +541,10 @@ class Job:
     def is_running(self) -> bool:
         with self._cond:
             return not self._done
+
+    def has_undelivered(self) -> bool:
+        with self._cond:
+            return self._first + len(self._items) - 1 > self._delivered
 
     def held(self) -> bool:
         """Between rounds, with a restart of the gateway waiting: nothing is in flight."""
@@ -793,7 +798,11 @@ class Job:
         with self._cond:
             if row_id in self._inbox_seen:
                 return False
-            return self.deliver(text.strip(), None, row_id)
+            if not self.deliver(text.strip(), None, row_id):
+                return False
+            self._cut = self._first + len(self._items) - 1
+            self._cond.notify_all()
+            return True
 
     def echo(self, messages: list) -> bool:
         """Account for a request's messages against the notes taken from OpenCode's inbox. True
@@ -806,6 +815,8 @@ class Job:
             )
             if marks:
                 self._accepted.update(marks)
+                if self._cut <= self._delivered:
+                    self._cut = 0
                 if newest:
                     self._echoed.add(marks[-1])
                 self.save()
@@ -856,14 +867,22 @@ class Job:
                     if not self._cond.wait(timeout=HEARTBEAT_S):
                         heartbeat = True
                         break
+                cut = self._cut if self._cut > after else 0
+                end = min(last, cut) if cut else last
                 start = max(sent + 1, self._first)
-                chunk = "".join(self._items[start - self._first :]) if last >= start else ""
+                chunk = (
+                    "".join(self._items[start - self._first : end - self._first + 1])
+                    if end >= start
+                    else ""
+                )
                 over = self._done and last <= sent
             if chunk:
                 yield chunk
-                sent = last
+                sent = end
                 with self._cond:
                     self._delivered = max(self._delivered, sent)
+                if cut and sent >= cut:
+                    return
             elif over:
                 return
             elif heartbeat:
@@ -1013,7 +1032,8 @@ class JobManager:
                 for job in running:
                     rows = conn.execute(
                         "select id, payload from session_inbox "
-                        "where session_id = ? and type = 'user' order by enqueued_seq, id",
+                        "where session_id = ? and type = 'user' and delivery = 'steer' "
+                        "order by enqueued_seq, id",
                         (job.session,),
                     ).fetchall()
                     for row_id, payload in rows:
@@ -1058,7 +1078,7 @@ class JobManager:
         agent read must not start the job again). None for a job that ended with a note still
         unread: the request goes on to start the next job, without saying the note a second
         time."""
-        if job.is_running():
+        if job.is_running() or job.has_undelivered():
             return job
         if job.finished() or not _notes_unread(job.store):
             raise GatewayError(DELIVERED)
